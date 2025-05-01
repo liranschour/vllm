@@ -315,6 +315,7 @@ class NixlConnectorWorker:
 
         self._registered_descs.append(descs)
 
+        import os
         NIXL_ROLE = os.getenv("NIXL_ROLE")
 
         # For debug, SENDER puts some stuff in the KV caches
