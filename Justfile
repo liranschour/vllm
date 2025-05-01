@@ -1,11 +1,11 @@
 prefill:
     UCX_LOG_LEVEL=debug \
     NIXL_ROLE="SENDER" \
-    CUDA_VISIBLE_DEVICES=3 \
+    CUDA_VISIBLE_DEVICES=0 \
     VLLM_LOGGING_LEVEL="DEBUG" \
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
     VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-    vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    vllm serve mistralai/Mistral-7B-Instruct-v0.2 \
     --port 8100 \
     --enforce-eager \
     --disable-log-requests \
@@ -14,11 +14,11 @@ prefill:
 decode:
     UCX_LOG_LEVEL=info \
     NIXL_ROLE="RECVER" \
-    CUDA_VISIBLE_DEVICES=4 \
+    CUDA_VISIBLE_DEVICES=1 \
     VLLM_LOGGING_LEVEL="DEBUG" \
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
     VLLM_ENABLE_V1_MULTIPROCESSING=0 \
-    vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    vllm serve mistralai/Mistral-7B-Instruct-v0.2 \
     --port 8200 \
     --enforce-eager \
     --disable-log-requests \
@@ -31,7 +31,7 @@ send_request:
   curl -X POST http://localhost:8192/v1/completions \
     -H "Content-Type: application/json" \
     -d '{ \
-      "model": "meta-llama/Llama-3.1-8B-Instruct", \
+      "model": "mistralai/Mistral-7B-Instruct-v0.2", \
       "prompt": "EXPLAIN KERMIT THE FROG", \
       "max_tokens": 150, \
       "temperature": 0.7 \
