@@ -315,10 +315,6 @@ class NixlConnectorWorker:
 
         self._registered_descs.append(descs)
 
-        # THIS IS FOR DEBUG and INSECURE
-        import os
-        _ctx = zmq.Context()  # type: ignore
-        _side_channel = _ctx.socket(zmq.PAIR)  # type: ignore
         NIXL_ROLE = os.getenv("NIXL_ROLE")
 
         # For debug, SENDER puts some stuff in the KV caches
@@ -360,25 +356,7 @@ class NixlConnectorWorker:
 
             self.nixl_wrapper.send_notif("decoder", encoded_data)
 
-            print("prefiller handshake finished - ready to serve reads")
-
-            # _side_channel.setsockopt(zmq.LINGER, 0)  # type: ignore
-            # metadata = NixlAgentMetadata(
-            #     engine_id=self.engine_id,
-            #     agent_metadata=self.nixl_wrapper.get_agent_metadata(),
-            #     kv_caches_base_addr=self.kv_caches_base_addr[self.engine_id],
-            #     num_blocks=self.num_blocks,
-            # )
-            # encoder = msgspec.msgpack.Encoder()
-            # encoded_data = encoder.encode(metadata)
-            # size_in_bytes = len(encoded_data)
-            # logger.debug("Size of encoded NixlAgentMetadata: %s bytes",
-            #              str(size_in_bytes))
-            # _side_channel.send(encoder.encode(metadata))
-
-            # logger.debug("WAITING ON RECV")
-            # ack = _side_channel.recv()
-            # logger.debug("GOT ACK %s", ack)
+            logger.debug("prefiller handshake finished - ready to serve reads")
 
         elif NIXL_ROLE == "RECVER":  # RECEIVER is the Initiator side
             self.nixl_wrapper.fetch_remote_metadata("prefiller", "127.0.0.1", 5578)
@@ -402,18 +380,6 @@ class NixlConnectorWorker:
                 ready = self.nixl_wrapper.check_remote_metadata("prefiller")
 
             print("Ready to submit transfers")
-
-            # _side_channel.bind("tcp://localhost:5577")
-            # _side_channel.setsockopt(zmq.LINGER, 0)  # type: ignore
-            # decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-            # metadata_bytes = _side_channel.recv()
-            # metadata = decoder.decode(metadata_bytes)
-
-            # remote_engine_id = metadata.engine_id  #HACK
-
-            # self.add_remote_agent(metadata)
-            # print("SENDING ACK")
-            # _side_channel.send(b"ack")
 
         else:
             raise Exception("SET NIXL_ROLE to SENDER OR RECVER")
