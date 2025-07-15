@@ -91,7 +91,7 @@ benchmark NUM_PROMPTS:
     --seed $(date +%s) \
 
 benchmark_one INPUT_LEN:
-  python {{vllm-directory}}benchmarks/benchmark_one_concurrent_req.py \
+  python {{vllm-directory}}benchmarks/benchmark_one_concurrent.py \
     --port {{PROXY_PORT}} \
     --model {{MODEL}} \
     --input-len {{INPUT_LEN}} \
@@ -100,7 +100,7 @@ benchmark_one INPUT_LEN:
     --seed $(date +%s)
 
 benchmark_one_no_pd INPUT_LEN:
-  python {{vllm-directory}}benchmarks/benchmark_one_concurrent_req.py \
+  python {{vllm-directory}}benchmarks/benchmark_one_concurrent.py \
     --port {{DECODE_PORT}} \
     --model {{MODEL}} \
     --input-len {{INPUT_LEN}} \
