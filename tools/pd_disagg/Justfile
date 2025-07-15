@@ -10,6 +10,7 @@ PREFILL_PORT := "8100"
 DECODE_PORT := "8200"
 PREFILL_NIXL_SIDE_CHANNEL_PORT := "5557"
 DECODE_NIXL_SIDE_CHANNEL_PORT := "5558"
+BLOCK_SIZE := "128"
 
 prefill:
     UCX_TLS=cuda_ipc,cuda_copy,tcp \
@@ -20,7 +21,7 @@ prefill:
       --tensor-parallel-size 1 \
       --enforce-eager \
       --disable-log-requests \
-      --block-size 128 \
+      --block-size {{BLOCK_SIZE}} \
       --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
 
 prefill_lm:
@@ -35,6 +36,7 @@ prefill_lm:
         --port {{PREFILL_PORT}} \
         --disable-log-requests \
         --enforce-eager \
+        --block-size {{BLOCK_SIZE}} \
         --kv-transfer-config \
         '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_producer","kv_connector_extra_config": {"discard_partial_chunks": false, "lmcache_rpc_port": "producer1"}}'
 
@@ -47,7 +49,7 @@ decode:
       --tensor-parallel-size 1 \
       --enforce-eager \
       --disable-log-requests \
-      --block-size 128 \
+      --block-size {{BLOCK_SIZE}} \
       --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
 
 decode_lm:
@@ -62,6 +64,7 @@ decode_lm:
         --port {{DECODE_PORT}} \
         --disable-log-requests \
         --enforce-eager \
+        --block-size {{BLOCK_SIZE}} \
         --kv-transfer-config \
         '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_consumer","kv_connector_extra_config": {"discard_partial_chunks": false, "lmcache_rpc_port": "consumer1"}}'
 proxy:
@@ -95,7 +98,7 @@ benchmark_one INPUT_LEN:
     --port {{PROXY_PORT}} \
     --model {{MODEL}} \
     --input-len {{INPUT_LEN}} \
-    --output-len 1 \
+    --output-len 2 \
     --num-requests 10 \
     --seed $(date +%s)
 
@@ -104,7 +107,7 @@ benchmark_one_no_pd INPUT_LEN:
     --port {{DECODE_PORT}} \
     --model {{MODEL}} \
     --input-len {{INPUT_LEN}} \
-    --output-len 1 \
+    --output-len 2 \
     --num-requests 10 \
     --seed $(date +%s)
 
