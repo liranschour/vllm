@@ -934,12 +934,13 @@ class NixlConnectorWorker:
         done_req_ids: set[str] = set()
         for req_id, handles in list(transfers.items()):
             in_progress = False
-            for handle, _xfer_stime in handles:
+            for handle, _xfer_stime, nr_blocks in handles:
                 xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                 if xfer_state == "DONE":
                     self.nixl_wrapper.release_xfer_handle(handle)
                     _xfer_etime = time.perf_counter()
-                    print(f"XXX DONE in {_xfer_etime - _xfer_stime}")
+                    elapsed_t = _xfer_etime - _xfer_stime
+                    print(f"XXX DONE in {_xfer_etime - _xfer_stime} = {((self.block_len * 8 * nr_blocks)/elapsed_t)/(1024*1024*1024)} Gb/s")
                 elif xfer_state == "PROC":
                     in_progress = True
                     continue
@@ -1085,12 +1086,12 @@ class NixlConnectorWorker:
         start = time.perf_counter()
         self.nixl_wrapper.transfer(handle)
         end = time.perf_counter()
-        logger.info("========== TRANSFER: %s ========== of %d blocks", end - start, len(local_block_descs_ids))
+        logger.info("========== TRANSFER: %s ========== of %d blocks %d block size = %d", end - start, len(local_block_descs_ids), self.block_len, self.block_len * len(local_block_descs_ids))
 
         # Use handle to check completion in future step().
         # TODO (NickLucche) surface xfer elapsed time
         self._recving_transfers[request_id].append(
-            (handle, time.perf_counter()))
+            (handle, time.perf_counter(), len(local_block_descs_ids)))
 
     def _get_block_descs_ids(self,
                              engine_id: str,

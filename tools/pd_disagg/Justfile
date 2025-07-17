@@ -99,7 +99,7 @@ benchmark_one INPUT_LEN:
     --model {{MODEL}} \
     --input-len {{INPUT_LEN}} \
     --output-len 2 \
-    --num-requests 10 \
+    --num-requests 5 \
     --seed $(date +%s)
 
 benchmark_one_no_pd INPUT_LEN:
@@ -108,7 +108,7 @@ benchmark_one_no_pd INPUT_LEN:
     --model {{MODEL}} \
     --input-len {{INPUT_LEN}} \
     --output-len 2 \
-    --num-requests 10 \
+    --num-requests 5 \
     --seed $(date +%s)
 
 eval:
