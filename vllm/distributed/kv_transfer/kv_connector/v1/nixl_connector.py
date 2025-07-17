@@ -46,7 +46,8 @@ logger = init_logger(__name__)
 
 # Lazy import nixl_wrapper to avoid loading nixl_bindings if nixl is not used
 try:
-    from nixl._api import nixl_agent as NixlWrapper
+    from nixl._api import nixl_agent as NixlWrapper, nixl_agent_config
+    #from nixl._api import nixl_agent as NixlWrapper
     logger.info("NIXL is available")
 except ImportError:
     logger.warning("NIXL is not available")
@@ -361,6 +362,9 @@ class NixlConnectorWorker:
         self.block_size = vllm_config.cache_config.block_size
 
         # Agent.
+        #num_workers = 32
+        #config = nixl_agent_config(enable_prog_thread=False, num_threads=num_workers)
+        #self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), config)
         self.nixl_wrapper = NixlWrapper(str(uuid.uuid4()), None)
         # Map of engine_id -> {rank0: agent_name0, rank1: agent_name1..}.
         self._remote_agents: dict[EngineId, dict[int, str]] = defaultdict(dict)
@@ -1091,7 +1095,7 @@ class NixlConnectorWorker:
         # Use handle to check completion in future step().
         # TODO (NickLucche) surface xfer elapsed time
         self._recving_transfers[request_id].append(
-            (handle, time.perf_counter(), len(local_block_descs_ids)))
+            (handle, start, len(local_block_descs_ids)))
 
     def _get_block_descs_ids(self,
                              engine_id: str,
