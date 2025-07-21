@@ -40,6 +40,22 @@ prefill_lm:
         --kv-transfer-config \
         '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_producer","kv_connector_extra_config": {"discard_partial_chunks": false, "lmcache_rpc_port": "producer1"}}'
 
+prefill_push:
+    prefill_config_file={{SCRIPT_DIR}}/configs/lmcache-prefiller-config-push.yaml \
+    UCX_TLS=cuda_ipc,cuda_copy,tcp \
+        LMCACHE_CONFIG_FILE=$prefill_config_file \
+        LMCACHE_USE_EXPERIMENTAL=True \
+        VLLM_ENABLE_V1_MULTIPROCESSING=1 \
+        VLLM_WORKER_MULTIPROC_METHOD=spawn \
+        CUDA_VISIBLE_DEVICES={{PREFILL_GPU}} \
+        vllm serve {{MODEL}} \
+        --port {{PREFILL_PORT}} \
+        --disable-log-requests \
+        --enforce-eager \
+        --block-size {{BLOCK_SIZE}} \
+        --kv-transfer-config \
+        '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
+
 decode:
     UCX_TLS=cuda_ipc,cuda_copy,tcp \
     VLLM_NIXL_SIDE_CHANNEL_PORT={{DECODE_NIXL_SIDE_CHANNEL_PORT}} \
@@ -67,6 +83,23 @@ decode_lm:
         --block-size {{BLOCK_SIZE}} \
         --kv-transfer-config \
         '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_consumer","kv_connector_extra_config": {"discard_partial_chunks": false, "lmcache_rpc_port": "consumer1"}}'
+
+decode_push:
+    decode_config_file={{SCRIPT_DIR}}/configs/lmcache-decoder-config-push.yaml \
+    UCX_TLS=cuda_ipc,cuda_copy,tcp \
+        LMCACHE_CONFIG_FILE=$decode_config_file \
+        LMCACHE_USE_EXPERIMENTAL=True \
+        VLLM_ENABLE_V1_MULTIPROCESSING=1 \
+        VLLM_WORKER_MULTIPROC_METHOD=spawn \
+        CUDA_VISIBLE_DEVICES=1 \
+        vllm serve {{MODEL}} \
+        --port {{DECODE_PORT}} \
+        --disable-log-requests \
+        --enforce-eager \
+        --block-size {{BLOCK_SIZE}} \
+        --kv-transfer-config \
+        '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
+
 proxy:
     python "{{vllm-directory}}tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" \
       --port {{PROXY_PORT}} \
