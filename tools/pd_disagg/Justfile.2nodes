@@ -95,7 +95,7 @@ decode_push:
         LMCACHE_USE_EXPERIMENTAL=True \
         VLLM_ENABLE_V1_MULTIPROCESSING=1 \
         VLLM_WORKER_MULTIPROC_METHOD=spawn \
-        CUDA_VISIBLE_DEVICES=1 \
+        CUDA_VISIBLE_DEVICES={{DECODE_GPU}} \
         vllm serve {{MODEL}} \
         --port {{DECODE_PORT}} \
         --disable-log-requests \
