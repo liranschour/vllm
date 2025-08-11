@@ -8,8 +8,8 @@ MODEL := "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"
 PROXY_PORT := "8000"
 PREFILL_PORT := "8100"
 DECODE_PORT := "8200"
-PREFILL_HOST := "10.129.4.196"
-DECODE_HOST := "10.128.4.157"
+PREFILL_HOST := if env_var("PREFILL_HOST") != "" { env_var("PREFILL_HOST") } else { "localhost" }
+DECODE_HOST := if env_var("DECODE_HOST") != "" { env_var("DECODE_HOST") } else { "localhost" }
 PREFILL_NIXL_SIDE_CHANNEL_PORT := "5557"
 DECODE_NIXL_SIDE_CHANNEL_PORT := "5558"
 BLOCK_SIZE := "128"
