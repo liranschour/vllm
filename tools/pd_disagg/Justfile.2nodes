@@ -2,14 +2,14 @@
 vllm-directory := "/workspace/lirans/vllm/"
 SCRIPT_DIR := "/workspace/lirans/vllm/tools/pd_disagg"
 
-PREFILL_GPU := "5"
+PREFILL_GPU := "4"
 DECODE_GPU := "4"
 MODEL := "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"
 PROXY_PORT := "8000"
 PREFILL_PORT := "8100"
 DECODE_PORT := "8200"
-PREFILL_HOST := if env_var("PREFILL_HOST") != "" { env_var("PREFILL_HOST") } else { "localhost" }
-DECODE_HOST := if env_var("DECODE_HOST") != "" { env_var("DECODE_HOST") } else { "localhost" }
+PREFILL_HOST := env_var_or_default("PREFILL_HOST", "localhost")
+DECODE_HOST := env_var_or_default("DECODE_HOST", "localhost")
 PREFILL_NIXL_SIDE_CHANNEL_PORT := "5557"
 DECODE_NIXL_SIDE_CHANNEL_PORT := "5558"
 BLOCK_SIZE := "128"
