@@ -1,5 +1,5 @@
 local_cpu: True 
-max_local_cpu_size: 5.0
+max_local_cpu_size: 25.0
 #local_disk: 
 max_local_disk_size: 0
 remote_serde: NULL
