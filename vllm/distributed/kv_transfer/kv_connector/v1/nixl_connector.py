@@ -597,8 +597,11 @@ class NixlConnectorWorker:
 
         # nixl_prepped_dlist_handle.
         self.src_xfer_side_handle: int = 0
+        self.src_xfer_side_blocks: list = []
+
         # Map of engine_id -> nixl_prepped_dlist_handle (int)].
         self.dst_xfer_side_handles: dict[EngineId, int] = {}
+        self.dst_xfer_side_blocks: dict[EngineId, list] = {}
 
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
@@ -947,6 +950,7 @@ class NixlConnectorWorker:
         self.src_xfer_side_handle = self.nixl_wrapper.prep_xfer_dlist(
             "NIXL_INIT_AGENT", descs
         )
+        self.src_xfer_side_blocks = blocks_data
 
         # TODO(mgoin): Hybrid memory allocator is currently disabled for
         # models with local attention (Llama 4). Can remove this once enabled.
@@ -1151,6 +1155,7 @@ class NixlConnectorWorker:
         self.dst_xfer_side_handles[engine_id] = self.nixl_wrapper.prep_xfer_dlist(
             remote_agent_name, descs
         )
+        self.dst_xfer_side_blocks[engine_id] = blocks_data
 
         return remote_agent_name
 
@@ -1452,6 +1457,11 @@ class NixlConnectorWorker:
             remote_block_descs_ids = np.concatenate(remote_descs_list)
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+
+        prev_addr = 0
+        for i, block in enumerate(local_block_descs_ids):
+            print(f"XXX Block: {i}:{block} len since prev addr: {self.src_xfer_side_blocks[block][0] - prev_addr} len: {self.src_xfer_side_blocks[block][1]}")
+            prev_addr = self.src_xfer_side_blocks[block][0]
 
         # Prepare transfer with Nixl.
         handle = self.nixl_wrapper.make_prepped_xfer(
