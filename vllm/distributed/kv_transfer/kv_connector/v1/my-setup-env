@@ -1,0 +1,2 @@
+unset PYTHONPATH
+unset NIXL_PLUGIN_DIR
