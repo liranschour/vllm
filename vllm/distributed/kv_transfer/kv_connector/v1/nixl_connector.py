@@ -1459,9 +1459,16 @@ class NixlConnectorWorker:
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
         prev_addr = 0
+        block_id = 0
+        layer = 0
+        blocks = len(local_block_ids)
         for i, block in enumerate(local_block_descs_ids):
-            print(f"XXX Block: {i}:{block} len since prev addr: {self.src_xfer_side_blocks[block][0] - prev_addr} len: {self.src_xfer_side_blocks[block][1]}")
+            print(f"XXX Block: Layer-{layer}:{block_id}-->{block} len since prev addr: {self.src_xfer_side_blocks[block][0] - prev_addr} len: {self.src_xfer_side_blocks[block][1]}")
             prev_addr = self.src_xfer_side_blocks[block][0]
+            block_id += 1
+            if block_id % blocks == 0:
+                block_id = 0
+                layer += 1
 
         # Prepare transfer with Nixl.
         handle = self.nixl_wrapper.make_prepped_xfer(
