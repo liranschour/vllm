@@ -1505,7 +1505,7 @@ class NixlConnectorWorker:
         layer = 0
         blocks = len(local_block_ids)
         for i, block in enumerate(local_block_descs_ids):
-            print(f"XXX Block: Layer-{layer}:{block_id}-->{block} len since prev addr: {self.src_xfer_side_blocks[block][0] - prev_addr} len: {self.src_xfer_side_blocks[block][1]}")
+            print(f"XXX Block: Layer-{layer}:{block_id}-->{block} To remote block {remote_block_descs_ids[i]} len since prev addr: {self.src_xfer_side_blocks[block][0] - prev_addr} len: {self.src_xfer_side_blocks[block][1]}")
             prev_addr = self.src_xfer_side_blocks[block][0]
             block_id += 1
             if block_id % blocks == 0:
