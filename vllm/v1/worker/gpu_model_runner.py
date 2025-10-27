@@ -4144,8 +4144,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         logger.info("Allocating a single KV cache buffer for all layers")
 
         # allocate one contiguous buffer for all layers
-        buffer = (torch.zeros(total_size, dtype=torch.int8,
+        tmp_tensor = torch.zeros(total_size, dtype=torch.int8,
                              device=self.device)
+        print(f"XXX base_addr = {tmp_tensor.data_ptr()} size = {total_size}")
+
+        buffer = (tmp_tensor
                   .view(kv_cache_spec.dtype)
                   .view(kv_cache_shape))
 
