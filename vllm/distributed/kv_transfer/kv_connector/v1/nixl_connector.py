@@ -1483,6 +1483,9 @@ class NixlConnectorWorker:
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
+        # XXX kv-layout
+        local_block_descs_ids = local_block_ids
+        remote_block_descs_ids = remote_block_ids
         prev_addr = 0
         block_id = 0
         layer = 0
