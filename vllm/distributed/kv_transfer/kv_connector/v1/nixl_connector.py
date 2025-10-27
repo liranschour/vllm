@@ -1173,7 +1173,7 @@ class NixlConnectorWorker:
             blocks_data = []
             block_len = self.block_len_per_layer[0] * len(self.block_len_per_layer)
             mem_len = block_len * self.num_blocks
-            uniform_base_addr = min(self.nixl_agent_meta.kv_caches_base_addr)
+            uniform_base_addr = min(nixl_agent_meta.kv_caches_base_addr)
             print(f"XXX remote kv-layout {uniform_base_addr} mem_len = {mem_len}")
             for block_id in range(self.num_blocks):
                 block_offset = block_id * block_len
