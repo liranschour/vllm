@@ -892,24 +892,19 @@ class NixlConnectorWorker:
         self.num_regions = len(caches_data)
         self.num_layers = len(xfer_buffers.keys())
 
-        if False:
-            descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
-            logger.debug("Registering descs: %s", caches_data)
-            self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
-            logger.debug("Done registering descs")
-            self._registered_descs.append(descs)
-        else:
+        if True:
             # kv-layout
             assert len(set(self.block_len_per_layer)) == 1, f"kv-layout support only single block size"
             block_len = self.block_len_per_layer[0] * len(self.block_len_per_layer)
             mem_len = block_len * self.num_blocks
             uniform_base_addr = min(seen_base_addresses)
             caches_data = [(uniform_base_addr, mem_len, self.tp_rank, "")]
-            descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
-            logger.info("Registering descs: %s", caches_data)
-            self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
-            logger.debug("Done registering descs")
-            self._registered_descs.append(descs)
+
+        descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
+        logger.debug("Registering descs: %s", caches_data)
+        self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
+        logger.debug("Done registering descs")
+        self._registered_descs.append(descs)
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
@@ -928,31 +923,32 @@ class NixlConnectorWorker:
 
         # Register local/src descr for NIXL xfer.
         blocks_data = []
-        if False:
-            for i, base_addr in enumerate(seen_base_addresses):
-                kv_block_len = self.get_backend_aware_kv_block_len(layer_idx=i)
-                # NOTE With heter-TP, more blocks are prepared than what are
-                # needed as self.num_blocks >= nixl_agent_meta.num_blocks. We
-                # could create fewer, but then _get_block_descs_ids needs to
-                # select agent_meta.num_blocks instead of self.num_blocks for
-                # local descr, and that makes handling regular flow less clean.
+        for i, base_addr in enumerate(seen_base_addresses):
+            kv_block_len = self.get_backend_aware_kv_block_len(layer_idx=i)
+            # NOTE With heter-TP, more blocks are prepared than what are
+            # needed as self.num_blocks >= nixl_agent_meta.num_blocks. We
+            # could create fewer, but then _get_block_descs_ids needs to
+            # select agent_meta.num_blocks instead of self.num_blocks for
+            # local descr, and that makes handling regular flow less clean.
+            for block_id in range(self.num_blocks):
+                block_offset = block_id * self.block_len_per_layer[i]
+                addr = base_addr + block_offset
+                # (addr, len, device id)
+                blocks_data.append((addr, kv_block_len, self.tp_rank))
+
+            if self._use_flashinfer:
+                # Separate and interleave K/V regions to maintain the same
+                # descs ordering. This is needed for selecting contiguous heads
+                # when split across TP ranks.
                 for block_id in range(self.num_blocks):
                     block_offset = block_id * self.block_len_per_layer[i]
                     addr = base_addr + block_offset
-                    # (addr, len, device id)
-                    blocks_data.append((addr, kv_block_len, self.tp_rank))
-
-                if self._use_flashinfer:
-                    # Separate and interleave K/V regions to maintain the same
-                    # descs ordering. This is needed for selecting contiguous heads
-                    # when split across TP ranks.
-                    for block_id in range(self.num_blocks):
-                        block_offset = block_id * self.block_len_per_layer[i]
-                        addr = base_addr + block_offset
-                        # Register addresses for V cache (K registered first).
-                        v_addr = addr + kv_block_len
-                        blocks_data.append((v_addr, kv_block_len, self.tp_rank))
-        else:
+                    # Register addresses for V cache (K registered first).
+                    v_addr = addr + kv_block_len
+                    blocks_data.append((v_addr, kv_block_len, self.tp_rank))
+        if True:
+            # XXX kv-layout
+            blocks_data = []
             assert len(set(self.block_len_per_layer)) == 1, f"kv-layout support only single block size"
             block_len = self.block_len_per_layer[0] * len(self.block_len_per_layer)
             mem_len = block_len * self.num_blocks
