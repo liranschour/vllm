@@ -4128,10 +4128,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_cache_spec.head_size,
             cache_dtype_str=self.cache_config.cache_dtype,
         )
-
+        print(f"XXX {kv_cache_shape}")
         # insert (num_tensors) dimensions into the shape
         kv_cache_shape = (num_tensors,) + kv_cache_shape
-
+        print(f"XXX after {kv_cache_shape}")
         try:
             kv_cache_stride_order = (
                 attn_backend.get_kv_cache_stride_order(True))
@@ -4139,10 +4139,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         except (AttributeError, NotImplementedError):
             return {}
 
+        print(f"XXX {kv_cache_stride_order}")
         kv_cache_shape = tuple(
             kv_cache_shape[i] for i in kv_cache_stride_order
         )
-
+        print(f"XXX {kv_cache_shape}")
         # Maintain original KV shape view.
         inv_order = [
             kv_cache_stride_order.index(i)
