@@ -805,6 +805,20 @@ class NixlConnectorWorker:
 
         fut.add_done_callback(request_ready)
 
+    def is_unified_kv_layout(self, kv_caches: dict[str, torch.Tensor]):
+        if len(kv_caches) < 2:
+            return True
+
+        t1 = kv_caches[0]
+        t2 = kv_caches[1]
+
+        if not (getattr(t1, "is_view", lambda: t1._base is not None)()
+            and getattr(t2, "is_view", lambda: t2._base is not None)()):
+            return False
+
+        s1, s2 = t1.untyped_storage(), t2.untyped_storage()
+        return (s1.data_ptr() == s2.data_ptr()) and (s1.nbytes() == s2.nbytes())
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
@@ -892,6 +906,8 @@ class NixlConnectorWorker:
         self.num_regions = len(caches_data)
         self.num_layers = len(xfer_buffers.keys())
 
+        self.unified_kv_layout = self.is_unified_kv_layout(kv_caches)
+        print(f"XXX {self.unified_kv_layout}")
         if True:
             # kv-layout
             assert len(set(self.block_len_per_layer)) == 1, f"kv-layout support only single block size"
