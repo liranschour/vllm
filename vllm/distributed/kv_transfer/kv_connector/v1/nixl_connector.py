@@ -1318,7 +1318,7 @@ class NixlConnectorWorker:
 
         if self.use_host_buffer:
             # XXX TODO XXX
-            self.initialize_host_xfer_buffer(kv_caches=kv_caches)
+            self.initialize_host_xfer_buffer(kv_caches={"cross-layers":kv_cache})
             assert len(self.host_xfer_buffers) == len(kv_caches), (
                 f"host_buffer: {len(self.host_xfer_buffers)}, "
                 f"kv_caches: {len(kv_caches)}"
@@ -1528,7 +1528,7 @@ class NixlConnectorWorker:
                 addr = base_addr + block_offset
                 # (addr, len, device id)
                 blocks_data.append((addr, kv_block_len, self.device_id))
-
+            print(f"XXX {kv_block_len}")
             if self.kv_topo.is_kv_layout_blocks_first:
                 # Separate and interleave K/V regions to maintain the same
                 # descs ordering. This is needed for selecting contiguous heads
