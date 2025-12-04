@@ -1318,7 +1318,8 @@ class NixlConnectorWorker:
 
         if self.use_host_buffer:
             # XXX TODO XXX
-            self.initialize_host_xfer_buffer(kv_caches={"cross-layers":kv_cache})
+            kv_caches = {"cross-layers":kv_cache}
+            self.initialize_host_xfer_buffer(kv_caches=kv_caches)
             assert len(self.host_xfer_buffers) == len(kv_caches), (
                 f"host_buffer: {len(self.host_xfer_buffers)}, "
                 f"kv_caches: {len(kv_caches)}"
