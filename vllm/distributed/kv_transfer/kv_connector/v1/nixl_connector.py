@@ -13,7 +13,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, ClassVar
 
 import msgspec
 import numpy as np
@@ -21,7 +21,7 @@ import torch
 import zmq
 
 from vllm import envs
-from vllm.attention import AttentionBackend
+from vllm.attention import Attention, AttentionBackend, AttentionMetadata
 from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.attention.selector import get_attn_backend
 from vllm.config import VllmConfig
@@ -158,6 +158,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
 
 
 class NixlConnector(KVConnectorBase_V1):
+    prefer_cross_layer_blocks: ClassVar[bool] = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -254,6 +256,11 @@ class NixlConnector(KVConnectorBase_V1):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
+
+    def register_cross_layers_kv_cache(
+        self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]
+    ):
+        self.register_kv_caches([kv_cache])
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         assert self.connector_worker is not None
