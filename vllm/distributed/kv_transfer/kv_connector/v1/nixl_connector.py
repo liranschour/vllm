@@ -13,7 +13,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, ClassVar
 
 import msgspec
 import numpy as np
@@ -21,7 +21,7 @@ import torch
 import zmq
 
 from vllm import envs
-from vllm.attention import AttentionBackend
+from vllm.attention import Attention, AttentionBackend, AttentionMetadata
 from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.attention.selector import get_attn_backend
 from vllm.config import VllmConfig
@@ -158,6 +158,8 @@ class NixlConnectorMetadata(KVConnectorMetadata):
 
 
 class NixlConnector(KVConnectorBase_V1):
+    prefer_cross_layer_blocks: ClassVar[bool] = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -253,6 +255,17 @@ class NixlConnector(KVConnectorBase_V1):
     ############################################################
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
+        self.connector_worker.register_kv_caches(kv_caches)
+
+    def register_cross_layers_kv_cache(
+        self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]
+    ):
+        assert self.connector_worker is not None
+
+        cross_layer_name = "ALL_LAYERS"
+
+        kv_caches = {cross_layer_name: kv_cache}
+        self.connector_worker.cross_layers = True
         self.connector_worker.register_kv_caches(kv_caches)
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
@@ -806,6 +819,7 @@ class NixlConnectorWorker:
         if vllm_config.kv_transfer_config is None:
             raise ValueError("kv_transfer_config must be set for NixlConnector")
         self.kv_transfer_config = vllm_config.kv_transfer_config
+        self.cross_layers = False
 
         self.nixl_backends = vllm_config.kv_transfer_config.get_from_extra_config(
             "backends", ["UCX"]
@@ -1164,7 +1178,7 @@ class NixlConnectorWorker:
 
         # TODO (NickLucche): Get kernel_block_size in a cleaner way
         # NHD default "view" for non-MLA cache
-        if self.device_type == "cpu":
+        if self.device_type == "cpu" or self.cross_layers:
             block_size_position = -2
         else:
             block_size_position = -2 if self.use_mla else -3
@@ -1174,8 +1188,8 @@ class NixlConnectorWorker:
         self.slot_size_per_layer = list[int]()  # HD bytes in kv terms
         self.device_id = self.tp_rank
         for layer_name, cache_or_caches in xfer_buffers.items():
-            cache_list = cache_or_caches if split_k_and_v else [cache_or_caches]
 
+            cache_list = cache_or_caches if not self.cross_layers and split_k_and_v else [cache_or_caches]
             for cache in cache_list:
                 base_addr = cache.data_ptr()
                 if not self.use_host_buffer and current_platform.is_cuda_alike():
@@ -1184,7 +1198,6 @@ class NixlConnectorWorker:
                     continue
 
                 kernel_block_size = cache.shape[block_size_position]
-
                 if self.block_size != kernel_block_size:
                     logger.info_once(
                         "User-specified logical block size (%s) does not match"
