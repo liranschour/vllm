@@ -182,7 +182,7 @@ async def stream_service_response(
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
     }
-
+    print(f"XXX {req_data}")
     async with client_info["client"].stream(
         "POST", endpoint, json=req_data, headers=headers
     ) as response:
@@ -209,11 +209,12 @@ async def _handle_completions(api: str, request: Request):
         kv_transfer_params = response_json.get("kv_transfer_params", {})
         if kv_transfer_params:
             req_data["kv_transfer_params"] = kv_transfer_params
+            print(f"XXX {kv_transder_params}")
 
         # Get the next decode client in round-robin fashion
         decode_client_info = get_next_client(request.app, "decode")
 
-        logger.debug("Using %s %s", prefill_client_info, decode_client_info)
+        logger.info("Using %s %s", prefill_client_info, decode_client_info)
 
         # Stream response from decode service
         async def generate_stream():

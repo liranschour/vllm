@@ -768,6 +768,7 @@ class NixlConnectorScheduler:
                 time.perf_counter() + envs.VLLM_NIXL_ABORT_REQUEST_TIMEOUT
             )
 
+        print(f"XXX request.request_id")
         return delay_free_blocks, dict(
             do_remote_prefill=True,
             do_remote_decode=False,
