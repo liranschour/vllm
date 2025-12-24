@@ -92,6 +92,7 @@ class OffloadingWorker:
         """
         transfer_type = (src_cls.medium(), dst_cls.medium())
         assert transfer_type not in self.transfer_type_to_handler
+
         self.handlers.add(handler)
         self.transfer_type_to_handler[transfer_type] = handler
 

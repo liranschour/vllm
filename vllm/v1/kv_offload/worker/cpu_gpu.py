@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import uuid
 from collections import deque
 
 import numpy as np
 import torch
+from nixl._api import nixl_agent, nixl_agent_config
 
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import AttentionBackend
@@ -277,4 +279,38 @@ class CpuGpuOffloadingHandlers:
             src_block_size_factor=cpu_block_size_factor,
             dst_block_size_factor=gpu_block_size_factor,
             priority=-1,
+        )
+
+        self.nixl_agent = nixl_agent | None
+        self.local_xfer_descs = int | None
+
+        self.register_kv_caches(gpu_tensors)
+        self.register_kv_caches(cpu_tensors)
+
+    def register_kv_caches(self, tensors: list[torch.Tensor]):
+        agent_config = nixl_agent_config(backends=["UCX"])
+        self.nixl_agent = nixl_agent(str(uuid.uuid4()), agent_config)
+
+        plugin_list = self.nixl_agent.get_plugin_list()
+        assert "UCX" in plugin_list
+
+        logger.info(
+            "Plugin parameters:\n%s\n%s",
+            self.nixl_agent.get_plugin_mem_types("UCX"),
+            self.nixl_agent.get_plugin_params("UCX"),
+        )
+
+        logger.info(
+            "Backend parameters:\n%s\n%s",
+            self.nixl_agent.get_backend_mem_types("UCX"),
+            self.nixl_agent.get_backend_params("UCX"),
+        )
+
+        reg_descs = self.nixl_agent.get_reg_descs(tensors)
+        xfer_descs = self.nixl_agent.get_xfer_descs(tensors)
+
+        assert self.nixl_agent.register_memory(reg_descs) is not None
+
+        self.local_xfer_descs = self.nixl_agent.prep_xfer_dlist(
+            "NIXL_INIT_AGENT", xfer_descs
         )
