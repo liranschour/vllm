@@ -121,7 +121,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         src_sub_blocks_to_skip = -dst_blocks.size % self.src_block_size_factor
 
         assert dst_sub_block_count == src_sub_block_count - src_sub_blocks_to_skip
-        print("XXX %", self.src_block_size_factor)
+        print("XXX %s", self.src_block_size_factor)
         src_to_dst = np.empty((dst_sub_block_count, 2), dtype=np.int64)
         expand_block_ids(
             src_blocks,
@@ -132,7 +132,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         expand_block_ids(dst_blocks, self.dst_block_size_factor, src_to_dst[:, 1])
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
-        print("XXX %s  \n meduim: %s", src_to_dst_tensor, src_spec.medium())
+        print("XXX medium: %s src_to_dst: %s", src_spec.medium(), src_to_dst_tensor)
 
         # initialize transfer mode
         # xfer_handle = nixl_agent2.initialize_xfer(
