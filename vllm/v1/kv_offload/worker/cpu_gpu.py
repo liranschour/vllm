@@ -132,7 +132,12 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         expand_block_ids(dst_blocks, self.dst_block_size_factor, src_to_dst[:, 1])
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
-        action = "READ" if src_spec.medium() == "GPU" else "WRITE"
+        action, cpu_blocks, gpu_blocks = (
+            ("READ", dst_blocks, src_blocks)
+            if src_spec.medium() == "GPU"
+            else ("WRITE", src_blocks, dst_blocks)
+        )
+
         print(
             "XXX medium: %s src_to_dst: %s action %s: src_blocks %s dst_blocks:",
             src_spec.medium(),
@@ -142,9 +147,17 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             dst_blocks,
         )
 
-        # xfer_handle = self.cpu_nixl_agent.make_prepped_xfer(
-        # action, self.cpu_xfer_descs, [0, 1], remote_prep_handle, [1, 0], b"UUID2"
-        # )
+        xfer_handle = self.cpu_nixl_agent.make_prepped_xfer(
+            action,
+            self.cpu_xfer_descs,
+            cpu_blocks,
+            self.cpu_gpu_xfer_descs,
+            gpu_blocks,
+            str(job_id).encode(),
+        )
+
+        self.cpu_nixl_agent.transfer(xfer_handle)
+
         stream = (
             self._stream_pool.pop()
             if self._stream_pool
