@@ -285,6 +285,10 @@ class CpuGpuOffloadingHandlers:
         self.gpu_nixl_agent, self.gpu_xfer_descs = self.nixl_register_kv(gpu_tensors)
         self.cpu_nixl_agent, self.cpu_xfer_descs = self.nixl_register_kv(cpu_tensors)
 
+        gpu_meta = self.gpu_nixl_agent.get_agent_metadata()
+        remote_name = self.cpu_nixl_agent.add_remote_agent(gpu_meta)
+        logger.info("Loaded name from metadata: %s", remote_name)
+
     def nixl_register_kv(self, tensors: list[torch.Tensor]) -> tuple[nixl_agent, int]:
         agent_config = nixl_agent_config(backends=["UCX"])
         agent = nixl_agent(str(uuid.uuid4()), agent_config)
