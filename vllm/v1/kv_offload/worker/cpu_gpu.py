@@ -281,36 +281,34 @@ class CpuGpuOffloadingHandlers:
             priority=-1,
         )
 
-        self.nixl_agent = nixl_agent | None
-        self.local_xfer_descs = int | None
+        self.gpu_nixl_agent, self.gpu_xfer_descs = self.nixl_register_kv(gpu_tensors)
+        self.cpu_nixl_agent, self.cpu_xfer_descs = self.nixl_register_kv(cpu_tensors)
 
-        self.register_kv_caches(gpu_tensors)
-        self.register_kv_caches(cpu_tensors)
-
-    def register_kv_caches(self, tensors: list[torch.Tensor]):
+    def nixl_register_kv(self, tensors: list[torch.Tensor]) -> tuple[nixl_agent, int]:
         agent_config = nixl_agent_config(backends=["UCX"])
-        self.nixl_agent = nixl_agent(str(uuid.uuid4()), agent_config)
+        agent = nixl_agent(str(uuid.uuid4()), agent_config)
+        assert agent is not None
 
-        plugin_list = self.nixl_agent.get_plugin_list()
+        plugin_list = agent.get_plugin_list()
         assert "UCX" in plugin_list
 
         logger.info(
             "Plugin parameters:\n%s\n%s",
-            self.nixl_agent.get_plugin_mem_types("UCX"),
-            self.nixl_agent.get_plugin_params("UCX"),
+            agent.get_plugin_mem_types("UCX"),
+            agent.get_plugin_params("UCX"),
         )
 
         logger.info(
             "Backend parameters:\n%s\n%s",
-            self.nixl_agent.get_backend_mem_types("UCX"),
-            self.nixl_agent.get_backend_params("UCX"),
+            agent.get_backend_mem_types("UCX"),
+            agent.get_backend_params("UCX"),
         )
 
-        reg_descs = self.nixl_agent.get_reg_descs(tensors)
-        xfer_descs = self.nixl_agent.get_xfer_descs(tensors)
+        reg_descs = agent.get_reg_descs(tensors)
+        xfer_descs = agent.get_xfer_descs(tensors)
 
-        assert self.nixl_agent.register_memory(reg_descs) is not None
+        assert agent.register_memory(reg_descs) is not None
 
-        self.local_xfer_descs = self.nixl_agent.prep_xfer_dlist(
-            "NIXL_INIT_AGENT", xfer_descs
-        )
+        local_xfer_descs = agent.prep_xfer_dlist("NIXL_INIT_AGENT", xfer_descs)
+
+        return (agent, local_xfer_descs)
