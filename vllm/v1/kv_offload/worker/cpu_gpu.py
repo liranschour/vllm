@@ -166,6 +166,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             str(job_id).encode(),
         )
 
+        print("xfer_handle %x", xfer_handle)
         # self.cpu_nixl_agent.transfer(xfer_handle)
 
         stream = (
@@ -320,11 +321,11 @@ class CpuGpuOffloadingHandlers:
             src_block_size_factor=gpu_block_size_factor,
             dst_block_size_factor=cpu_block_size_factor,
             priority=1,
-            self.gpu_nixl_agent,
-            self.gpu_xfer_descs,
-            self.cpu_nixl_agent,
-            self.cpu_xfer_descs,
-            self.cpu_gpu_xfer_descs,
+            gpu_nixl_agent=self.gpu_nixl_agent,
+            gpu_xfer_descs=self.gpu_xfer_descs,
+            cpu_nixl_agent=self.cpu_nixl_agent,
+            cpu_xfer_descs=self.cpu_xfer_descs,
+            cpu_gpu_xfer_descs=self.cpu_gpu_xfer_descs,
         )
 
         self.cpu_to_gpu_handler = SingleDirectionOffloadingHandler(
@@ -334,6 +335,11 @@ class CpuGpuOffloadingHandlers:
             src_block_size_factor=cpu_block_size_factor,
             dst_block_size_factor=gpu_block_size_factor,
             priority=-1,
+            gpu_nixl_agent=self.gpu_nixl_agent,
+            gpu_xfer_descs=self.gpu_xfer_descs,
+            cpu_nixl_agent=self.cpu_nixl_agent,
+            cpu_xfer_descs=self.cpu_xfer_descs,
+            cpu_gpu_xfer_descs=self.cpu_gpu_xfer_descs,
         )
 
     def nixl_register_kv(self, tensors: list[torch.Tensor]) -> tuple[nixl_agent, int]:
