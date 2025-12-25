@@ -391,9 +391,7 @@ class CpuGpuOffloadingHandlers:
         nixl_memory_type = "VRAM_SEG" if tensors[0].is_cuda else "DRAM_SEG"
         logger.info("len block_descs %d", len(blocks_data), nixl_memory_type)
 
-        xfer_descs = agent.get_xfer_descs(
-            blocks_data, "VRAM" if tensors[0].is_cuda else "DRAM"
-        )
+        xfer_descs = agent.get_xfer_descs(blocks_data, nixl_memory_type)
 
         local_xfer_descs = agent.prep_xfer_dlist("NIXL_INIT_AGENT", xfer_descs)
 
