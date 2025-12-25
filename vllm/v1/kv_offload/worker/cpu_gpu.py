@@ -372,17 +372,19 @@ class CpuGpuOffloadingHandlers:
         blocks_data: list[tuple[int, int, int]] = []
 
         for tensor in tensors:
-            num_blocks = tensor[0].numel()
+            num_blocks = tensor.shape[0]
+            bytes_per_block = tensor[0].numel() * tensor.element_size()
+
             base_addr = tensor.data_ptr()
-            block_len = tensor.numel() * tensor.element_size() // num_blocks
+
             for i in range(num_blocks):
-                addr = base_addr + (i * block_len)
-                blocks_data.append((addr, block_len, tensor.device.index))
+                addr = base_addr + (i * bytes_per_block)
+                blocks_data.append((addr, bytes_per_block, tensor.device.index))
 
             logger.info(
                 "data_ptr %x block_len %d num_blocks %d",
                 tensor.data_ptr(),
-                block_len,
+                bytes_per_block,
                 num_blocks,
             )
 
