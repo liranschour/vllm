@@ -366,8 +366,10 @@ class CpuGpuOffloadingHandlers:
             agent.get_backend_params("UCX"),
         )
 
-        reg_descs = agent.get_reg_descs(tensors)
-        xfer_descs = agent.get_xfer_descs(tensors)
+        parts = [slice_ for tensor in tensors for slice_ in tensor.unbind(dim=0)]
+
+        reg_descs = agent.get_reg_descs(parts)
+        xfer_descs = agent.get_xfer_descs(parts)
 
         assert agent.register_memory(reg_descs) is not None
 
