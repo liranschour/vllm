@@ -314,8 +314,11 @@ class CpuGpuOffloadingHandlers:
         remote_name = self.cpu_nixl_agent.add_remote_agent(gpu_meta)
         logger.info("Loaded name from metadata: %s", remote_name)
 
+        blocks_data, nixl_memory_type = self.get_blocks_data(gpu_tensors)
+        xfer_descs = self.cpu_nixl_agent.get_xfer_descs(blocks_data, nixl_memory_type)
+
         self.cpu_gpu_xfer_descs = self.cpu_nixl_agent.prep_xfer_dlist(
-            remote_name, gpu_tensors
+            remote_name, xfer_descs, nixl_memory_type
         )
 
         self.gpu_to_cpu_handler = SingleDirectionOffloadingHandler(
@@ -346,30 +349,8 @@ class CpuGpuOffloadingHandlers:
             cpu_gpu_xfer_descs=self.cpu_gpu_xfer_descs,
         )
 
-    def nixl_register_kv(self, tensors: list[torch.Tensor]) -> tuple[nixl_agent, int]:
-        agent_config = nixl_agent_config(backends=["UCX"])
-        agent = nixl_agent(str(uuid.uuid4()), agent_config)
-        assert agent is not None
-
-        plugin_list = agent.get_plugin_list()
-        assert "UCX" in plugin_list
-
-        logger.info(
-            "Plugin parameters:\n%s\n%s",
-            agent.get_plugin_mem_types("UCX"),
-            agent.get_plugin_params("UCX"),
-        )
-
-        logger.info(
-            "Backend parameters:\n%s\n%s",
-            agent.get_backend_mem_types("UCX"),
-            agent.get_backend_params("UCX"),
-        )
-
-        reg_descs = agent.get_reg_descs(tensors)
-        assert agent.register_memory(reg_descs) is not None
-
-        blocks_data = []
+    def get_blocks_data(self, tensors) -> tuple[list[tuple[int, int, int]], str]:
+        blocks_data: list[tuple[int, int, int]] = []
 
         for tensor in tensors:
             num_blocks = tensor.shape[0]
@@ -393,8 +374,34 @@ class CpuGpuOffloadingHandlers:
                 bytes_per_block,
                 num_blocks,
             )
+            nixl_memory_type = "VRAM" if tensors[0].is_cuda else "DRAM"
 
-        nixl_memory_type = "VRAM" if tensors[0].is_cuda else "DRAM"
+        return (blocks_data, nixl_memory_type)
+
+    def nixl_register_kv(self, tensors: list[torch.Tensor]) -> tuple[nixl_agent, int]:
+        agent_config = nixl_agent_config(backends=["UCX"])
+        agent = nixl_agent(str(uuid.uuid4()), agent_config)
+        assert agent is not None
+
+        plugin_list = agent.get_plugin_list()
+        assert "UCX" in plugin_list
+
+        logger.info(
+            "Plugin parameters:\n%s\n%s",
+            agent.get_plugin_mem_types("UCX"),
+            agent.get_plugin_params("UCX"),
+        )
+
+        logger.info(
+            "Backend parameters:\n%s\n%s",
+            agent.get_backend_mem_types("UCX"),
+            agent.get_backend_params("UCX"),
+        )
+
+        reg_descs = agent.get_reg_descs(tensors)
+        assert agent.register_memory(reg_descs) is not None
+
+        blocks_data, nixl_memory_type = self.get_blocks_data(tensors)
 
         logger.info("len block_descs %d", len(blocks_data), nixl_memory_type)
 
