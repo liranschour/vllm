@@ -149,12 +149,15 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         )
 
         print(
-            "XXX medium: %s src_to_dst: %s action %s: src_blocks %s dst_blocks:",
+            "XXX medium: %s src_to_dst: %s action %s: "
+            "src_blocks %s %s dst_blocks %s %s",
             src_spec.medium(),
             src_to_dst_tensor,
             action,
-            src_blocks,
-            dst_blocks,
+            cpu_blocks,
+            type(cpu_blocks),
+            gpu_blocks,
+            type(gpu_blocks),
         )
 
         xfer_handle = self.cpu_nixl_agent.make_prepped_xfer(
@@ -163,7 +166,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             cpu_blocks,
             self.cpu_gpu_xfer_descs,
             gpu_blocks,
-            str(job_id).encode(),
+            b"TEST",
         )
 
         print("xfer_handle %x", xfer_handle)
