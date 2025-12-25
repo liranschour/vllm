@@ -143,9 +143,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
         action, cpu_blocks, gpu_blocks = (
-            ("READ", dst_blocks.to_list(), src_blocks.to_list())
+            ("READ", dst_blocks.tolist(), src_blocks.tolist())
             if src_spec.medium() == "GPU"
-            else ("WRITE", src_blocks.to_list(), dst_blocks.to_list())
+            else ("WRITE", src_blocks.tolist(), dst_blocks.tolist())
         )
 
         logger.info("cpu blocks %s type: %s", cpu_blocks, type(cpu_blocks))
