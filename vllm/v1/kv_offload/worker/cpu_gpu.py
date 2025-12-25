@@ -388,7 +388,7 @@ class CpuGpuOffloadingHandlers:
                 num_blocks,
             )
 
-        nixl_memory_type = "VRAM" if tensors[0].is_cuda else "DRAM"
+        nixl_memory_type = "VRAM_SEG" if tensors[0].is_cuda else "DRAM_SEG"
         logger.info("len block_descs %d", len(blocks_data), nixl_memory_type)
 
         xfer_descs = agent.get_xfer_descs(
