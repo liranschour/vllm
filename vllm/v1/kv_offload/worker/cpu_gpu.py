@@ -148,7 +148,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             else ("WRITE", src_blocks, dst_blocks)
         )
 
-        print(
+        logger.info("cpu blocks %s type: %s", cpu_blocks, type(cpu_blocks))
+        logger.info(
             "XXX medium: %s src_to_dst: %s action %s: "
             "src_blocks %s %s dst_blocks %s %s",
             src_spec.medium(),
