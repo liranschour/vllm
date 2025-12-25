@@ -379,7 +379,13 @@ class CpuGpuOffloadingHandlers:
 
             for i in range(num_blocks):
                 addr = base_addr + (i * bytes_per_block)
-                blocks_data.append((addr, bytes_per_block, tensor.device.index))
+                blocks_data.append(
+                    (
+                        addr,
+                        bytes_per_block,
+                        tensor.device.index if tensor.is_cuda else 0,
+                    )
+                )
 
             logger.info(
                 "data_ptr %x block_len %d num_blocks %d",
@@ -389,6 +395,7 @@ class CpuGpuOffloadingHandlers:
             )
 
         nixl_memory_type = "VRAM" if tensors[0].is_cuda else "DRAM"
+
         logger.info("len block_descs %d", len(blocks_data), nixl_memory_type)
 
         xfer_descs = agent.get_xfer_descs(blocks_data, nixl_memory_type)
