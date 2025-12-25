@@ -132,7 +132,13 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         expand_block_ids(dst_blocks, self.dst_block_size_factor, src_to_dst[:, 1])
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
-        print("XXX $", src_to_dst_tensor)
+        print("XXX %s  \n meduim: %s", src_to_dst_tensor, src_spec.medium)
+
+        # initialize transfer mode
+        # xfer_handle = nixl_agent2.initialize_xfer(
+        #    "READ", agent2_xfer_descs, agent1_xfer_descs, remote_name, b"UUID1"
+        # )
+
         stream = (
             self._stream_pool.pop()
             if self._stream_pool
