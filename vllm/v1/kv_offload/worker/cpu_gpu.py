@@ -134,17 +134,17 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         action = "READ" if src_spec.medium() == "GPU" else "WRITE"
         print(
-            "XXX medium: %s src_to_dst: %s action %s: ",
+            "XXX medium: %s src_to_dst: %s action %s: src_blocks %s dst_blocks:",
             src_spec.medium(),
             src_to_dst_tensor,
             action,
+            src_blocks,
+            dst_blocks,
         )
 
-        # initialize transfer mode
-        # xfer_handle = nixl_agent2.initialize_xfer(
-        #    "READ", agent2_xfer_descs, agent1_xfer_descs, remote_name, b"UUID1"
+        # xfer_handle = self.cpu_nixl_agent.make_prepped_xfer(
+        # action, self.cpu_xfer_descs, [0, 1], remote_prep_handle, [1, 0], b"UUID2"
         # )
-
         stream = (
             self._stream_pool.pop()
             if self._stream_pool
