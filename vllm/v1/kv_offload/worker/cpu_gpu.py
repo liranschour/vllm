@@ -369,7 +369,7 @@ class CpuGpuOffloadingHandlers:
         reg_descs = agent.get_reg_descs(tensors)
         assert agent.register_memory(reg_descs) is not None
 
-        blocks_data: list[tuple[int, int, int]] = []
+        blocks_data = []
 
         for tensor in tensors:
             num_blocks = tensor.shape[0]
@@ -388,7 +388,8 @@ class CpuGpuOffloadingHandlers:
                 num_blocks,
             )
 
-        print("len block_descs %d", len(blocks_data))
+        nixl_memory_type = "VRAM" if tensors[0].is_cuda else "DRAM"
+        logger.info("len block_descs %d", len(blocks_data), nixl_memory_type)
 
         xfer_descs = agent.get_xfer_descs(
             blocks_data, "VRAM" if tensors[0].is_cuda else "DRAM"
