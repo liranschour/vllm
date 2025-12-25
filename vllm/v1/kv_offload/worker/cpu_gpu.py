@@ -281,6 +281,7 @@ class CpuGpuOffloadingHandlers:
             priority=-1,
         )
 
+        logger.info("Register GPU: %s and CPU: %s", gpu_tensors, cpu_tensors)
         self.gpu_nixl_agent, self.gpu_xfer_descs = self.nixl_register_kv(gpu_tensors)
         self.cpu_nixl_agent, self.cpu_xfer_descs = self.nixl_register_kv(cpu_tensors)
 
