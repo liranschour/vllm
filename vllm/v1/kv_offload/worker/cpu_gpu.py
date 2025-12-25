@@ -132,7 +132,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         expand_block_ids(dst_blocks, self.dst_block_size_factor, src_to_dst[:, 1])
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
-        action = "READ" if src_spec.meduim() == "GPU" else "WRITE"
+        action = "READ" if src_spec.medium() == "GPU" else "WRITE"
         logger.info(
             "XXX medium: %s src_to_dst: %s action %s: ",
             src_spec.medium(),
