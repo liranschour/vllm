@@ -121,7 +121,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         src_sub_blocks_to_skip = -dst_blocks.size % self.src_block_size_factor
 
         assert dst_sub_block_count == src_sub_block_count - src_sub_blocks_to_skip
-
+        print("XXX %", self.src_block_size_factor)
         src_to_dst = np.empty((dst_sub_block_count, 2), dtype=np.int64)
         expand_block_ids(
             src_blocks,
