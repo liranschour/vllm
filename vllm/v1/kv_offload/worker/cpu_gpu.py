@@ -134,7 +134,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         action = "READ" if src_spec.meduim() == "GPU" else "WRITE"
         logger.info(
-            "XXX medium: %s src_to_dst: %s action: ",
+            "XXX medium: %s src_to_dst: %s action %s: ",
             src_spec.medium(),
             src_to_dst_tensor,
             action,
