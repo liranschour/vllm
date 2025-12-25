@@ -390,7 +390,9 @@ class CpuGpuOffloadingHandlers:
 
         print("len block_descs %d", len(blocks_data))
 
-        xfer_descs = agent.get_xfer_descs(tensors)
+        xfer_descs = agent.get_xfer_descs(
+            blocks_data, "VRAM" if tensors[0].is_cuda else "DRAM"
+        )
 
         local_xfer_descs = agent.prep_xfer_dlist("NIXL_INIT_AGENT", xfer_descs)
 
