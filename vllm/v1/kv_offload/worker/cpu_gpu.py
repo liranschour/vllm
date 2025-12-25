@@ -156,7 +156,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             str(job_id).encode(),
         )
 
-        self.cpu_nixl_agent.transfer(xfer_handle)
+        # self.cpu_nixl_agent.transfer(xfer_handle)
 
         stream = (
             self._stream_pool.pop()
