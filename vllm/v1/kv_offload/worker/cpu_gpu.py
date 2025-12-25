@@ -367,20 +367,28 @@ class CpuGpuOffloadingHandlers:
         )
 
         reg_descs = agent.get_reg_descs(tensors)
+        assert agent.register_memory(reg_descs) is not None
 
-        block_descs: list[tuple[int, int, int]] = []
+        blocks_data: list[tuple[int, int, int]] = []
+
         for tensor in tensors:
+            num_blocks = tensor[0].numel()
+            base_addr = tensor.data_ptr()
+            block_len = tensor.numel() * tensor.element_size() // num_blocks
+            for i in range(num_blocks):
+                addr = base_addr + (i * block_len)
+                blocks_data.append((addr, block_len, tensor.device.id))
+
             logger.info(
-                "data_ptr %x total len %d block len %d",
+                "data_ptr %x block_len %d num_blocks %d",
                 tensor.data_ptr(),
-                tensor.numel() * tensor.element_size(),
-                tensor[0].numel(),
+                block_len,
+                num_blocks,
             )
-        print("len block_descs %d", len(block_descs))
+
+        print("len block_descs %d", len(blocks_data))
 
         xfer_descs = agent.get_xfer_descs(tensors)
-
-        assert agent.register_memory(reg_descs) is not None
 
         local_xfer_descs = agent.prep_xfer_dlist("NIXL_INIT_AGENT", xfer_descs)
 
