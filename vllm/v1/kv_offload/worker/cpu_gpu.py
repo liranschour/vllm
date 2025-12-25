@@ -171,7 +171,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         )
 
         print("xfer_handle %x", xfer_handle)
-        # self.cpu_nixl_agent.transfer(xfer_handle)
+        self.cpu_nixl_agent.transfer(xfer_handle)
 
         stream = (
             self._stream_pool.pop()
