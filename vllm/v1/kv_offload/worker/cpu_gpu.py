@@ -377,7 +377,7 @@ class CpuGpuOffloadingHandlers:
             block_len = tensor.numel() * tensor.element_size() // num_blocks
             for i in range(num_blocks):
                 addr = base_addr + (i * block_len)
-                blocks_data.append((addr, block_len, tensor.device.id))
+                blocks_data.append((addr, block_len, tensor.device.index))
 
             logger.info(
                 "data_ptr %x block_len %d num_blocks %d",
