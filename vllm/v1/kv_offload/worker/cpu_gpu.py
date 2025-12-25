@@ -71,6 +71,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         src_block_size_factor: int,
         dst_block_size_factor: int,
         priority: int,
+        cpu_nixl_agent: nixl_agent,
+        cpu_xfer_descs: int,
+        gpu_nixl_agent: nixl_agent,
+        gpu_xfer_descs: int,
+        cpu_gpu_xfer_descs: int,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -98,6 +103,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self.src_block_size_factor: int = src_block_size_factor
         self.dst_block_size_factor: int = dst_block_size_factor
         self.priority = priority
+        self.gpu_nixl_agent = gpu_nixl_agent
+        self.gpu_xfer_descs = gpu_xfer_descs
+        self.cpu_nixl_agent = cpu_nixl_agent
+        self.cpu_xfer_descs = cpu_xfer_descs
+        self.cpu_gpu_xfer_descs = cpu_gpu_xfer_descs
 
         # queue of transfers (job_id, stream, event)
         self._transfers: deque[tuple[int, torch.cuda.Stream, torch.Event]] = deque()
@@ -289,24 +299,6 @@ class CpuGpuOffloadingHandlers:
         # TODO (orozery): adapt swap_blocks to support gpu_block_size_factor
         assert gpu_block_size_factor == 1
 
-        self.gpu_to_cpu_handler = SingleDirectionOffloadingHandler(
-            src_tensors=gpu_tensors,
-            dst_tensors=cpu_tensors,
-            kv_dim_before_num_blocks=kv_dim_before_num_blocks,
-            src_block_size_factor=gpu_block_size_factor,
-            dst_block_size_factor=cpu_block_size_factor,
-            priority=1,
-        )
-
-        self.cpu_to_gpu_handler = SingleDirectionOffloadingHandler(
-            src_tensors=cpu_tensors,
-            dst_tensors=gpu_tensors,
-            kv_dim_before_num_blocks=kv_dim_before_num_blocks,
-            src_block_size_factor=cpu_block_size_factor,
-            dst_block_size_factor=gpu_block_size_factor,
-            priority=-1,
-        )
-
         logger.info(
             "Register GPU: %s and CPU: %s", gpu_tensors[0].shape, cpu_tensors[0].shape
         )
@@ -319,6 +311,29 @@ class CpuGpuOffloadingHandlers:
 
         self.cpu_gpu_xfer_descs = self.cpu_nixl_agent.prep_xfer_dlist(
             remote_name, gpu_tensors
+        )
+
+        self.gpu_to_cpu_handler = SingleDirectionOffloadingHandler(
+            src_tensors=gpu_tensors,
+            dst_tensors=cpu_tensors,
+            kv_dim_before_num_blocks=kv_dim_before_num_blocks,
+            src_block_size_factor=gpu_block_size_factor,
+            dst_block_size_factor=cpu_block_size_factor,
+            priority=1,
+            self.gpu_nixl_agent,
+            self.gpu_xfer_descs,
+            self.cpu_nixl_agent,
+            self.cpu_xfer_descs,
+            self.cpu_gpu_xfer_descs,
+        )
+
+        self.cpu_to_gpu_handler = SingleDirectionOffloadingHandler(
+            src_tensors=cpu_tensors,
+            dst_tensors=gpu_tensors,
+            kv_dim_before_num_blocks=kv_dim_before_num_blocks,
+            src_block_size_factor=cpu_block_size_factor,
+            dst_block_size_factor=gpu_block_size_factor,
+            priority=-1,
         )
 
     def nixl_register_kv(self, tensors: list[torch.Tensor]) -> tuple[nixl_agent, int]:
