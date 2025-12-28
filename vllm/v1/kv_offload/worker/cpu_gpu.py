@@ -175,7 +175,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         print("xfer_handle %x %s", xfer_handle, xfer_uuid)
         self.cpu_nixl_agent.transfer(xfer_handle)
 
-        self._transfers.append((job_id, None, None))
+        self._transfers.append((job_id, xfer_handle, None))
 
         # return Success
         return True
