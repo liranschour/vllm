@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import uuid
 from collections import deque
+from typing import cast
 
 import numpy as np
 import torch
@@ -110,7 +111,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         self.cpu_gpu_xfer_descs = cpu_gpu_xfer_descs
 
         # queue of transfers (job_id, stream, event)
-        self._transfers: deque[tuple[int, torch.cuda.Stream, torch.Event]] = deque()
+        self._transfers: deque[tuple[int, object, object]] = deque()
         # list of CUDA streams available for re-use
         self._stream_pool: list[torch.cuda.Stream] = []
         # list of CUDA events available for re-use
@@ -161,17 +162,23 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             type(gpu_blocks),
         )
 
+        xfer_uuid = job_id.to_bytes(job_id, byteorder="big", signed=True)
         xfer_handle = self.cpu_nixl_agent.make_prepped_xfer(
             action,
             self.cpu_xfer_descs,
             cpu_blocks,
             self.cpu_gpu_xfer_descs,
             gpu_blocks,
-            b"TEST",
+            xfer_uuid,
         )
 
-        print("xfer_handle %x", xfer_handle)
+        print("xfer_handle %x %s", xfer_handle, xfer_uuid)
         self.cpu_nixl_agent.transfer(xfer_handle)
+
+        self._transfers.append((job_id, None, None))
+
+        # return Success
+        return True
 
         stream = (
             self._stream_pool.pop()
@@ -203,11 +210,13 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        while self._transfers and self._transfers[0][2].query():
-            job_id, stream, event = self._transfers.popleft()
-            results.append((job_id, True))
-            self._stream_pool.append(stream)
-            self._event_pool.append(event)
+        while self._transfers:
+            transfer = cast(torch.Event, self._transfers[0][2])
+            if transfer.query() is not None:
+                job_id, stream, event = transfer.popleft()
+                results.append((job_id, True))
+                self._stream_pool.append(stream)
+                self._event_pool.append(event)
         return results
 
 
