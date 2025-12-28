@@ -225,6 +225,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     # res = self.nixl_wrapper.get_xfer_telemetry(handle)
                     # self.xfer_stats.record_transfer(res)
                     self.nixl_agent.release_xfer_handle(xfer_handle)
+                    logger.info("XXX completed transfer %d %d", job_id, xfer_handle)
                     results.append((job_id, True))
                     self._transfers.popleft()
                 elif xfer_state == "PROC":
