@@ -219,12 +219,12 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 logger.error("This should not happen")
                 continue
             try:
-                xfer_state = self.nixl_agent.check_xfer_state(xfer_handle)
+                xfer_state = self.cpu_nixl_agent.check_xfer_state(xfer_handle)
                 if xfer_state == "DONE":
                     # Get telemetry from NIXL
                     # res = self.nixl_wrapper.get_xfer_telemetry(handle)
                     # self.xfer_stats.record_transfer(res)
-                    self.nixl_agent.release_xfer_handle(xfer_handle)
+                    self.cpu_nixl_agent.release_xfer_handle(xfer_handle)
                     logger.info("XXX completed transfer %d %d", job_id, xfer_handle)
                     results.append((job_id, True))
                     self._transfers.popleft()
