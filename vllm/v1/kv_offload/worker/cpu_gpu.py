@@ -211,13 +211,50 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
         while self._transfers:
-            transfer = cast(torch.Event, self._transfers[0][2])
-            if transfer.query() is not None:
-                job_id, stream, event = transfer.popleft()
-                results.append((job_id, True))
-                self._stream_pool.append(stream)
-                self._event_pool.append(event)
+            job_id, xfer_handle = cast(
+                tuple[int, int], (self._transfers[0][0], self._transfers[0][1])
+            )
+            if job_id is None or xfer_handle is None:
+                self._transfers.popleft()
+                logger.error("This should not happen")
+                continue
+            try:
+                xfer_state = self.nixl_agent.check_xfer_state(xfer_handle)
+                if xfer_state == "DONE":
+                    # Get telemetry from NIXL
+                    # res = self.nixl_wrapper.get_xfer_telemetry(handle)
+                    # self.xfer_stats.record_transfer(res)
+                    self.nixl_agent.release_xfer_handle(xfer_handle)
+                    results.append((job_id, True))
+                    self._transfers.popleft()
+                elif xfer_state == "PROC":
+                    continue
+                else:
+                    logger.error(
+                        "NIXL transfer failed for request %s with state "
+                        "%s. Marking blocks as invalid.",
+                        job_id,
+                        xfer_state,
+                    )
+            except Exception:
+                logger.exception(
+                    "NIXL transfer exception for job %d handle %d. "
+                    "Marking blocks as invalid.",
+                    job_id,
+                    xfer_handle,
+                )
         return results
+
+        #########################
+
+
+#            transfer = cast(torch.Event, self._transfers[0][2])
+#            if transfer.query() is not None:
+#                job_id, stream, event = transfer.popleft()
+#                results.append((job_id, True))
+#                self._stream_pool.append(stream)
+#                self._event_pool.append(event)
+#        return results
 
 
 class CpuGpuOffloadingHandlers:
