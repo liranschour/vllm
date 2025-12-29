@@ -446,6 +446,7 @@ class CpuGpuOffloadingHandlers:
         )
 
         reg_descs = agent.get_reg_descs(tensors)
+        logger.info("XXX register memory %d %s", reg_descs, tensors[0].is_cuda)
         assert agent.register_memory(reg_descs) is not None
 
         blocks_data, nixl_memory_type = self.get_blocks_data(tensors)
