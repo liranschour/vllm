@@ -426,6 +426,7 @@ class CpuGpuOffloadingHandlers:
         return (blocks_data, nixl_memory_type)
 
     def nixl_register_kv(self, tensors: list[torch.Tensor]) -> tuple[nixl_agent, int]:
+        logger.info("XXX Start")
         agent_config = nixl_agent_config(backends=["UCX"])
         agent = nixl_agent(str(uuid.uuid4()), agent_config)
         assert agent is not None
