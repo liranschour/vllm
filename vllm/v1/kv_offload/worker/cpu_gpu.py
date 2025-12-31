@@ -132,7 +132,6 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         src_sub_blocks_to_skip = -dst_blocks.size % self.src_block_size_factor
 
         assert dst_sub_block_count == src_sub_block_count - src_sub_blocks_to_skip
-        print("XXX %s", self.src_block_size_factor)
         src_to_dst = np.empty((dst_sub_block_count, 2), dtype=np.int64)
         expand_block_ids(
             src_blocks,
@@ -149,10 +148,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             else ("WRITE", src_blocks.tolist(), dst_blocks.tolist())
         )
 
-        logger.info("cpu blocks %s type: %s", cpu_blocks, type(cpu_blocks))
-        logger.info(
-            "XXX medium: %s src_to_dst: %s action %s: "
-            "src_blocks %s %s dst_blocks %s %s",
+        logger.debug(
+            "medium: %s src_to_dst: %s action %s: src_blocks %s %s dst_blocks %s %s",
             src_spec.medium(),
             src_to_dst_tensor,
             action,
@@ -172,7 +169,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             xfer_uuid,
         )
 
-        print("xfer_handle %x %s", xfer_handle, xfer_uuid)
+        print("xfer_handle %x %s %s", xfer_handle, xfer_uuid, action)
         self.cpu_nixl_agent.transfer(xfer_handle)
 
         self._transfers.append((job_id, xfer_handle, None))
@@ -225,7 +222,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                     # res = self.nixl_wrapper.get_xfer_telemetry(handle)
                     # self.xfer_stats.record_transfer(res)
                     self.cpu_nixl_agent.release_xfer_handle(xfer_handle)
-                    logger.info("XXX completed transfer %d %d", job_id, xfer_handle)
+                    logger.debug("Completed transfer %d %d", job_id, xfer_handle)
                     results.append((job_id, True))
                     self._transfers.popleft()
                 elif xfer_state == "PROC":
@@ -426,7 +423,6 @@ class CpuGpuOffloadingHandlers:
         return (blocks_data, nixl_memory_type)
 
     def nixl_register_kv(self, tensors: list[torch.Tensor]) -> tuple[nixl_agent, int]:
-        logger.info("XXX Start")
         agent_config = nixl_agent_config(backends=["UCX"])
         agent = nixl_agent(str(uuid.uuid4()), agent_config)
         assert agent is not None
@@ -447,7 +443,6 @@ class CpuGpuOffloadingHandlers:
         )
 
         reg_descs = agent.get_reg_descs(tensors)
-        logger.info("XXX register memory %d %s", reg_descs, tensors[0].is_cuda)
         assert agent.register_memory(reg_descs) is not None
 
         blocks_data, nixl_memory_type = self.get_blocks_data(tensors)
