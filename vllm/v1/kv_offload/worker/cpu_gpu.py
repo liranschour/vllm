@@ -169,7 +169,6 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             xfer_uuid,
         )
 
-        print("xfer_handle %x %s %s", xfer_handle, xfer_uuid, action)
         self.cpu_nixl_agent.transfer(xfer_handle)
 
         self._transfers.append((job_id, xfer_handle, None))
@@ -424,9 +423,6 @@ class CpuGpuOffloadingHandlers:
 
     def nixl_register_kv(self, tensors: list[torch.Tensor]) -> tuple[nixl_agent, int]:
         agent_config = nixl_agent_config(backends=["UCX"])
-        import nixl
-
-        logger.info("NIXL %s", repr(nixl))
         agent = nixl_agent(str(uuid.uuid4()), agent_config)
         assert agent is not None
 
