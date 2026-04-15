@@ -2,7 +2,7 @@
 
 ## Abstract
 
-In this design PD disaggregation is based on the vLLM CPU KV cache which is per vLLM instance and it is in canonical layout (single TP unified block size). The PD Connector is a secondary tier that is registered as such. Orchestration with the CPU cache is done via the PrimaryTier and it not known to the secondary tiers.
+In this design PD disaggregation is based on the vLLM CPU KV cache which is per vLLM instance and it is in canonical layout (single TP unified block size). The PD Connector is a secondary tier that implements the `SecondaryTierManager` interface. Orchestration between the primary tier (CPU Manager) and secondary tiers is done by the `TieringManager`, which is transparent to the secondary tiers.
 
 ## Assumptions
 
@@ -28,21 +28,24 @@ In this design PD disaggregation is based on the vLLM CPU KV cache which is per 
 
 #### Components
 
-- **OffloadingManager (CPU KV Cache)** — Manages the CPU KV cache per vLLM instance in canonical layout.
+- **OffloadingConnector** — The vLLM V1 connector interface. Holds a single `OffloadingManager`. Unchanged from the existing design.
 
-- **PrimaryTier** — The main component that drives the KV cache lifecycle. It interacts with the OffloadingManager to offload GPU memory to CPU and triggers secondary tiers accordingly.
+- **TieringManager** — Implements the `OffloadingManager` interface and orchestrates the tier hierarchy. It dispatches operations to the primary tier and all registered secondary tiers. On store completion in the primary tier, it cascades to every secondary tier. On load, it checks the primary tier first, then falls back to secondary tiers for promotion.
 
-- **SecondaryTier** — A pluggable component registered with the OffloadingManager that implements the actual KV cache transfer between nodes. The PD Connector is implemented as a secondary tier, handling load and store between peers.
+- **PrimaryTier (CPU Manager)** — The single tier with exclusive access to GPU KV memory. Manages the CPU DRAM KV cache per vLLM instance in canonical layout. Handles GPU↔CPU data migration on the worker side.
+
+- **SecondaryTier (PD Connector)** — Implements the `SecondaryTierManager` interface. Reads and writes the primary tier's CPU memory via zero-copy memory views (`JobMetadata.spec`). Has no direct GPU access. The PD Connector is a concrete secondary tier that handles KV cache transfer between Prefiller and Decoder nodes via NIXL.
 
 #### Component Diagram
 
 ```mermaid
 graph TD
-    PP[PrimaryTier] -->|schedule load/store| OM["OffloadingManager<br/>CPU KV Cache"]
-    PP -->|load/save| SP["SecondaryTier<br/>PD Connector"]
-    PP -->|get_required_blocks| SP
-    SP -->|CTRL:lookup_fetch| Remote[Remote Peer PD]
-    SP -->|NIXL.Transfer| Remote
+    OC[OffloadingConnector] --> TM[TieringManager]
+    TM -->|GPU↔CPU offload| PT["PrimaryTier<br/>CPU Manager"]
+    TM -->|submit_store/submit_load| ST["SecondaryTier<br/>PD Connector"]
+    TM -->|get_finished| ST
+    ST -->|CTRL:lookup_fetch| Remote[Remote Peer PD]
+    ST -->|NIXL.Transfer| Remote
 ```
 
 ### Design Decisions
@@ -52,15 +55,22 @@ graph TD
     - When do we know for sure that blocks have been saved already
   - **Option 2** - Control message that will prepare the data operation and then trigger one-sided transfer.
 - Allow streaming of saved KV blocks on the prefiller side to the Decoder.
-  Implemented by allowing to submit the request to the decoder at once before KV blocks are computed on the Prefiller. This allows the prefiller to send KV blocks once they are in the CPU cache after receiving an allocate_fetch() control command from the decoder.
+  Implemented by allowing to submit the request to the decoder at once before KV blocks are computed on the Prefiller. This allows the prefiller to send KV blocks once they are in the CPU cache after receiving a lookup_fetch() control command from the decoder.
 ### API
 
-#### Secondary Tier
-- `register_secondary_tier()`
-- `load(job_id, block_hashs, peer_id)` — Decoder initiates a load from Prefiller
-- `get_required_blocks()` - Polled by the primary tier
-- `save(job_id, block_descs)` — Prefiller saves blocks
-- `get_finished()` — Async notification of load/save operation completion
+#### SecondaryTierManager Interface (from RFC #38260)
+- `lookup(block_hashes) -> int | None` — Check if the secondary tier has the requested blocks (e.g., if a remote peer has them)
+- `submit_store(job_metadata: JobMetadata) -> None` — Async store: cascade blocks from primary tier CPU memory to the secondary tier
+- `submit_load(job_metadata: JobMetadata) -> None` — Async load: promote blocks from the secondary tier into primary tier CPU memory
+- `get_finished() -> Iterable[JobResult]` — Poll for completed async store/load jobs
+- `touch(block_hashes)` — Mark blocks as recently used (eviction hint)
+
+`JobMetadata` carries `job_id`, `block_hashes`, and a `spec: CPUMemoryViewLoadStoreSpec` — a zero-copy memory view into the primary tier's CPU tensors. For `submit_store` the view is read-only; for `submit_load` it is writable.
+
+#### PD Connector Extensions
+- `submit_load` on the Decoder sends a `CTRL:lookup_fetch` to the Prefiller peer, triggering a NIXL WRITE transfer back into the Decoder's CPU memory view
+- `submit_store` on the Prefiller registers block descriptors so they can be served when a `lookup_fetch` arrives
+- Streaming: the TieringManager may call `submit_store` in chunks as blocks become available; the PD Connector transfers each chunk as soon as it is saved
 
 ### Flow
 
@@ -68,32 +78,31 @@ graph TD
 
 ```mermaid
 sequenceDiagram
-    participant Prefiller_OC as Prefiller PrimaryTier
+    participant Prefiller_TM as Prefiller TieringManager
     participant Prefiller_PD as Prefiller SecondaryTier PD
     participant Decoder_PD as Decoder SecondaryTier PD
-    participant Decoder_OC as Decoder PrimaryTier
+    participant Decoder_TM as Decoder TieringManager
 
     Prefiller_PD->>Prefiller_PD: Open listener thread
     Decoder_PD->>Decoder_PD: Open listener thread
 
-    Note over Prefiller_OC,Decoder_OC: ── Init time ──
+    Note over Prefiller_TM,Decoder_TM: ── Init time ──
 
-    Decoder_OC->>Decoder_PD: load(job_id, block_hashs, peer_id)
+    Decoder_TM->>Decoder_PD: submit_load(job_metadata)
     Note right of Prefiller_PD: If no connection to D exists,<br/>do handshake and create connection
 
-    Decoder_PD->>Prefiller_PD: 𝗖𝗧𝗥𝗟:lookup_fetch(job_id, block_hashs, local_block_descs)
+    Decoder_PD->>Prefiller_PD: 𝗖𝗧𝗥𝗟:lookup_fetch(job_id, block_hashes, block_indexes)
 
-    Prefiller_OC->>Prefiller_PD: get_required_blocks()
-    Note left of Prefiller_OC: Iterate over chunks till completion
-    Prefiller_OC->>Prefiller_PD: save(job_id, block_descs)
+    Note left of Prefiller_TM: Iterate over chunks till completion
+    Prefiller_TM->>Prefiller_PD: submit_store(job_metadata)
 
     Prefiller_PD-)Decoder_PD: 𝗗𝗔𝗧𝗔:NIXL.Transfer(WRITE, local_block_descs, remote_block_descs)
 
     Prefiller_PD-->>Decoder_PD: Transfer complete
     Prefiller_PD-->>Prefiller_PD: Transfer complete
 
-    Decoder_OC->>Decoder_PD: get_finished(job_id)
-    Prefiller_OC->>Prefiller_PD: get_finished(job_id)
+    Decoder_TM->>Decoder_PD: get_finished()
+    Prefiller_TM->>Prefiller_PD: get_finished()
 
 ```
 ### Error Handling
