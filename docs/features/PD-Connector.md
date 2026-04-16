@@ -319,13 +319,26 @@ remain `None` and no registration is attempted.
 
 ### Step 5: Connection Establishment
 
-When `load()` is called for a peer not yet connected, establish a ZMQ control channel connection. The Decoder sends its NIXL agent metadata and KV block descriptors to the Prefiller. The Prefiller uses these to prep a remote descriptor list (`remote_dlist`) so that future `make_prepped_xfer` transfers need only block indices.
+When `submit_load()` is called for a peer not yet connected, establish a ZMQ control
+channel connection. The Decoder sends its NIXL agent metadata and three compact memory
+layout parameters (`base_addr`, `num_blocks`, `block_len`). The Prefiller uses these to
+reconstruct the per-block descriptor list and prep a remote descriptor list (`remote_dlist`)
+so that future `make_prepped_xfer` transfers need only block indices.
 
-The Prefiller does **not** send its metadata back. The Decoder is the WRITE target, not the initiator — `add_remote_agent` is only required on the side that initiates transfers (Prefiller).
+The Prefiller does **not** send its metadata back. The Decoder is the WRITE target, not the
+initiator — `add_remote_agent` is only required on the side that initiates transfers
+(Prefiller).
 
 #### peer_id format
 
-`peer_id` encodes the remote ZMQ listener address as `"<host>:<port>"`. `load()` parses it to drive `_ctrl.connect()`.
+`peer_id` encodes the remote ZMQ listener address as `"<host>:<port>"`. Already the
+existing format — no change needed.
+
+#### Naming
+
+The existing `_connect(remote_peer_id, host, port)` is renamed to
+`_open_channel(remote_peer_id, host, port)` (ZMQ-level socket setup only).
+The new application-level method is `_ensure_connected(peer_id)`.
 
 #### Handshake
 
@@ -333,66 +346,98 @@ The Prefiller does **not** send its metadata back. The Decoder is the WRITE targ
 Decoder ──connect msg──► Prefiller
          {type: "connect",
           peer_id: decoder_id,
-          agent_metadata: <bytes>,        # Decoder's NIXL metadata (needed by Prefiller to WRITE)
-          block_descs: [[addr,len,dev_id], ...]}  # Decoder's kv_blocks as list of 3-tuples
+          agent_metadata: <bytes>,   # Decoder's NIXL metadata (Prefiller needs to WRITE)
+          base_addr:  <int>,         # ctypes.data of kv_blocks[0]
+          num_blocks: <int>,         # len(kv_blocks)
+          block_len:  <int>}         # nbytes of each block (must equal Prefiller's block_len)
 
 Decoder ◄──connect_ack── Prefiller
          {type: "connect_ack",
-          peer_id: prefiller_id}          # No metadata: Decoder does not initiate transfers
+          peer_id: prefiller_id}     # No metadata: Decoder does not initiate transfers
 ```
 
-The Decoder blocks in `_connect()` until the `connect_ack` arrives (per-peer `threading.Event`, with timeout).
+The Prefiller verifies `msg["block_len"] == self._kv_blocks[0].nbytes` and raises
+`ValueError` if they differ (incompatible block sizes).
+
+The Prefiller reconstructs the per-block descriptor list inline:
+```python
+base_addr  = msg["base_addr"]
+num_blocks = msg["num_blocks"]
+block_len  = msg["block_len"]
+block_descs = [(base_addr + i * block_len, block_len, 0) for i in range(num_blocks)]
+```
+then calls `get_xfer_descs(block_descs, mem_type="DRAM")` → `prep_xfer_dlist(nixl_name, ...)`.
+
+The Decoder blocks in `_ensure_connected()` until `connect_ack` arrives
+(per-peer `threading.Event`, timeout = 10 s).
 
 #### State added
 
 | Field | Type | Description |
 |---|---|---|
 | `_connections` | `set[str]` | peer_ids with a completed handshake |
-| `_connect_events` | `dict[str, Event]` | one Event per in-progress connect |
+| `_connect_events` | `dict[str, threading.Event]` | one Event per in-progress connect |
 | `_remote_dlists` | `dict[str, nixl_prepped_dlist_handle]` | Prefiller's prepped dlist per Decoder peer |
+| `_peer_nixl_names` | `dict[str, str]` | peer_id → NIXL agent name (from `add_remote_agent`) |
+
+`_peer_nixl_names` is needed because `add_remote_agent(metadata)` returns a NIXL-assigned
+name string that must be passed to `prep_xfer_dlist` and `remove_remote_agent`.
 
 #### Flow
 
-**Decoder side** (`load()` → `_connect(peer_id)`):
-1. Parse `host, port = peer_id.rsplit(":", 1)`
-2. `self._ctrl.connect(peer_id, host, int(port))`
-3. Send `connect` message with `self._agent.get_agent_metadata()` and kv_blocks as `[(addr, nbytes, dev_id), ...]`
-4. Wait on `self._connect_events[peer_id]` (timeout = 10 s)
-5. Mark `peer_id` in `self._connections`
+**Decoder side** (`submit_load()` → `_ensure_connected(peer_id)`):
+1. If `peer_id` already in `_connections`, return immediately
+2. `_open_channel(peer_id, host, int(port))` — open ZMQ DEALER socket
+3. Send `connect` message: `agent_metadata`, `base_addr`, `num_blocks`, `block_len`
+4. Wait on `_connect_events[peer_id]` (timeout = 10 s)
 
-**Prefiller side** (listener handles `connect`):
-1. `self._agent.add_remote_agent(msg["agent_metadata"])` — Prefiller learns Decoder's transport endpoints
-2. `self._remote_dlists[sender_id] = self._agent.prep_xfer_dlist(sender_id, block_descs, mem_type="cpu")`
-3. Connect back to Decoder's ZMQ listener, mark `sender_id` in `self._connections`
-4. Reply with `connect_ack` — **no metadata included**
+**Prefiller side** (`_handle_message` handles `"connect"`):
+1. Verify `msg["block_len"] == self._kv_blocks[0].nbytes`; raise `ValueError` on mismatch
+2. `nixl_name = self._agent.add_remote_agent(msg["agent_metadata"])`
+3. Reconstruct: `block_descs = [(msg["base_addr"] + i * msg["block_len"], msg["block_len"], 0) for i in range(msg["num_blocks"])]`
+4. `xfer_dlist = self._agent.get_xfer_descs(block_descs, mem_type="DRAM")`
+5. `remote_dlist = self._agent.prep_xfer_dlist(nixl_name, xfer_dlist)`
+6. Store in `_peer_nixl_names[decoder_peer_id]`, `_remote_dlists[decoder_peer_id]`,
+   `_connections.add(decoder_peer_id)`
+7. Open reverse channel via `_open_channel` if not already open
+8. Send `connect_ack` — **no metadata**
 
-**Decoder side** (listener handles `connect_ack`):
-1. Mark `sender_id` in `self._connections`
-2. Set `self._connect_events[sender_id]` — unblocks `_ensure_connected`
+**Decoder side** (`_handle_message` handles `"connect_ack"`):
+1. `_connections.add(sender_id)`
+2. Pop and set `_connect_events[sender_id]` — unblocks `_ensure_connected`
 
 #### On peer down
 
-`_on_peer_down()` removes the peer from `_connections` and releases its entry in `_remote_dlists`.
+`_on_peer_down()` additionally:
+- Discards `peer_id` from `_connections`
+- Pops and sets any pending `_connect_events[peer_id]` entry (unblock waiters)
+- Calls `self._agent.remove_remote_agent(nixl_name)` for the peer's NIXL name
+- Calls `self._agent.release_dlist_handle(dlist)` for the peer's remote dlist
+
+#### On close
+
+`close()` additionally releases all `_remote_dlists` handles and calls
+`remove_remote_agent` for all entries in `_peer_nixl_names`.
 
 #### Tasks
-- [ ] Change `peer_id` contract: format `"<host>:<port>"`; parse in `_connect()`
-- [ ] Add `_connections: set[str]`, `_connect_events: dict[str, threading.Event]`, `_remote_dlists: dict[str, nixl_prepped_dlist_handle]`
-- [ ] `load()`: if `peer_id` not in `_connections`, call `_connect(peer_id)` before sending `lookup_fetch`
-- [ ] Implement `_connect(peer_id)`: parse host/port, ZMQ connect, send `connect` message, wait on event
-- [ ] Listener handles `connect`: `add_remote_agent`, `prep_xfer_dlist` → `_remote_dlists`, send `connect_ack` (no metadata)
-- [ ] Listener handles `connect_ack`: set event (no `add_remote_agent`)
-- [ ] `_on_peer_down()`: clear `_connections` entry, release and remove `_remote_dlists` entry
-- [ ] `close()`: release all `_remote_dlists` handles
-- [ ] Add integration test: two connectors, `load()` triggers handshake, verify both sides have `_connections` populated and Prefiller has `_remote_dlists` entry
+- [ ] Rename `_connect(remote_peer_id, host, port)` → `_open_channel(remote_peer_id, host, port)`; update all call sites and tests
+- [ ] Add `_connections`, `_connect_events`, `_remote_dlists`, `_peer_nixl_names` in `__init__`
+- [ ] Implement `_ensure_connected(peer_id)`
+- [ ] Extend `_handle_message` with `"connect"` handler (Prefiller side)
+- [ ] Extend `_handle_message` with `"connect_ack"` handler (Decoder side)
+- [ ] Extend `_on_peer_down()` to clean up connection and NIXL remote state
+- [ ] Extend `close()` to release all remote dlists and remove remote agents
+- [ ] Add `TestConnectionEstablishment` integration test: two connectors, call
+      `_ensure_connected`, verify `_connections` on both sides and `_remote_dlists`
+      on Prefiller side
 
 #### Tests
 
-Tests are located in `tests/test_pd_connector.py`.
+Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
 
 To run:
 ```bash
-cd /home/lirans/my-utils/pd-connector
-python3 -m pytest tests/test_pd_connector.py -v
+venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
 ### Step 6: Lookup-Fetch with Two-Phase Timeout

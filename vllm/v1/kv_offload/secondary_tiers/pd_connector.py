@@ -82,6 +82,12 @@ class PDConnector(SecondaryTierManager):
         self._closed = False
         self._lock = threading.Lock()
 
+        # Connection state (all accessed under _lock)
+        self._connections: set[str] = set()
+        self._connect_events: dict[str, threading.Event] = {}
+        self._remote_dlists: dict[str, object] = {}
+        self._peer_nixl_names: dict[str, str] = {}
+
         self._zmq_ctx = zmq.Context()
 
         # ROUTER: single listener for all incoming peers
@@ -111,7 +117,7 @@ class PDConnector(SecondaryTierManager):
     # Connection management
     # ------------------------------------------------------------------
 
-    def _connect(self, remote_peer_id: str, host: str, port: int) -> None:
+    def _open_channel(self, remote_peer_id: str, host: str, port: int) -> None:
         """
         Open a DEALER socket to remote_peer_id's ROUTER and begin monitoring it.
 
@@ -137,6 +143,43 @@ class PDConnector(SecondaryTierManager):
             self._dealers[remote_peer_id] = dealer
             self._monitor_sockets[remote_peer_id] = monitor_sock
 
+    def _ensure_connected(self, peer_id: str) -> None:
+        """
+        Application-level NIXL handshake with a remote peer (Decoder side).
+
+        Sends a 'connect' message containing this node's NIXL agent metadata
+        and compact memory layout parameters (base_addr, num_blocks, block_len).
+        Blocks until the Prefiller replies with 'connect_ack' (timeout = 10 s).
+
+        Safe to call concurrently: a per-peer threading.Event serialises
+        multiple callers waiting for the same handshake.
+        """
+        with self._lock:
+            if peer_id in self._connections:
+                return
+            if peer_id in self._connect_events:
+                event = self._connect_events[peer_id]
+            else:
+                event = threading.Event()
+                self._connect_events[peer_id] = event
+
+        host, port_str = peer_id.rsplit(":", 1)
+        self._open_channel(peer_id, host, int(port_str))
+
+        self._send(peer_id, {
+            "type": "connect",
+            "peer_id": self._peer_id,
+            "agent_metadata": self._agent.get_agent_metadata(),
+            "base_addr": int(np.asarray(self._kv_blocks[0]).ctypes.data),
+            "num_blocks": len(self._kv_blocks),
+            "block_len": self._kv_blocks[0].nbytes,
+        })
+
+        if not event.wait(timeout=10.0):
+            raise TimeoutError(
+                f"PDConnector: connect handshake timed out for {peer_id}"
+            )
+
     # ------------------------------------------------------------------
     # Messaging
     # ------------------------------------------------------------------
@@ -153,11 +196,66 @@ class PDConnector(SecondaryTierManager):
         dealer.send(data)
 
     def _handle_message(self, sender_id: str, msg: dict) -> None:
-        """
-        Dispatch an incoming control message.
-        Extended in later steps (lookup_fetch, lookup_ack/nack, transfer_done).
-        """
-        pass
+        """Dispatch an incoming control message."""
+        msg_type = msg.get("type")
+
+        if msg_type == "connect":
+            # Prefiller side: Decoder is establishing a NIXL connection.
+            decoder_peer_id = msg["peer_id"]
+            local_block_len = self._kv_blocks[0].nbytes
+            if msg["block_len"] != local_block_len:
+                logger.error(
+                    "PDConnector %s: block_len mismatch from %s: "
+                    "remote=%d, local=%d — rejecting connect",
+                    self._peer_id,
+                    decoder_peer_id,
+                    msg["block_len"],
+                    local_block_len,
+                )
+                return
+            nixl_name = self._agent.add_remote_agent(msg["agent_metadata"])
+            base_addr = msg["base_addr"]
+            num_blocks = msg["num_blocks"]
+            block_len = msg["block_len"]
+            block_descs = [
+                (base_addr + i * block_len, block_len, 0)
+                for i in range(num_blocks)
+            ]
+            xfer_dlist = self._agent.get_xfer_descs(block_descs, mem_type="DRAM")
+            remote_dlist = self._agent.prep_xfer_dlist(nixl_name, xfer_dlist)
+
+            with self._lock:
+                self._peer_nixl_names[decoder_peer_id] = nixl_name
+                self._remote_dlists[decoder_peer_id] = remote_dlist
+                self._connections.add(decoder_peer_id)
+
+            # Open reverse ZMQ channel if not already open.
+            with self._lock:
+                already_open = decoder_peer_id in self._dealers
+            if not already_open:
+                dhost, dport = decoder_peer_id.rsplit(":", 1)
+                self._open_channel(decoder_peer_id, dhost, int(dport))
+
+            self._send(decoder_peer_id, {
+                "type": "connect_ack",
+                "peer_id": self._peer_id,
+            })
+
+        elif msg_type == "connect_ack":
+            # Decoder side: Prefiller has completed the handshake.
+            with self._lock:
+                self._connections.add(sender_id)
+                event = self._connect_events.pop(sender_id, None)
+            if event:
+                event.set()
+
+        else:
+            logger.warning(
+                "PDConnector %s: unknown message type %r from %s",
+                self._peer_id,
+                msg_type,
+                sender_id,
+            )
 
     # ------------------------------------------------------------------
     # Background threads
@@ -261,8 +359,7 @@ class PDConnector(SecondaryTierManager):
         """
         Called when a peer connection is lost (clean disconnect or heartbeat timeout).
 
-        Cleans up the DEALER and monitor sockets for the peer.
-        Job cancellation logic is added in later steps.
+        Cleans up ZMQ sockets and any NIXL remote state for the peer.
         """
         with self._lock:
             if peer_id not in self._dealers:
@@ -270,11 +367,22 @@ class PDConnector(SecondaryTierManager):
                 return
             dealer = self._dealers.pop(peer_id)
             monitor = self._monitor_sockets.pop(peer_id)
+            self._connections.discard(peer_id)
+            event = self._connect_events.pop(peer_id, None)
+            nixl_name = self._peer_nixl_names.pop(peer_id, None)
+            dlist = self._remote_dlists.pop(peer_id, None)
 
         logger.warning("PDConnector %s: peer %s is down", self._peer_id, peer_id)
 
         monitor.close()
         dealer.close()
+
+        if event:
+            event.set()
+        if nixl_name and self._agent is not None:
+            self._agent.remove_remote_agent(nixl_name)
+        if dlist and self._agent is not None:
+            self._agent.release_dlist_handle(dlist)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -315,7 +423,20 @@ class PDConnector(SecondaryTierManager):
         self._router.setsockopt(zmq.LINGER, 0)
         self._router.close()
 
-        # Release NIXL resources before destroying the ZMQ context.
+        # Release remote NIXL descriptor lists and deregister remote agents.
+        with self._lock:
+            remote_items = list(self._remote_dlists.items())
+            nixl_names = list(self._peer_nixl_names.values())
+            self._remote_dlists.clear()
+            self._peer_nixl_names.clear()
+            self._connections.clear()
+        if self._agent is not None:
+            for _peer_id, dlist in remote_items:
+                self._agent.release_dlist_handle(dlist)
+            for nixl_name in nixl_names:
+                self._agent.remove_remote_agent(nixl_name)
+
+        # Release local NIXL resources before destroying the ZMQ context.
         if self._local_dlist is not None:
             self._agent.release_dlist_handle(self._local_dlist)
             self._local_dlist = None
@@ -369,7 +490,7 @@ class PDConnector(SecondaryTierManager):
         self._local_dlist = self._agent.prep_xfer_dlist(
             "NIXL_INIT_AGENT", xfer_dlist
         )
-        logger.info(
+        logger.debug(
             "PDConnector %s: registered %d blocks with NIXL",
             self._peer_id,
             len(self._kv_blocks),

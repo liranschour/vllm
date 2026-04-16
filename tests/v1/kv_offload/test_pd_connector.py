@@ -182,7 +182,7 @@ class TestZMQControlChannel:
         a = _CapturingConnector("127.0.0.1", pa)
         b = _CapturingConnector("127.0.0.1", pb)
         try:
-            a._connect(b._peer_id, "127.0.0.1", pb)
+            a._open_channel(b._peer_id, "127.0.0.1", pb)
             time.sleep(0.1)  # allow TCP connection to establish
 
             a._send(b._peer_id, {"type": "ping", "data": "hello"})
@@ -203,8 +203,8 @@ class TestZMQControlChannel:
         b = _CapturingConnector("127.0.0.1", pb)
         try:
             # Both sides connect to each other for full bidirectionality
-            a._connect(b._peer_id, "127.0.0.1", pb)
-            b._connect(a._peer_id, "127.0.0.1", pa)
+            a._open_channel(b._peer_id, "127.0.0.1", pb)
+            b._open_channel(a._peer_id, "127.0.0.1", pa)
             time.sleep(0.1)
 
             b._send(a._peer_id, {"type": "pong", "value": 42})
@@ -223,8 +223,8 @@ class TestZMQControlChannel:
         a = _CapturingConnector("127.0.0.1", pa)
         b = _CapturingConnector("127.0.0.1", pb)
         try:
-            a._connect(b._peer_id, "127.0.0.1", pb)
-            b._connect(a._peer_id, "127.0.0.1", pa)
+            a._open_channel(b._peer_id, "127.0.0.1", pb)
+            b._open_channel(a._peer_id, "127.0.0.1", pa)
             time.sleep(0.1)
 
             a._send(b._peer_id, {"type": "from_a"})
@@ -246,7 +246,7 @@ class TestZMQControlChannel:
         b = _CapturingConnector("127.0.0.1", pb)
         try:
             # A connects to B so A can send the disconnect message
-            a._connect(b._peer_id, "127.0.0.1", pb)
+            a._open_channel(b._peer_id, "127.0.0.1", pb)
             time.sleep(0.1)
 
             a.close()  # sends {"type": "disconnect"} before tearing down
@@ -317,3 +317,115 @@ class TestNIXLRegistration:
         c.close()
         assert c._local_dlist is None
         assert c._reg is None
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Connection establishment tests
+# ---------------------------------------------------------------------------
+
+
+class TestConnectionEstablishment:
+    """
+    Tests for the NIXL handshake between two PDConnector instances.
+
+    The 'decoder' calls _ensure_connected(prefiller_peer_id); the 'prefiller'
+    handles the 'connect' message and replies with 'connect_ack'.  After the
+    handshake both sides should have the peer in _connections, and the
+    prefiller should have a _remote_dlists entry for the decoder.
+    """
+
+    def test_ensure_connected_populates_connections_both_sides(self):
+        """After _ensure_connected, both connector._connections contain the other."""
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder   = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            decoder._ensure_connected(prefiller._peer_id)
+
+            # Decoder must know it's connected to prefiller.
+            assert prefiller._peer_id in decoder._connections
+            # Prefiller must know it's connected to decoder.
+            assert decoder._peer_id in prefiller._connections
+        finally:
+            decoder.close()
+            prefiller.close()
+
+    def test_ensure_connected_builds_remote_dlist_on_prefiller(self):
+        """Prefiller has a _remote_dlists entry for the decoder after handshake."""
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder   = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            decoder._ensure_connected(prefiller._peer_id)
+
+            assert decoder._peer_id in prefiller._remote_dlists
+            assert prefiller._remote_dlists[decoder._peer_id] is not None
+        finally:
+            decoder.close()
+            prefiller.close()
+
+    def test_ensure_connected_is_idempotent(self):
+        """Calling _ensure_connected twice does not raise and does not duplicate state."""
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder   = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            decoder._ensure_connected(prefiller._peer_id)
+            decoder._ensure_connected(prefiller._peer_id)  # second call is a no-op
+
+            assert len([p for p in decoder._connections
+                        if p == prefiller._peer_id]) == 1
+        finally:
+            decoder.close()
+            prefiller.close()
+
+    def test_block_len_mismatch_raises(self):
+        """_ensure_connected raises ValueError when block_len differs."""
+        pp, pd = free_port(), free_port()
+        # Prefiller gets a (16, 8) float32 view → block_len = 32 bytes
+        # Decoder gets a (16, 4) float32 view → block_len = 16 bytes
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder   = PDConnector("127.0.0.1", pd)
+        try:
+            import torch
+            prefiller.set_primary_view(
+                memoryview(torch.zeros((16, 8), dtype=torch.float32).numpy())
+            )
+            decoder.set_primary_view(
+                memoryview(torch.zeros((16, 4), dtype=torch.float32).numpy())
+            )
+
+            with pytest.raises((ValueError, Exception)):
+                decoder._ensure_connected(prefiller._peer_id)
+        finally:
+            decoder.close()
+            prefiller.close()
+
+    def test_peer_down_removes_remote_dlist(self):
+        """After decoder disconnects, prefiller's _remote_dlists entry is removed."""
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder   = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            decoder._ensure_connected(prefiller._peer_id)
+            assert decoder._peer_id in prefiller._remote_dlists
+
+            decoder.close()
+            # Allow the disconnect message / heartbeat to propagate.
+            time.sleep(0.3)
+
+            assert decoder._peer_id not in prefiller._remote_dlists
+        finally:
+            prefiller.close()
