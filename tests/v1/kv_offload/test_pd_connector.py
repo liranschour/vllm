@@ -273,3 +273,47 @@ class TestZMQControlChannel:
         c = PDConnector("127.0.0.1", p)
         c.close()
         c.close()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# Step 4: NIXL registration tests
+# ---------------------------------------------------------------------------
+
+pytest.importorskip("nixl._api", reason="NIXL not installed")
+
+
+class TestNIXLRegistration:
+
+    def test_nixl_agent_created_after_set_primary_view(self):
+        """_agent is None before set_primary_view, not None after."""
+        p = free_port()
+        c = PDConnector("127.0.0.1", p)
+        try:
+            assert c._agent is None
+            c.set_primary_view(make_primary_view())
+            assert c._agent is not None
+        finally:
+            c.close()
+
+    def test_reg_and_local_dlist_set_after_set_primary_view(self):
+        """_reg and _local_dlist are set after set_primary_view."""
+        p = free_port()
+        c = PDConnector("127.0.0.1", p)
+        try:
+            assert c._reg is None
+            assert c._local_dlist is None
+            c.set_primary_view(make_primary_view())
+            assert c._reg is not None
+            assert c._local_dlist is not None
+        finally:
+            c.close()
+
+    def test_close_releases_dlist_and_deregisters(self):
+        """close() sets _local_dlist and _reg back to None."""
+        p = free_port()
+        c = PDConnector("127.0.0.1", p)
+        c.set_primary_view(make_primary_view())
+        assert c._local_dlist is not None
+        c.close()
+        assert c._local_dlist is None
+        assert c._reg is None

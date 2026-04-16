@@ -267,7 +267,7 @@ To run:
 
 ### Step 4: NIXL Registration and Prepped Descriptor List
 
-Create a `nixl_agent` inside `PDConnector` and register the CPU KV buffer with NIXL inside
+Create a `nixl_agent` inside `PDConnector` and register the CPU KV blocks with NIXL inside
 `set_primary_view()`. Immediately prepare a local descriptor list handle
 (`nixl_prepped_dlist_handle`) from the registered memory so that future transfers can be
 initiated using only block indices — avoiding repeated descriptor preparation per transfer.
@@ -276,16 +276,17 @@ No metadata exchange with remote peers is performed in this step.
 
 #### Design
 
-`set_primary_view(view)` is the trigger for NIXL registration because `_primary_view` is
-not available at `__init__()` time (it is delivered later by `TieringOffloadingManager`).
+`set_primary_view(view)` is the trigger for NIXL registration because `_kv_blocks` is
+not available at `__init__()` time (it is built from `view` in Step 3).
 
-In `set_primary_view(view)`:
-1. `self._primary_view = view` (already done in Step 1)
-2. Create `self._agent = nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))`
-3. Register the buffer: `self._reg = self._agent.register_memory(self._primary_view)`
-4. Prepare a local descriptor list: `self._local_dlist = self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._primary_view)`
+In `set_primary_view(view)`, after `_kv_blocks` is built:
+1. Create `self._agent = nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))`
+2. Build an Nx3 `uint64` descriptor array from `_kv_blocks`:
+   `(block_arr.ctypes.data, mv.nbytes, 0)` per block — base address, byte length, device_id=0 (DRAM)
+3. Register: `self._reg = self._agent.register_memory(xfer_descs, mem_type="DRAM")`
+4. Prep local dlist: `self._local_dlist = self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", xfer_descs, mem_type="DRAM")`
 
-On `close()`, deregister memory and release the handle:
+On `close()`, release before ZMQ teardown:
 ```
 self._agent.release_dlist_handle(self._local_dlist)
 self._agent.deregister_memory(self._reg)
@@ -295,19 +296,26 @@ self._agent.deregister_memory(self._reg)
 
 | PDConnector action | NIXL call |
 |---|---|
-| `set_primary_view()` | `nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))` |
-| `set_primary_view()` | `agent.register_memory(self._primary_view)` → `self._reg` |
-| `set_primary_view()` | `agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._primary_view)` → `self._local_dlist` |
+| `set_primary_view()` | `nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))` → `self._agent` |
+| `set_primary_view()` | `agent.register_memory(xfer_descs, mem_type="DRAM")` → `self._reg` |
+| `set_primary_view()` | `agent.prep_xfer_dlist("NIXL_INIT_AGENT", xfer_descs, mem_type="DRAM")` → `self._local_dlist` |
 | `close()` | `agent.release_dlist_handle(self._local_dlist)` |
 | `close()` | `agent.deregister_memory(self._reg)` |
 
+`xfer_descs` is a `np.zeros((num_blocks, 3), dtype=np.uint64)` array — accepted by both
+`register_memory` and `prep_xfer_dlist` without needing to pass tensors directly.
+
+NIXL import is lazy (`from nixl._api import ...`); if nixl is not installed the fields
+remain `None` and no registration is attempted.
+
 #### Tasks
-- [ ] Create `nixl_agent` in `set_primary_view()` with UCX backend; store as `self._agent`
-- [ ] Call `self._agent.register_memory(self._primary_view)` and store result as `self._reg`
-- [ ] Call `self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._primary_view)` and store as `self._local_dlist`
-- [ ] On `close()`, call `self._agent.release_dlist_handle(self._local_dlist)` then `self._agent.deregister_memory(self._reg)`
-- [ ] Add unit test verifying `self._reg` and `self._local_dlist` are set after init
-- [ ] Add unit test verifying deregistration is called on `close()`
+- [x] Add lazy `nixl_agent` / `nixl_agent_config` import at module level; `None` if absent
+- [x] Add `self._agent = None`, `self._reg = None`, `self._local_dlist = None` in `__init__()`
+- [x] In `set_primary_view()`: create agent, build Nx3 descriptor array, call `register_memory` and `prep_xfer_dlist`; store results
+- [x] In `close()`: call `release_dlist_handle` then `deregister_memory` before ZMQ teardown
+- [x] `TestNIXLRegistration::test_nixl_agent_created_after_set_primary_view`
+- [x] `TestNIXLRegistration::test_reg_and_local_dlist_set_after_set_primary_view`
+- [x] `TestNIXLRegistration::test_close_releases_dlist_and_deregisters`
 
 ### Step 5: Connection Establishment
 

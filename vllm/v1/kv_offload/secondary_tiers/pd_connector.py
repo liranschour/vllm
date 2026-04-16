@@ -28,6 +28,14 @@ from vllm.v1.kv_offload.abstract import (
 
 logger = init_logger(__name__)
 
+# Lazy NIXL import — optional dependency; None when not installed.
+try:
+    from nixl._api import nixl_agent as _NixlAgent
+    from nixl._api import nixl_agent_config as _NixlAgentConfig
+except ImportError:
+    _NixlAgent = None  # type: ignore[assignment,misc]
+    _NixlAgentConfig = None  # type: ignore[assignment,misc]
+
 # ZMQ ZMTP keep-alive options (milliseconds)
 _HEARTBEAT_IVL_MS = 2000
 _HEARTBEAT_TIMEOUT_MS = 10000
@@ -67,6 +75,10 @@ class PDConnector(SecondaryTierManager):
     def __init__(self, host: str, port: int) -> None:
         self._peer_id = f"{host}:{port}"
         self._primary_view: memoryview | None = None
+        self._kv_blocks: list[memoryview] = []
+        self._agent = None
+        self._reg = None
+        self._local_dlist = None
         self._closed = False
         self._lock = threading.Lock()
 
@@ -303,6 +315,14 @@ class PDConnector(SecondaryTierManager):
         self._router.setsockopt(zmq.LINGER, 0)
         self._router.close()
 
+        # Release NIXL resources before destroying the ZMQ context.
+        if self._local_dlist is not None:
+            self._agent.release_dlist_handle(self._local_dlist)
+            self._local_dlist = None
+        if self._reg is not None:
+            self._agent.deregister_memory(self._reg)
+            self._reg = None
+
         # destroy() with linger=0 terminates the context immediately and
         # causes any blocking ZMQ calls in background threads to raise ZMQError,
         # allowing them to exit cleanly.
@@ -316,8 +336,8 @@ class PDConnector(SecondaryTierManager):
 
     def set_primary_view(self, view: memoryview) -> None:
         """
-        Store the long-lived memoryview of the primary tier's CPU tensor and
-        build a per-block list for NIXL registration.
+        Store the long-lived memoryview of the primary tier's CPU tensor,
+        build a per-block list, and register with NIXL for later transfers.
 
         Called once by TieringOffloadingManager during initialisation.
         view.shape[0] is num_blocks; each view[i] is a contiguous sub-view
@@ -325,9 +345,35 @@ class PDConnector(SecondaryTierManager):
         """
         self._primary_view = view
         arr = np.asarray(view)
-        self._kv_blocks: list[memoryview] = [
-            memoryview(arr[i]) for i in range(arr.shape[0])
+        self._kv_blocks = [memoryview(arr[i]) for i in range(arr.shape[0])]
+
+        if _NixlAgent is None:
+            return
+
+        self._agent = _NixlAgent(self._peer_id, _NixlAgentConfig(backends=["UCX"]))
+
+        # Register the entire contiguous KV buffer as one memory region.
+        whole = np.asarray(self._primary_view)
+        reg_desc = np.array(
+            [[whole.ctypes.data, whole.nbytes, 0]], dtype=np.uint64
+        )
+        self._reg = self._agent.register_memory(reg_desc, mem_type="DRAM")
+
+        # Build per-block list of (base_addr, nbytes, device_id=0) 3-tuples so
+        # that future make_prepped_xfer() calls can address individual blocks by index.
+        block_tuples = [
+            (int(np.asarray(mv).ctypes.data), mv.nbytes, 0)
+            for mv in self._kv_blocks
         ]
+        xfer_dlist = self._agent.get_xfer_descs(block_tuples, mem_type="DRAM")
+        self._local_dlist = self._agent.prep_xfer_dlist(
+            "NIXL_INIT_AGENT", xfer_dlist
+        )
+        logger.info(
+            "PDConnector %s: registered %d blocks with NIXL",
+            self._peer_id,
+            len(self._kv_blocks),
+        )
 
     def get_tier_name(self) -> str:
         return "PDConnector"
