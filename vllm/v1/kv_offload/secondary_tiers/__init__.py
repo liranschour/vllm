@@ -11,8 +11,10 @@ from vllm.v1.kv_offload.secondary_tiers.dummy import (
     DummyLoadStoreSpec,
     DummySecondaryTier,
 )
+from vllm.v1.kv_offload.secondary_tiers.pd_connector import PDConnector
 
 __all__ = [
     "DummyLoadStoreSpec",
     "DummySecondaryTier",
+    "PDConnector",
 ]

@@ -116,29 +116,37 @@ An abort request API can be considered that should be passed by the orchestrator
 
 ## Implementation
 
-### Step 1: SecondaryTiers
+### Step 1: PDConnector Skeleton
 
-Introduce a `SecondaryTier` base class and a `SecondaryTiers` registry component. `PrimaryTier` depends on `SecondaryTiers` to dispatch operations. Individual `SecondaryTier` implementations register themselves into `SecondaryTiers` without any knowledge of `PrimaryTier`.
+The `SecondaryTierManager` ABC and the `TieringOffloadingManager` orchestrator are already
+defined in [`vllm/v1/kv_offload/abstract.py`](../../vllm/v1/kv_offload/abstract.py) and
+[`vllm/v1/kv_offload/tiering/manager.py`](../../vllm/v1/kv_offload/tiering/manager.py)
+respectively. Step 1 creates the `PDConnector` file and wires it into the existing framework.
 
 ```
-PrimaryTier --> SecondaryTiers --> [SecondaryTier, SecondaryTier, ...]
+TieringOffloadingManager --> [PDConnector(SecondaryTierManager), ...]
 ```
 
 #### Tasks
-- [ ] Define `SecondaryTier` abstract base class with `load`, `save`, `get_finished` methods
-- [ ] Implement `SecondaryTiers` registry with `register(tier: SecondaryTier)` and dispatch methods
-- [ ] `PrimaryTier` holds a reference to `SecondaryTiers` and calls it on `load`/`save`
-- [ ] `SecondaryTiers` iterates registered tiers and calls each in sequence
-- [ ] Add unit tests for registration and sequential dispatch
+- [ ] Create `vllm/v1/kv_offload/secondary_tiers/pd_connector.py`
+- [ ] Define `PDConnector(SecondaryTierManager)` inheriting from `SecondaryTierManager`
+      (`vllm/v1/kv_offload/abstract.py`)
+- [ ] Implement `set_primary_view(view)` — store `self._primary_view = view`
+- [ ] Implement `get_tier_name()` — return `"PDConnector"`
+- [ ] Stub `lookup()`, `submit_store()`, `submit_load()`, `get_finished()` with
+      `raise NotImplementedError` (to be filled in later steps)
+- [ ] Export `PDConnector` from `vllm/v1/kv_offload/secondary_tiers/__init__.py`
+- [ ] Add unit test: instantiate `PDConnector`, pass it to `TieringOffloadingManager`
+      via `secondary_tiers=[pd_connector]`, verify `get_tier_name()` returns `"PDConnector"`
+      and `set_primary_view()` stores the view
 
 #### Tests
 
-Tests are located in `tests/test_secondary_tiers.py`.
+Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
 
 To run:
 ```bash
-cd /home/lirans/my-utils/pd-connector
-python3 -m pytest tests/test_secondary_tiers.py -v
+venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
 ### Step 2: PDConnector as a SecondaryTier
