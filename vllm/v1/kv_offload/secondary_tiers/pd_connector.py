@@ -14,6 +14,7 @@ import time
 from collections.abc import Iterable
 
 import msgspec
+import numpy as np
 import zmq
 import zmq.utils.monitor
 
@@ -315,13 +316,18 @@ class PDConnector(SecondaryTierManager):
 
     def set_primary_view(self, view: memoryview) -> None:
         """
-        Store the long-lived memoryview of the primary tier's CPU tensor.
+        Store the long-lived memoryview of the primary tier's CPU tensor and
+        build a per-block list for NIXL registration.
 
         Called once by TieringOffloadingManager during initialisation.
-        The view is used by submit_store and submit_load to read/write
-        primary tier CPU memory directly (zero-copy).
+        view.shape[0] is num_blocks; each view[i] is a contiguous sub-view
+        covering one block's bytes (zero-copy).
         """
         self._primary_view = view
+        arr = np.asarray(view)
+        self._kv_blocks: list[memoryview] = [
+            memoryview(arr[i]) for i in range(arr.shape[0])
+        ]
 
     def get_tier_name(self) -> str:
         return "PDConnector"

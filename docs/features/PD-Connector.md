@@ -148,7 +148,7 @@ Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
 
 To run:
 ```bash
-venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
+.venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
 ### Step 2: ZMQ Control Channel
@@ -217,45 +217,73 @@ Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
 
 To run:
 ```bash
-venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
+.venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
 ### Step 3: Register Memory
 
-Accept CPU KV block tensors at `PDConnector` init time and store them for later NIXL registration (which happens in Step 5). No NIXL calls are made in this step.
+The CPU KV buffer is delivered to `PDConnector` via `set_primary_view(view: memoryview)`,
+called by `TieringOffloadingManager.__init__()`. The view's first dimension is `num_blocks`.
+`set_primary_view` must slice it into a 1-D list of per-block memoryviews (`kv_blocks`) for
+use in NIXL registration (Step 4).
 
 #### Design
 
-`PDConnector.__init__()` receives a `kv_blocks: list[torch.Tensor]` argument representing the CPU KV cache blocks allocated by the OffloadingManager. The tensors are stored as `self._kv_blocks` for use in the NIXL registration step.
+Extend `set_primary_view(view)` to build `self._kv_blocks` by slicing along the first axis:
+
+```python
+def set_primary_view(self, view: memoryview) -> None:
+    self._primary_view = view
+    self._kv_blocks = [view[i] for i in range(len(view))]
+```
+
+`len(view)` equals `view.shape[0]` (number of blocks). Each `view[i]` is a contiguous
+sub-view covering exactly one block's worth of bytes. No copy is made.
+
+```
+TieringOffloadingManager.__init__()
+  └─► tier.set_primary_view(memoryview(cpu_tensor.numpy()))
+        ├─► self._primary_view = view
+        └─► self._kv_blocks = [view[0], view[1], ..., view[num_blocks-1]]
+```
+
+`self._kv_blocks` is a `list[memoryview]` of length `num_blocks`, ready for NIXL
+registration in Step 4.
 
 #### Tasks
-- [ ] Add `kv_blocks: list[torch.Tensor]` parameter to `PDConnector.__init__()`
-- [ ] Store as `self._kv_blocks = kv_blocks`
-- [ ] Add unit test in `tests/test_pd_connector.py` verifying that tensors passed at init are accessible via `self._kv_blocks`
+- [x] `set_primary_view(view)` stores `self._primary_view = view` (done in Step 1)
+- [ ] Extend `set_primary_view(view)` to set `self._kv_blocks = [view[i] for i in range(len(view))]`
+- [ ] Add unit test: after `set_primary_view(view)`, verify `len(self._kv_blocks) == len(view)`
+      and `self._kv_blocks[0] == view[0]`
 
 #### Tests
 
-Tests are located in `tests/test_pd_connector.py`.
+Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
 
 To run:
 ```bash
-cd /home/lirans/my-utils/pd-connector
-python3 -m pytest tests/test_pd_connector.py -v
+.venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
 ### Step 4: NIXL Registration and Prepped Descriptor List
 
-Create a `nixl_agent` inside `PDConnector` and register the CPU KV block tensors with NIXL at init time. Immediately prepare a local descriptor list handle (`nixl_prepped_dlist_handle`) from the registered memory so that future transfers can be initiated using only block indices — avoiding repeated descriptor preparation per transfer.
+Create a `nixl_agent` inside `PDConnector` and register the CPU KV buffer with NIXL inside
+`set_primary_view()`. Immediately prepare a local descriptor list handle
+(`nixl_prepped_dlist_handle`) from the registered memory so that future transfers can be
+initiated using only block indices — avoiding repeated descriptor preparation per transfer.
 
 No metadata exchange with remote peers is performed in this step.
 
 #### Design
 
-At `PDConnector.__init__()` time, after storing `self._kv_blocks`:
+`set_primary_view(view)` is the trigger for NIXL registration because `_primary_view` is
+not available at `__init__()` time (it is delivered later by `TieringOffloadingManager`).
 
-1. Create `self._agent = nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))`
-2. Register all KV blocks: `self._reg = self._agent.register_memory(self._kv_blocks)`
-3. Prepare a local descriptor list: `self._local_dlist = self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._kv_blocks)`
+In `set_primary_view(view)`:
+1. `self._primary_view = view` (already done in Step 1)
+2. Create `self._agent = nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))`
+3. Register the buffer: `self._reg = self._agent.register_memory(self._primary_view)`
+4. Prepare a local descriptor list: `self._local_dlist = self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._primary_view)`
 
 On `close()`, deregister memory and release the handle:
 ```
@@ -267,16 +295,16 @@ self._agent.deregister_memory(self._reg)
 
 | PDConnector action | NIXL call |
 |---|---|
-| `__init__()` | `nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))` |
-| `__init__()` | `agent.register_memory(self._kv_blocks)` → `self._reg` |
-| `__init__()` | `agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._kv_blocks)` → `self._local_dlist` |
+| `set_primary_view()` | `nixl_agent(peer_id, nixl_agent_config(backends=["UCX"]))` |
+| `set_primary_view()` | `agent.register_memory(self._primary_view)` → `self._reg` |
+| `set_primary_view()` | `agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._primary_view)` → `self._local_dlist` |
 | `close()` | `agent.release_dlist_handle(self._local_dlist)` |
 | `close()` | `agent.deregister_memory(self._reg)` |
 
 #### Tasks
-- [ ] Create `nixl_agent` in `PDConnector.__init__()` with UCX backend; store as `self._agent`
-- [ ] Call `self._agent.register_memory(self._kv_blocks)` and store result as `self._reg`
-- [ ] Call `self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._kv_blocks)` and store as `self._local_dlist`
+- [ ] Create `nixl_agent` in `set_primary_view()` with UCX backend; store as `self._agent`
+- [ ] Call `self._agent.register_memory(self._primary_view)` and store result as `self._reg`
+- [ ] Call `self._agent.prep_xfer_dlist("NIXL_INIT_AGENT", self._primary_view)` and store as `self._local_dlist`
 - [ ] On `close()`, call `self._agent.release_dlist_handle(self._local_dlist)` then `self._agent.deregister_memory(self._reg)`
 - [ ] Add unit test verifying `self._reg` and `self._local_dlist` are set after init
 - [ ] Add unit test verifying deregistration is called on `close()`

@@ -48,8 +48,8 @@ class _MinimalPrimary(CPUPrimaryTierOffloadingManager):
     def __init__(self):
         pass
 
-    def get_primary_kv_tensors(self):
-        return torch.zeros((16, 8), dtype=torch.float32)
+    def get_primary_kv_tensor(self):
+        return torch.zeros((16, 8), dtype=torch.int8)
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +74,18 @@ class TestPDConnectorSkeleton:
             view = make_primary_view()
             c.set_primary_view(view)
             assert c._primary_view is view
+        finally:
+            c.close()
+
+    def test_set_primary_view_builds_kv_blocks(self):
+        p = free_port()
+        c = PDConnector("127.0.0.1", p)
+        try:
+            view = make_primary_view()  # shape (16, 8)
+            c.set_primary_view(view)
+            arr = view.obj  # underlying numpy array
+            assert len(c._kv_blocks) == arr.shape[0]  # 16 blocks
+            assert bytes(c._kv_blocks[0]) == arr[0].tobytes()
         finally:
             c.close()
 
