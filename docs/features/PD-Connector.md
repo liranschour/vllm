@@ -121,22 +121,24 @@ An abort request API can be considered that should be passed by the orchestrator
 The `SecondaryTierManager` ABC and the `TieringOffloadingManager` orchestrator are already
 defined in [`vllm/v1/kv_offload/abstract.py`](../../vllm/v1/kv_offload/abstract.py) and
 [`vllm/v1/kv_offload/tiering/manager.py`](../../vllm/v1/kv_offload/tiering/manager.py)
-respectively. Step 1 creates the `PDConnector` file and wires it into the existing framework.
+respectively. Step 1 creates `PDConnector` as a concrete `SecondaryTierManager` and wires
+it into the existing framework. It handles the actual KV cache transfer between Prefiller
+and Decoder nodes using NIXL (implemented in later steps).
 
 ```
 TieringOffloadingManager --> [PDConnector(SecondaryTierManager), ...]
 ```
 
 #### Tasks
-- [ ] Create `vllm/v1/kv_offload/secondary_tiers/pd_connector.py`
-- [ ] Define `PDConnector(SecondaryTierManager)` inheriting from `SecondaryTierManager`
+- [x] Create `vllm/v1/kv_offload/secondary_tiers/pd_connector.py`
+- [x] Define `PDConnector(SecondaryTierManager)` inheriting from `SecondaryTierManager`
       (`vllm/v1/kv_offload/abstract.py`)
-- [ ] Implement `set_primary_view(view)` — store `self._primary_view = view`
-- [ ] Implement `get_tier_name()` — return `"PDConnector"`
-- [ ] Stub `lookup()`, `submit_store()`, `submit_load()`, `get_finished()` with
+- [x] Implement `set_primary_view(view)` — store `self._primary_view = view`
+- [x] Implement `get_tier_name()` — return `"PDConnector"`
+- [x] Stub `lookup()`, `submit_store()`, `submit_load()`, `get_finished()` with
       `raise NotImplementedError` (to be filled in later steps)
-- [ ] Export `PDConnector` from `vllm/v1/kv_offload/secondary_tiers/__init__.py`
-- [ ] Add unit test: instantiate `PDConnector`, pass it to `TieringOffloadingManager`
+- [x] Export `PDConnector` from `vllm/v1/kv_offload/secondary_tiers/__init__.py`
+- [x] Add unit test: instantiate `PDConnector`, pass it to `TieringOffloadingManager`
       via `secondary_tiers=[pd_connector]`, verify `get_tier_name()` returns `"PDConnector"`
       and `set_primary_view()` stores the view
 
@@ -149,86 +151,76 @@ To run:
 venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
-### Step 2: PDConnector as a SecondaryTier
+### Step 2: ZMQ Control Channel
 
-Implement `PDConnector` as a concrete `SecondaryTier`. It handles the actual KV cache transfer between Prefiller and Decoder nodes using NIXL.
+Add a bidirectional ZMQ control channel directly inside `PDConnector`. Any two `PDConnector` instances can send messages to each other. When a peer process dies or the connection drops, the surviving peer is notified via `_on_peer_down(peer_id)`.
 
-On the **Prefiller side**, the PrimaryTier polls `get_required_blocks()` to determine which blocks the SecondaryTier needs, then calls `save()` to store KV block descriptors. The SecondaryTier waits for incoming `lookup_fetch` requests from the Decoder and initiates the transfer once blocks are available.
-On the **Decoder side**, `load()` connects to the Prefiller peer, sends a `lookup_fetch` control message, and triggers a NIXL transfer to save the blocks into the local CPU cache.
+There is no separate transport abstraction — the channel is an internal concern of `PDConnector`.
 
-#### Tasks
-- [ ] Implement `PDConnector(SecondaryTier)` class in `src/pd_connector.py`
-- [ ] `save(job_id, block_descs)` — register block descriptors, ready to serve `lookup_fetch`
-- [ ] `load(job_id, block_hashes, peer_id)` — connect to peer, send `CTRL:lookup_fetch`, trigger NIXL transfer
-- [ ] `get_finished(job_ids)` — poll NIXL transfer status and return completed job ids
-- [ ] Add unit tests in `tests/test_pd_connector.py`
+#### Architecture
 
-#### Tests
-
-Tests are located in `tests/test_pd_connector.py`.
-
-To run:
-```bash
-cd /home/lirans/my-utils/pd-connector
-python3 -m pytest tests/test_pd_connector.py -v
-```
-
-### Step 3: ZMQ CtrlTransport
-
-Implement `ZmqCtrlTransport` — a concrete `CtrlTransport` backed by ZMQ. The listener uses a ZMQ `ROUTER` socket so it can accept connections from multiple peers simultaneously. Each peer connects with a `DEALER` socket, and the router identifies peers by their socket identity.
-
-Peer liveness is tracked via a heartbeat mechanism. If a peer stops sending heartbeats within the timeout window, the transport fires a `on_peer_down(peer_id)` callback so that `PDConnector` can abort all in-progress jobs for that peer.
+Each `PDConnector` has:
+- **One ROUTER socket** — listens on `<host>:<port>`, accepts incoming connections from any peer.
+- **One DEALER socket per remote peer** — connects to that peer's ROUTER; used to send messages to that peer.
 
 ```
-Peer A (DEALER) ──┐
-Peer B (DEALER) ──┼──► ZmqCtrlTransport (ROUTER) ──► PDConnector
-Peer C (DEALER) ──┘         │
-                        heartbeat monitor
-                        → on_peer_down(peer_id)
+PDConnector A                          PDConnector B
+  ROUTER ◄── DEALER(B) ──────────── DEALER(A) ──► ROUTER
+    │                                                │
+  _listener_loop                            _listener_loop
+  _monitor_loop ← EVENT_DISCONNECTED ← ZMQ heartbeat
 ```
 
-#### Design decisions
-- **Socket types**: `ROUTER` on the listener side, `DEALER` on the connecting side — allows multiplexing N peers on one port.
-- **Heartbeat**: each peer sends a periodic `{"type": "heartbeat", "peer_id": "..."}` message. The listener tracks `last_seen[peer_id]` and fires `on_peer_down` if a peer exceeds `heartbeat_timeout_s`.
-- **Message format**: MessagePack (msgspec) — consistent with the existing NIXL handshake wire format.
-- **Graceful disconnect**: a `{"type": "disconnect", "peer_id": "..."}` message triggers immediate `on_peer_down` without waiting for timeout.
+Sending to peer P: use `_dealers[peer_id]`.
+Replying to a message received on ROUTER: use ROUTER with the sender's identity frame.
 
-#### Keep-Alive Mechanism
+#### Keep-Alive
 
-Liveness is implemented using **ZMQ's built-in ZMTP heartbeat** — no application-level ping thread is needed. Both the ROUTER and each DEALER socket have the following socket options set at creation time:
+Liveness uses **ZMQ's built-in ZMTP heartbeat** — no application-level ping thread. Both the ROUTER and each DEALER socket have the following options set at creation:
 
-| Option | Default | Description |
+| Option | Value | Description |
 |---|---|---|
-| `HEARTBEAT_IVL` | 2000 ms | How often ZMQ sends a PING to the peer |
-| `HEARTBEAT_TIMEOUT` | 10000 ms | How long ZMQ waits for a PONG before closing the connection |
-| `HEARTBEAT_TTL` | 10000 ms | How long the remote peer considers this side alive without a PING |
+| `HEARTBEAT_IVL` | 2000 ms | ZMQ sends a PING to the peer at this interval |
+| `HEARTBEAT_TIMEOUT` | 10000 ms | ZMQ closes the connection if no PONG within this window |
+| `HEARTBEAT_TTL` | 10000 ms | Remote peer considers this side alive for this long without a PING |
 
-When ZMQ detects a dead connection (no PONG within `HEARTBEAT_TIMEOUT`), it closes the DEALER socket and fires `EVENT_DISCONNECTED` on that socket's monitor. A dedicated `_monitor_loop` background thread polls all DEALER monitor sockets using a ZMQ `Poller` and calls `on_peer_down(peer_id)` when `EVENT_DISCONNECTED` is received.
+When ZMQ detects a dead connection it fires `EVENT_DISCONNECTED` on the DEALER socket's monitor. A background `_monitor_loop` thread polls all DEALER monitor sockets with a ZMQ `Poller` and calls `_on_peer_down(peer_id)` on `EVENT_DISCONNECTED`.
 
-- **Startup**: heartbeats are activated automatically as soon as the socket is connected. No application-level handshake is required.
-- **Shutdown**: on clean disconnect, `disconnect()` sends a `{"type": "disconnect"}` application message so the remote `_listener_loop` fires `on_peer_down` immediately without waiting for the heartbeat timeout to expire.
+For a **clean disconnect**, before closing the DEALER, send `{"type": "disconnect"}` so the remote `_listener_loop` calls `_on_peer_down` immediately without waiting for the heartbeat timeout.
+
+#### Message format
+
+MessagePack (msgspec). Each message has at least a `"type"` field.
+
+#### State added to PDConnector
+
+| Field | Type | Description |
+|---|---|---|
+| `_router` | `zmq.Socket` | ROUTER socket, bound once at init |
+| `_dealers` | `dict[str, zmq.Socket]` | One DEALER per connected peer |
+| `_listener_thread` | `threading.Thread` | Reads from ROUTER, dispatches to `_handle_message()` |
+| `_monitor_thread` | `threading.Thread` | Polls DEALER monitors, fires `_on_peer_down()` |
 
 #### Tasks
-- [ ] Implement `ZmqCtrlTransport(CtrlTransport)` in `src/zmq_ctrl_transport.py`
-- [ ] Listener thread: ZMQ `ROUTER` socket, receives from any peer, dispatches to `recv()` queue
-- [ ] Sender: ZMQ `DEALER` socket per peer (lazily created), sends messages to a specific peer
-- [ ] Heartbeat sender: background thread sends heartbeat to each connected peer at `heartbeat_interval_s`
-- [ ] Heartbeat monitor: background thread checks `last_seen` and calls `on_peer_down(peer_id)` on timeout
-- [ ] Send `disconnect` message on `close()` before tearing down sockets
-- [ ] Register `on_peer_down` callback in `PDConnector` to cancel in-progress jobs for the failed peer
-- [ ] Add unit tests in `tests/test_zmq_ctrl_transport.py`
+- [ ] `PDConnector.__init__()`: create ROUTER socket with ZMTP heartbeat options, bind to `host:port`, start `_listener_loop` thread
+- [ ] `_connect(peer_id, host, port)`: create DEALER socket with ZMTP heartbeat options, connect, start monitoring that socket in `_monitor_loop`
+- [ ] `_send(peer_id, msg)`: serialize with msgspec and send via `_dealers[peer_id]`
+- [ ] `_listener_loop`: receive frames from ROUTER, deserialize, dispatch to `_handle_message(sender_id, msg)`
+- [ ] `_monitor_loop`: poll all DEALER monitor sockets; call `_on_peer_down(peer_id)` on `EVENT_DISCONNECTED`
+- [ ] `_on_peer_down(peer_id)`: stub — log the event; full cancellation logic added in later steps
+- [ ] `close()`: send `{"type": "disconnect"}` to each peer, close all DEALER sockets, close ROUTER
+- [ ] Add unit tests: two in-process `PDConnector` instances; verify message delivery in both directions; verify `_on_peer_down` is called after clean disconnect
 
 #### Tests
 
-Tests are located in `tests/test_zmq_ctrl_transport.py`.
+Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
 
 To run:
 ```bash
-cd /home/lirans/my-utils/pd-connector
-python3 -m pytest tests/test_zmq_ctrl_transport.py -v
+venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
-### Step 4: Register Memory
+### Step 3: Register Memory
 
 Accept CPU KV block tensors at `PDConnector` init time and store them for later NIXL registration (which happens in Step 5). No NIXL calls are made in this step.
 
@@ -251,7 +243,7 @@ cd /home/lirans/my-utils/pd-connector
 python3 -m pytest tests/test_pd_connector.py -v
 ```
 
-### Step 5: NIXL Registration and Prepped Descriptor List
+### Step 4: NIXL Registration and Prepped Descriptor List
 
 Create a `nixl_agent` inside `PDConnector` and register the CPU KV block tensors with NIXL at init time. Immediately prepare a local descriptor list handle (`nixl_prepped_dlist_handle`) from the registered memory so that future transfers can be initiated using only block indices — avoiding repeated descriptor preparation per transfer.
 
@@ -289,7 +281,7 @@ self._agent.deregister_memory(self._reg)
 - [ ] Add unit test verifying `self._reg` and `self._local_dlist` are set after init
 - [ ] Add unit test verifying deregistration is called on `close()`
 
-### Step 6: Connection Establishment
+### Step 5: Connection Establishment
 
 When `load()` is called for a peer not yet connected, establish a ZMQ control channel connection. The Decoder sends its NIXL agent metadata and KV block descriptors to the Prefiller. The Prefiller uses these to prep a remote descriptor list (`remote_dlist`) so that future `make_prepped_xfer` transfers need only block indices.
 
@@ -367,7 +359,7 @@ cd /home/lirans/my-utils/pd-connector
 python3 -m pytest tests/test_pd_connector.py -v
 ```
 
-### Step 7: Lookup-Fetch with Two-Phase Timeout
+### Step 6: Lookup-Fetch with Two-Phase Timeout
 
 When the Decoder calls `load()`, it sends a `lookup_fetch` control message to the Prefiller. The Prefiller replies with `lookup_ack` to confirm the control message was received and the job exists. `lookup_ack` does **not** mean data has been transferred — it is only a control-plane confirmation.
 
@@ -476,7 +468,7 @@ cd /home/lirans/my-utils/pd-connector
 python3 -m pytest tests/test_pd_connector.py -v
 ```
 
-### Step 8: NIXL Transfer with Per-Chunk Completion
+### Step 7: NIXL Transfer with Per-Chunk Completion
 
 When `save(job_id, chunk_descs)` is called on the Prefiller, it checks whether a `lookup_fetch` is pending for that job. If one exists, it immediately initiates a NIXL WRITE for the newly saved blocks. The Prefiller polls its in-flight NIXL handles and, when a chunk completes, sends a `transfer_done` control message to the Decoder listing the block hashes that were just transferred. The Decoder accumulates these until all requested hashes are received, at which point the job transitions to DONE.
 
@@ -517,7 +509,7 @@ class _PendingFetch:
 #### Flow
 
 **Prefiller** (handles `lookup_fetch`):
-1. Send `lookup_ack` (same as Step 7).
+1. Send `lookup_ack` (same as Step 6).
 2. Build `hash_to_remote_idx = dict(zip(msg["block_hashes"], msg["block_indexes"]))`.
 3. Create `_PendingFetch` with `hash_to_remote_idx` and `remaining_hashes = set(msg["block_hashes"])`.
 4. Call `_try_transfer(job_id)` to transfer any blocks already saved.
@@ -543,7 +535,7 @@ class _PendingFetch:
 2. If `received_hashes` is a superset of `load_job.block_hashes`: mark job DONE.
 
 **Decoder** (`get_finished(job_ids)`):
-- Unchanged from Step 7: returns DONE jobs; aborts timed-out ones.
+- Unchanged from Step 6: returns DONE jobs; aborts timed-out ones.
 
 #### State added
 
