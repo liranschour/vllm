@@ -440,238 +440,76 @@ To run:
 venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
-### Step 6: Lookup-Fetch with Two-Phase Timeout
+### Step 6: `submit_store()` and Job Tracking
 
-When the Decoder calls `load()`, it sends a `lookup_fetch` control message to the Prefiller. The Prefiller replies with `lookup_ack` to confirm the control message was received and the job exists. `lookup_ack` does **not** mean data has been transferred — it is only a control-plane confirmation.
+Implement `submit_store()` and `get_finished()` on the Prefiller side. When the
+`TieringOffloadingManager` calls `submit_store(job_metadata)`, the `PDConnector` records
+the job and its blocks. Each block is checked against a `_pending_blocks` map — if a
+Decoder has already sent a `lookup_fetch` for that block, a NIXL transfer is initiated
+immediately. All ready blocks for the same peer are batched into a single
+`make_prepped_xfer` call. The returned handle is tracked so that `get_finished()` can
+poll for completion and decrement the job's remaining counter.
 
-This creates two distinct failure modes, which must be tracked separately:
+#### Data Structures
 
-| Failure | Cause |
-|---|---|
-| No `lookup_ack` before `ack_deadline` | Control message was lost, or Prefiller does not have the job registered |
-| `lookup_ack` received but no transfer complete before `xfer_deadline` | Data transfer did not occur (NIXL not implemented yet in this step) |
-
-No NIXL data transfer occurs in this step. Jobs always time out at the transfer phase.
-
-#### Message format
-
-`lookup_fetch` (Decoder → Prefiller):
-```
-{
-  "type":          "lookup_fetch",
-  "job_id":        <str>,
-  "block_hashes":  [<int>, ...],
-  "block_indexes": [<int>, ...]   # Decoder's kv_block slot for each hash (same length, same order)
-}
-```
-
-`lookup_ack` (Prefiller → Decoder):
-```
-{
-  "type":    "lookup_ack",
-  "job_id":  <str>
-}
-```
-
-#### Two-phase deadline tracking
-
-```
-load() called
-    │
-    ├─ ack_deadline = now + _LOOKUP_ACK_TIMEOUT_S
-    │
-    ▼
-[waiting for lookup_ack]
-    │
-    ├── ack_deadline exceeded → ABORTED  (control failure: message lost or job not found)
-    │
-    ▼ lookup_ack received
-    │
-    ├─ xfer_deadline = now + _TRANSFER_TIMEOUT_S
-    │
-    ▼
-[waiting for transfer complete]  ← future step will resolve this
-    │
-    ├── xfer_deadline exceeded → ABORTED  (transfer failure: data did not arrive)
-    │
-    └── transfer complete → DONE
-```
-
-#### Flow
-
-**Decoder** (`load()`):
-1. Verify an active connection via `_ensure_connected(peer_id)`. If handshake times out, raise immediately.
-2. Create `_LoadJob` with `ack_deadline = now + _LOOKUP_ACK_TIMEOUT_S`.
-3. Send `lookup_fetch` with `job_id`, `block_hashes`, and `block_indexes`.
-
-> `SecondaryPillar.load()` signature: `load(job_id, block_hashes, block_indexes, peer_id)`.
-> `block_hashes[i]` identifies the block; `block_indexes[i]` is the Decoder's kv_block slot (index into the descriptors registered at init) where that block should be written.
-
-**Prefiller** (handles `lookup_fetch`):
-1. Look up `_save_jobs[job_id]`. If not found or aborted, return (NACK is a future step).
-2. Reply with `lookup_ack` to the Decoder.
-
-**Decoder** (handles `lookup_ack`):
-1. Record `ack_received = True`.
-2. Set `xfer_deadline = now + _TRANSFER_TIMEOUT_S`.
-3. Do **not** mark job as DONE — data transfer has not occurred yet.
-
-**Decoder `get_finished()`**:
-- If `not ack_received` and `now > ack_deadline`: abort — control failure.
-- If `ack_received` and `now > xfer_deadline`: abort — transfer failure.
-- Return jobs in DONE state (transfer completion is a future step).
-
-#### State added
-
-| Field | Type | Description |
-|---|---|---|
-| `_LoadJob.ack_received` | `bool` | True once `lookup_ack` has been received |
-| `_LoadJob.ack_deadline` | `float` | Deadline for receiving `lookup_ack`; exceeded → control failure |
-| `_LoadJob.xfer_deadline` | `float` | Set on ack receipt; exceeded → transfer failure |
-
-#### Tasks
-- [ ] `_LoadJob`: add `ack_received: bool = False`, `ack_deadline: float`, `xfer_deadline: float = 0.0`
-- [ ] `load()`: set `ack_deadline = now + _LOOKUP_ACK_TIMEOUT_S`; send `lookup_fetch`
-- [ ] `_handle_lookup_fetch` (Prefiller): send `lookup_ack` back to Decoder
-- [ ] `_handle_lookup_ack` (Decoder): set `ack_received = True`, `xfer_deadline = now + _TRANSFER_TIMEOUT_S`; do NOT mark DONE
-- [ ] `get_finished()`: abort on ack timeout (control failure) or xfer timeout (transfer failure); return DONE jobs
-- [ ] Add `_LOOKUP_ACK_TIMEOUT_S` and `_TRANSFER_TIMEOUT_S` class constants
-- [ ] Test: load with no matching save → no ack → ack_deadline fires → ABORTED (control failure)
-- [ ] Test: load with matching save → ack received → no transfer → xfer_deadline fires → ABORTED (transfer failure)
-
-#### Tests
-
-Tests are located in `tests/test_pd_connector.py`.
-
-To run:
-```bash
-cd /home/lirans/my-utils/pd-connector
-python3 -m pytest tests/test_pd_connector.py -v
-```
-
-### Step 7: NIXL Transfer with Per-Chunk Completion
-
-When `save(job_id, chunk_descs)` is called on the Prefiller, it checks whether a `lookup_fetch` is pending for that job. If one exists, it immediately initiates a NIXL WRITE for the newly saved blocks. The Prefiller polls its in-flight NIXL handles and, when a chunk completes, sends a `transfer_done` control message to the Decoder listing the block hashes that were just transferred. The Decoder accumulates these until all requested hashes are received, at which point the job transitions to DONE.
-
-This supports the streaming case: `lookup_fetch` may arrive before all KV blocks are computed on the Prefiller. Each chunk is transferred as soon as it is saved.
-
-#### Block index mapping (Prefiller ↔ Decoder)
-
-`load()` accepts `block_indexes: list[int]` alongside `block_hashes`. Each `block_indexes[i]` is the Decoder's pre-allocated kv_block slot (index into the descriptors registered at init) where `block_hashes[i]` should be written. Both lists are forwarded verbatim in the `lookup_fetch` message.
-
-On the Prefiller side, each `BlockDesc` in `save()` has an `addr`. Using `_addr_to_idx[addr]` gives the local kv_block index. The `block_hash` field identifies the block, and `hash_to_remote_idx[block_hash]` (built from the `lookup_fetch` payload as `dict(zip(block_hashes, block_indexes))`) gives the remote kv_block index to pass to `make_prepped_xfer`.
-
-#### New message: `transfer_done`
-
-`transfer_done` (Prefiller → Decoder):
-```
-{
-  "type":         "transfer_done",
-  "job_id":       <str>,
-  "block_hashes": [<int>, ...]   # hashes of blocks transferred in this chunk
-}
-```
-
-#### Prefiller: pending fetch tracking
-
-`_pending_fetches: dict[str, _PendingFetch]` — keyed by job_id, created when `lookup_fetch` arrives.
+`_StoreJob` dataclass:
 
 ```python
 @dataclass
-class _PendingFetch:
-    job_id: str
-    decoder_peer_id: str
-    hash_to_remote_idx: dict[int, int]  # block_hash → Decoder's kv_block index; built as dict(zip(block_hashes, block_indexes))
-    remaining_hashes: set[int]          # hashes not yet transferred
+class _StoreJob:
+    job_id: JobId
+    remaining: int  # blocks not yet transferred via NIXL
 ```
 
-`_xfer_handles: list[tuple[object, str, list[int]]]` — `(nixl_handle, job_id, chunk_hashes)` — for in-flight transfers.
+#### State added to PDConnector
 
-#### Flow
+| Field | Type | Description |
+|---|---|---|
+| `_store_jobs` | `dict[JobId, _StoreJob]` | Active store jobs with remaining block counter |
+| `_pending_blocks` | `dict[bytes, ...]` | Blocks requested by remote `lookup_fetch` but not yet stored. Empty until `lookup_fetch` handling is implemented in a later step |
+| `_block_to_job` | `dict[bytes, tuple[JobId, int]]` | Maps `block_hash` → `(job_id, local_block_idx)` for transfer initiation and counter decrement |
+| `_inflight_xfers` | `dict[handle, tuple[JobId, int]]` | Maps NIXL transfer handle → `(job_id, num_blocks)`. Used by `get_finished()` to attribute completed transfers to jobs |
+| `_finished_jobs` | `list[JobResult]` | Completed jobs waiting to be returned by `get_finished()` |
 
-**Prefiller** (handles `lookup_fetch`):
-1. Send `lookup_ack` (same as Step 6).
-2. Build `hash_to_remote_idx = dict(zip(msg["block_hashes"], msg["block_indexes"]))`.
-3. Create `_PendingFetch` with `hash_to_remote_idx` and `remaining_hashes = set(msg["block_hashes"])`.
-4. Call `_try_transfer(job_id)` to transfer any blocks already saved.
+#### Flow — `submit_store(job_metadata)`
 
-**Prefiller** (`save(job_id, chunk_descs)`):
-1. Store chunk in `_save_jobs` as before.
-2. Call `_try_transfer(job_id)`.
+1. Create `_StoreJob(job_id, remaining=len(keys))`; add to `_store_jobs[job_id]`
+2. For each `(key, block_idx)` in `zip(job_metadata.keys, job_metadata.spec.block_ids)`:
+   - Extract `block_hash = get_offload_block_hash(key)`
+   - Record `_block_to_job[block_hash] = (job_id, int(block_idx))`
+   - Look up `block_hash` in `_pending_blocks` — collect matches
+3. If matches found: group matched blocks by peer and issue one
+   `make_prepped_xfer("WRITE", self._local_dlist, [local_idxs], self._remote_dlists[peer], [remote_idxs])`
+   per peer. Call `transfer(handle)`. Store `_inflight_xfers[handle] = (job_id, len(batch))`.
+4. Since `_pending_blocks` is empty for now, no transfer is initiated in this step.
 
-**Prefiller** (`_try_transfer(job_id)`):
-1. Intersect saved `block_descs` (by hash) with `pending_fetch.remaining_hashes`.
-2. For each matching block: resolve `local_idx = _addr_to_idx[desc.addr]`, `remote_idx = hash_to_remote_idx[desc.block_hash]`.
-3. Call `make_prepped_xfer("WRITE", local_dlist, local_indices, remote_dlists[decoder], remote_indices)` → `handle`.
-4. Call `transfer(handle)`, append `(handle, job_id, chunk_hashes)` to `_xfer_handles`.
-5. Remove chunk hashes from `remaining_hashes`.
+#### Flow — `get_finished()`
 
-**Prefiller** (`get_finished(job_ids)`):
-1. Poll `_xfer_handles`: for each handle, call `check_xfer_state(handle)`.
-2. On `"D"` (Done): release handle, send `transfer_done(job_id, chunk_hashes)` to Decoder.
-3. If `remaining_hashes` for the job is now empty: mark `_save_jobs[job_id]` as DONE.
-
-**Decoder** (handles `transfer_done`):
-1. Add `msg["block_hashes"]` to `_load_jobs[job_id].received_hashes`.
-2. If `received_hashes` is a superset of `load_job.block_hashes`: mark job DONE.
-
-**Decoder** (`get_finished(job_ids)`):
-- Unchanged from Step 6: returns DONE jobs; aborts timed-out ones.
-
-#### State added
-
-| Side | Field | Type | Description |
-|---|---|---|---|
-| Prefiller | `_pending_fetches` | `dict[str, _PendingFetch]` | Active fetch requests waiting for chunks |
-| Prefiller | `_xfer_handles` | `list[tuple[handle, str, list[int]]]` | In-flight NIXL handles with job context |
-| Prefiller | `_addr_to_idx` | `dict[int, int]` | `kv_block.data_ptr() → list index`, built at init |
-| Decoder | `_LoadJob.received_hashes` | `set[int]` | Block hashes confirmed transferred so far |
-
-#### Sequence (streaming example)
-
-```
-Decoder.load("job1", block_hashes=[h0,h1,h2], block_indexes=[3,7,2], prefiller_id)
-    └─► lookup_fetch{block_hashes:[h0,h1,h2], block_indexes:[3,7,2]}
-         → Prefiller: hash_to_remote_idx={h0:3, h1:7, h2:2}, remaining={h0,h1,h2}
-         → sends lookup_ack
-
-Prefiller.save("job1", [desc(h0, addr=A0)])     ← first chunk
-    └─► _try_transfer: local_idx=_addr_to_idx[A0], remote_idx=3
-         WRITE kv_blocks[local_idx] → Decoder.kv_blocks[3]
-         remaining = {h1, h2}
-    └─► NIXL completes → transfer_done(job1, [h0]) → Decoder.received = {h0}
-
-Prefiller.save("job1", [desc(h1,A1), desc(h2,A2)])   ← second chunk
-    └─► _try_transfer: WRITE kv_blocks[local(h1)]→D[7], kv_blocks[local(h2)]→D[2]
-    └─► NIXL completes → transfer_done(job1, [h1,h2]) → Decoder.received={h0,h1,h2}
-         == requested → job DONE
-```
+1. Poll all handles in `_inflight_xfers` via `check_xfer_state(handle)`:
+   - `"DONE"` → call `release_xfer_handle(handle)`, remove from `_inflight_xfers`,
+     decrement `_store_jobs[job_id].remaining` by `num_blocks`.
+     If `remaining == 0`: remove from `_store_jobs`,
+     append `JobResult(job_id, success=True)` to `_finished_jobs`.
+   - `"PROC"` → skip (still in progress)
+2. Return current `_finished_jobs` and reset to empty list.
 
 #### Tasks
-- [ ] `SecondaryPillar.load()`: extend signature to `load(job_id, block_hashes, block_indexes, peer_id)`
-- [ ] `PDConnector.load()`: store `block_indexes` in `_LoadJob`; forward in `lookup_fetch` message
-- [ ] Add `_LoadJob.block_indexes: list[int]`
-- [ ] Build `_addr_to_idx: dict[int, int]` at `__init__()` from `self._kv_blocks`
-- [ ] Define `_PendingFetch` dataclass
-- [ ] Add `_pending_fetches: dict[str, _PendingFetch]` and `_xfer_handles` to `__init__()`
-- [ ] `_handle_lookup_fetch`: build `hash_to_remote_idx` from `zip(block_hashes, block_indexes)`; create `_PendingFetch`; call `_try_transfer()`
-- [ ] `save()`: after storing, call `_try_transfer(job_id)` if `_pending_fetches` has the job
-- [ ] Implement `_try_transfer(job_id)`: intersect, build index lists, call NIXL, update remaining
-- [ ] `get_finished()` (Prefiller): poll `_xfer_handles`, on done send `transfer_done`, release handle
-- [ ] Listener: handle `transfer_done` on Decoder side
-- [ ] `_handle_transfer_done`: accumulate `received_hashes`, mark DONE when complete
-- [ ] Add `_LoadJob.received_hashes: set[int]`
-- [ ] `close()`: release all in-flight NIXL handles in `_xfer_handles`
-- [ ] Test: save all blocks before load → single NIXL write → decoder gets transfer_done → job DONE
-- [ ] Test: save in two chunks after load → two NIXL writes → decoder accumulates → job DONE after second chunk
-- [ ] Test: partial save (only some hashes) → decoder never reaches DONE → xfer_deadline fires → ABORTED
+
+- [ ] Define `_StoreJob` dataclass
+- [ ] Add `_store_jobs`, `_pending_blocks`, `_block_to_job`, `_inflight_xfers`,
+      `_finished_jobs` in `__init__()`
+- [ ] Implement `submit_store(job_metadata)` — replaces the `raise NotImplementedError` stub
+- [ ] Implement `get_finished()` with `check_xfer_state` polling — replaces the
+      `raise NotImplementedError` stub
+- [ ] Add unit tests: submit a store job, verify `_store_jobs` entry and `_block_to_job`
+      mapping; verify `get_finished()` returns empty (no pending blocks → no transfers)
 
 #### Tests
 
-Tests are located in `tests/test_pd_connector.py`.
+Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
 
 To run:
 ```bash
-cd /home/lirans/my-utils/pd-connector
-python3 -m pytest tests/test_pd_connector.py -v
+.venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
+

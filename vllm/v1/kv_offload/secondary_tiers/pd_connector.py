@@ -12,6 +12,7 @@ into its own primary CPU tier via a NIXL WRITE transfer.
 import threading
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import msgspec
 import numpy as np
@@ -20,11 +21,14 @@ import zmq.utils.monitor
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.abstract import (
+    JobId,
     JobMetadata,
     JobResult,
     OffloadKey,
     SecondaryTierManager,
+    get_offload_block_hash,
 )
+from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 
 logger = init_logger(__name__)
 
@@ -47,6 +51,12 @@ def _apply_heartbeat(sock: zmq.Socket) -> None:
     sock.setsockopt(zmq.HEARTBEAT_IVL, _HEARTBEAT_IVL_MS)
     sock.setsockopt(zmq.HEARTBEAT_TIMEOUT, _HEARTBEAT_TIMEOUT_MS)
     sock.setsockopt(zmq.HEARTBEAT_TTL, _HEARTBEAT_TTL_MS)
+
+
+@dataclass
+class _StoreJob:
+    job_id: JobId
+    remaining: int
 
 
 class PDConnector(SecondaryTierManager):
@@ -87,6 +97,13 @@ class PDConnector(SecondaryTierManager):
         self._connect_events: dict[str, threading.Event] = {}
         self._remote_dlists: dict[str, object] = {}
         self._peer_nixl_names: dict[str, str] = {}
+
+        # Store job tracking (Step 6)
+        self._store_jobs: dict[JobId, _StoreJob] = {}
+        self._pending_blocks: dict[bytes, object] = {}
+        self._block_to_job: dict[bytes, tuple[JobId, int]] = {}
+        self._inflight_xfers: dict[object, tuple[JobId, int]] = {}
+        self._finished_jobs: list[JobResult] = []
 
         self._zmq_ctx = zmq.Context()
 
@@ -503,10 +520,45 @@ class PDConnector(SecondaryTierManager):
         raise NotImplementedError
 
     def submit_store(self, job_metadata: JobMetadata) -> None:
-        raise NotImplementedError
+        job_id = job_metadata.job_id
+        keys = list(job_metadata.keys)
+        spec = job_metadata.spec
+
+        assert isinstance(spec, CPULoadStoreSpec), (
+            f"Expected CPULoadStoreSpec, got {type(spec)}"
+        )
+        assert len(keys) == len(spec.block_ids), (
+            f"Length mismatch: {len(keys)} keys but "
+            f"{len(spec.block_ids)} block_ids in spec"
+        )
+
+        job = _StoreJob(job_id=job_id, remaining=len(keys))
+        self._store_jobs[job_id] = job
+
+        for key, block_idx in zip(keys, spec.block_ids):
+            block_hash = get_offload_block_hash(key)
+            self._block_to_job[block_hash] = (job_id, int(block_idx))
+
+            if block_hash in self._pending_blocks:
+                pass
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
         raise NotImplementedError
 
     def get_finished(self) -> Iterable[JobResult]:
-        raise NotImplementedError
+        for handle in list(self._inflight_xfers):
+            state = self._agent.check_xfer_state(handle)
+            if state == "DONE":
+                self._agent.release_xfer_handle(handle)
+                job_id, num_blocks = self._inflight_xfers.pop(handle)
+                job = self._store_jobs[job_id]
+                job.remaining -= num_blocks
+                if job.remaining == 0:
+                    del self._store_jobs[job_id]
+                    self._finished_jobs.append(
+                        JobResult(job_id=job_id, success=True)
+                    )
+
+        result = self._finished_jobs
+        self._finished_jobs = []
+        return result

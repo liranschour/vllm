@@ -7,6 +7,7 @@ Step 1: skeleton — tier name, primary view, TieringOffloadingManager wiring,
         unimplemented method stubs.
 Step 2: ZMQ control channel — bidirectional messaging, clean-disconnect
         notification via _on_peer_down.
+Step 6: submit_store() job tracking and get_finished().
 """
 
 import socket
@@ -16,7 +17,12 @@ import time
 import pytest
 import torch
 
-from vllm.v1.kv_offload.abstract import JobMetadata, OffloadKey
+from vllm.v1.kv_offload.abstract import (
+    JobMetadata,
+    OffloadKey,
+    get_offload_block_hash,
+)
+from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 from vllm.v1.kv_offload.secondary_tiers.pd_connector import PDConnector
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
@@ -98,30 +104,12 @@ class TestPDConnectorSkeleton:
         finally:
             c.close()
 
-    def test_submit_store_raises_not_implemented(self):
-        p = free_port()
-        c = PDConnector("127.0.0.1", p)
-        try:
-            with pytest.raises(NotImplementedError):
-                c.submit_store(JobMetadata(job_id=0, keys=[], spec=None))
-        finally:
-            c.close()
-
     def test_submit_load_raises_not_implemented(self):
         p = free_port()
         c = PDConnector("127.0.0.1", p)
         try:
             with pytest.raises(NotImplementedError):
                 c.submit_load(JobMetadata(job_id=0, keys=[], spec=None))
-        finally:
-            c.close()
-
-    def test_get_finished_raises_not_implemented(self):
-        p = free_port()
-        c = PDConnector("127.0.0.1", p)
-        try:
-            with pytest.raises(NotImplementedError):
-                list(c.get_finished())
         finally:
             c.close()
 
@@ -273,6 +261,75 @@ class TestZMQControlChannel:
         c = PDConnector("127.0.0.1", p)
         c.close()
         c.close()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# Step 6: submit_store() and get_finished() tests
+# ---------------------------------------------------------------------------
+
+class TestSubmitStoreJobTracking:
+
+    def test_submit_store_creates_store_job(self):
+        """submit_store adds a _StoreJob with correct remaining count."""
+        p = free_port()
+        c = PDConnector("127.0.0.1", p)
+        try:
+            c.set_primary_view(make_primary_view())
+            keys = [make_key(0), make_key(1), make_key(2)]
+            spec = CPULoadStoreSpec(block_ids=[0, 1, 2])
+            c.submit_store(JobMetadata(job_id=42, keys=keys, spec=spec))
+
+            assert 42 in c._store_jobs
+            assert c._store_jobs[42].remaining == 3
+        finally:
+            c.close()
+
+    def test_submit_store_populates_block_to_job(self):
+        """Each block hash is recorded in _block_to_job with correct job_id and index."""
+        p = free_port()
+        c = PDConnector("127.0.0.1", p)
+        try:
+            c.set_primary_view(make_primary_view())
+            keys = [make_key(0), make_key(1)]
+            spec = CPULoadStoreSpec(block_ids=[5, 7])
+            c.submit_store(JobMetadata(job_id=10, keys=keys, spec=spec))
+
+            h0 = get_offload_block_hash(keys[0])
+            h1 = get_offload_block_hash(keys[1])
+            assert c._block_to_job[h0] == (10, 5)
+            assert c._block_to_job[h1] == (10, 7)
+        finally:
+            c.close()
+
+    def test_get_finished_returns_empty_when_no_transfers(self):
+        """With empty _pending_blocks no transfers happen, get_finished returns []."""
+        p = free_port()
+        c = PDConnector("127.0.0.1", p)
+        try:
+            c.set_primary_view(make_primary_view())
+            keys = [make_key(0)]
+            spec = CPULoadStoreSpec(block_ids=[0])
+            c.submit_store(JobMetadata(job_id=1, keys=keys, spec=spec))
+
+            finished = list(c.get_finished())
+            assert finished == []
+        finally:
+            c.close()
+
+    def test_submit_store_job_remaining_matches_key_count(self):
+        """remaining equals the number of keys submitted."""
+        p = free_port()
+        c = PDConnector("127.0.0.1", p)
+        try:
+            c.set_primary_view(make_primary_view())
+            for n in (1, 5, 10):
+                keys = [make_key(i) for i in range(n)]
+                spec = CPULoadStoreSpec(block_ids=list(range(n)))
+                job_id = 100 + n
+                c.submit_store(JobMetadata(job_id=job_id, keys=keys, spec=spec))
+                assert c._store_jobs[job_id].remaining == n
+        finally:
+            c.close()
 
 
 # ---------------------------------------------------------------------------
