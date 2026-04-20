@@ -467,8 +467,8 @@ class _StoreJob:
 |---|---|---|
 | `_store_jobs` | `dict[JobId, _StoreJob]` | Active store jobs with remaining block counter |
 | `_pending_blocks` | `dict[bytes, ...]` | Blocks requested by remote `lookup_fetch` but not yet stored. Empty until `lookup_fetch` handling is implemented in a later step |
-| `_block_to_job` | `dict[bytes, tuple[JobId, int]]` | Maps `block_hash` → `(job_id, local_block_idx)` for transfer initiation and counter decrement |
-| `_inflight_xfers` | `dict[handle, tuple[JobId, int]]` | Maps NIXL transfer handle → `(job_id, num_blocks)`. Used by `get_finished()` to attribute completed transfers to jobs |
+| `_block_to_job` | `dict[bytes, list[tuple[JobId, int]]]` | Maps `block_hash` → FIFO list of `(job_id, local_block_idx)`. A block can be submitted by multiple store jobs; `lookup_fetch` pops the oldest entry |
+| `_inflight_xfers` | `dict[handle, dict[JobId, int]]` | Maps NIXL transfer handle → `{job_id: num_blocks}`. A single batch transfer can span multiple store jobs. Used by `get_finished()` to attribute completed transfers to jobs |
 | `_finished_jobs` | `list[JobResult]` | Completed jobs waiting to be returned by `get_finished()` |
 
 #### Flow — `submit_store(job_metadata)`
@@ -503,6 +503,114 @@ class _StoreJob:
       `raise NotImplementedError` stub
 - [ ] Add unit tests: submit a store job, verify `_store_jobs` entry and `_block_to_job`
       mapping; verify `get_finished()` returns empty (no pending blocks → no transfers)
+
+#### Tests
+
+Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
+
+To run:
+```bash
+.venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
+```
+
+### Step 7: `submit_load()` and `lookup_fetch` Handling
+
+Implement the Decoder-side `submit_load()` and the Prefiller-side `lookup_fetch` handler.
+When the Decoder needs blocks, it sends a `lookup_fetch` control message to the Prefiller.
+The Prefiller checks which blocks are already stored (in `_block_to_job`) and batches them
+into a single NIXL WRITE transfer. Blocks not yet stored are inserted into `_pending_blocks`
+so that a future `submit_store()` call can pick them up. `submit_store()` is updated to
+handle `_pending_blocks` matches (completing the Step 6 stub).
+
+Key invariant: store job `remaining` is decremented **only when NIXL transfer completes**
+(in `get_finished()` via `check_xfer_state`). This ensures primary blocks stay pinned
+(ref_cnt > 0) until DMA finishes. `get_finished()` is unchanged from Step 6.
+
+#### Data Structures
+
+```python
+@dataclass
+class _PendingBlock:
+    peer_id: str
+    remote_block_idx: int
+
+@dataclass
+class _LoadJob:
+    job_id: JobId
+    peer_id: str
+```
+
+#### State changes
+
+| Field | Type | Change |
+|---|---|---|
+| `_pending_blocks` | `dict[bytes, _PendingBlock]` | Type refined (was `dict[bytes, object]`) |
+| `_load_jobs` | `dict[JobId, _LoadJob]` | New — tracks Decoder-side load jobs |
+| `_request_to_peer` | `dict[JobId, str]` | New — orchestrator sets Prefiller peer_id per load job before calling `submit_load` |
+
+#### Peer Routing
+
+The Decoder determines the Prefiller peer_id per request. The orchestrator calls
+`set_load_peer(job_id, peer_id)` before `submit_load()`. `submit_load` pops the
+entry from `_request_to_peer`.
+
+#### Flow — `submit_load(job_metadata)` (Decoder side)
+
+1. Pop `peer_id` from `_request_to_peer[job_id]`
+2. `_ensure_connected(peer_id)`
+3. Create `_LoadJob(job_id, peer_id)`; add to `_load_jobs[job_id]`
+4. Send `lookup_fetch` ctrl message:
+   ```json
+   {"type": "lookup_fetch",
+    "peer_id": "<self._peer_id>",
+    "job_id": "<job_id>",
+    "block_hashes": ["<hash_0>", "<hash_1>", ...],
+    "block_indexes": [<idx_0>, <idx_1>, ...]}
+   ```
+
+#### Flow — `_handle_message("lookup_fetch")` (Prefiller side)
+
+1. Parse `peer_id`, `block_hashes`, `block_indexes` from message
+2. For each `(block_hash, remote_idx)` in `zip(block_hashes, block_indexes)`:
+   - If `block_hash` in `_block_to_job`:
+     - Pop `(store_job_id, local_idx)` from `_block_to_job`
+     - Collect `(local_idx, remote_idx)` into ready batch
+   - Else:
+     - Insert `_pending_blocks[block_hash] = _PendingBlock(peer_id, remote_idx)`
+3. If ready batch non-empty:
+   - `handle = make_prepped_xfer("WRITE", self._local_dlist, [local_idxs], self._remote_dlists[peer_id], [remote_idxs])`
+   - `transfer(handle)`
+   - `_inflight_xfers[handle] = (store_job_id, len(batch))`
+4. `remaining` is NOT decremented here — that happens in `get_finished()` when
+   `check_xfer_state` returns `"DONE"` (Step 6 logic)
+
+#### Flow — update `submit_store()` (completing Step 6 stub)
+
+Replace `if block_hash in self._pending_blocks: pass` with:
+
+For each `(key, block_idx)`:
+- If `block_hash` in `_pending_blocks`:
+  - Pop `_PendingBlock(peer_id, remote_idx)`
+  - Collect `(local_idx=int(block_idx), remote_idx, peer_id)` into ready batch
+  - Do NOT add to `_block_to_job` (block matched immediately)
+- Else:
+  - Add to `_block_to_job` as before
+
+After scanning all blocks: batch ready blocks by peer, one
+`make_prepped_xfer("WRITE", ...)` + `transfer()` per peer. Store handles in
+`_inflight_xfers[handle] = (job_id, len(batch))`.
+
+`remaining` is NOT decremented here — decremented by `get_finished()` on NIXL completion.
+
+#### Tasks
+
+- [ ] Define `_PendingBlock` and `_LoadJob` dataclasses
+- [ ] Add `_load_jobs`, `_request_to_peer` in `__init__()`; refine `_pending_blocks` type
+- [ ] Implement `set_load_peer(job_id, peer_id)`
+- [ ] Implement `submit_load(job_metadata)` — replaces the `raise NotImplementedError` stub
+- [ ] Extend `_handle_message` with `"lookup_fetch"` handler (Prefiller side)
+- [ ] Update `submit_store()` to handle `_pending_blocks` matches (replace the `pass` stub)
+- [ ] Add unit tests
 
 #### Tests
 

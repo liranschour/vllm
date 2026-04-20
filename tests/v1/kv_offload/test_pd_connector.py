@@ -8,11 +8,13 @@ Step 1: skeleton — tier name, primary view, TieringOffloadingManager wiring,
 Step 2: ZMQ control channel — bidirectional messaging, clean-disconnect
         notification via _on_peer_down.
 Step 6: submit_store() job tracking and get_finished().
+Step 7: submit_load(), lookup_fetch handling, pending_blocks matching.
 """
 
 import socket
 import threading
 import time
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -23,7 +25,10 @@ from vllm.v1.kv_offload.abstract import (
     get_offload_block_hash,
 )
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
-from vllm.v1.kv_offload.secondary_tiers.pd_connector import PDConnector
+from vllm.v1.kv_offload.secondary_tiers.pd_connector import (
+    PDConnector,
+    _PendingBlock,
+)
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
@@ -101,15 +106,6 @@ class TestPDConnectorSkeleton:
         try:
             with pytest.raises(NotImplementedError):
                 c.lookup([make_key(0)])
-        finally:
-            c.close()
-
-    def test_submit_load_raises_not_implemented(self):
-        p = free_port()
-        c = PDConnector("127.0.0.1", p)
-        try:
-            with pytest.raises(NotImplementedError):
-                c.submit_load(JobMetadata(job_id=0, keys=[], spec=None))
         finally:
             c.close()
 
@@ -296,8 +292,8 @@ class TestSubmitStoreJobTracking:
 
             h0 = get_offload_block_hash(keys[0])
             h1 = get_offload_block_hash(keys[1])
-            assert c._block_to_job[h0] == (10, 5)
-            assert c._block_to_job[h1] == (10, 7)
+            assert c._block_to_job[h0] == [(10, 5)]
+            assert c._block_to_job[h1] == [(10, 7)]
         finally:
             c.close()
 
@@ -330,6 +326,142 @@ class TestSubmitStoreJobTracking:
                 assert c._store_jobs[job_id].remaining == n
         finally:
             c.close()
+
+
+# ---------------------------------------------------------------------------
+# Step 7: submit_load() and lookup_fetch tests
+# ---------------------------------------------------------------------------
+
+class TestSubmitLoadAndLookupFetch:
+
+    def test_submit_load_creates_load_job(self):
+        """submit_load adds a _LoadJob with correct peer_id."""
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            decoder.set_load_peer(42, prefiller._peer_id)
+            keys = [make_key(0), make_key(1)]
+            spec = CPULoadStoreSpec(block_ids=[0, 1])
+            decoder.submit_load(JobMetadata(job_id=42, keys=keys, spec=spec))
+
+            assert 42 in decoder._load_jobs
+            assert decoder._load_jobs[42].peer_id == prefiller._peer_id
+        finally:
+            decoder.close()
+            prefiller.close()
+
+    def test_lookup_fetch_populates_pending_blocks(self):
+        """When Prefiller has no stored blocks, lookup_fetch inserts into _pending_blocks."""
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            keys = [make_key(0), make_key(1)]
+            spec = CPULoadStoreSpec(block_ids=[3, 5])
+            decoder.set_load_peer(10, prefiller._peer_id)
+            decoder.submit_load(JobMetadata(job_id=10, keys=keys, spec=spec))
+
+            time.sleep(0.3)
+
+            h0 = get_offload_block_hash(keys[0])
+            h1 = get_offload_block_hash(keys[1])
+            assert h0 in prefiller._pending_blocks
+            assert h1 in prefiller._pending_blocks
+            assert prefiller._pending_blocks[h0].remote_block_idx == 3
+            assert prefiller._pending_blocks[h1].remote_block_idx == 5
+            assert prefiller._pending_blocks[h0].peer_id == decoder._peer_id
+        finally:
+            decoder.close()
+            prefiller.close()
+
+    def test_lookup_fetch_matches_stored_blocks(self):
+        """When Prefiller has stored blocks, lookup_fetch removes them from _block_to_job."""
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            store_keys = [make_key(0), make_key(1)]
+            store_spec = CPULoadStoreSpec(block_ids=[2, 4])
+            prefiller.submit_store(
+                JobMetadata(job_id=1, keys=store_keys, spec=store_spec)
+            )
+
+            h0 = get_offload_block_hash(store_keys[0])
+            h1 = get_offload_block_hash(store_keys[1])
+            assert h0 in prefiller._block_to_job
+            assert h1 in prefiller._block_to_job
+
+            # Mock NIXL transport so the transfer call doesn't block.
+            prefiller._agent.make_prepped_xfer = MagicMock(return_value=999)
+            prefiller._agent.transfer = MagicMock()
+
+            load_keys = [make_key(0), make_key(1)]
+            load_spec = CPULoadStoreSpec(block_ids=[6, 8])
+            decoder.set_load_peer(20, prefiller._peer_id)
+            decoder.submit_load(
+                JobMetadata(job_id=20, keys=load_keys, spec=load_spec)
+            )
+
+            time.sleep(0.3)
+
+            assert h0 not in prefiller._block_to_job
+            assert h1 not in prefiller._block_to_job
+            assert len(prefiller._pending_blocks) == 0
+        finally:
+            decoder.close()
+            prefiller.close()
+
+    def test_submit_store_matches_pending_blocks(self):
+        """submit_store matches _pending_blocks: blocks not added to _block_to_job."""
+        p = free_port()
+        prefiller = PDConnector("127.0.0.1", p)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+
+            # Directly inject pending blocks (as if a lookup_fetch arrived).
+            keys = [make_key(0), make_key(1), make_key(2)]
+            h0 = get_offload_block_hash(keys[0])
+            h1 = get_offload_block_hash(keys[1])
+            h2 = get_offload_block_hash(keys[2])
+            prefiller._pending_blocks[h0] = _PendingBlock(
+                peer_id="127.0.0.1:9999", remote_block_idx=3
+            )
+            prefiller._pending_blocks[h1] = _PendingBlock(
+                peer_id="127.0.0.1:9999", remote_block_idx=5
+            )
+            prefiller._pending_blocks[h2] = _PendingBlock(
+                peer_id="127.0.0.1:9999", remote_block_idx=7
+            )
+
+            # Mock NIXL transport and remote dlist.
+            prefiller._agent.make_prepped_xfer = MagicMock(return_value=888)
+            prefiller._agent.transfer = MagicMock()
+            prefiller._remote_dlists["127.0.0.1:9999"] = MagicMock()
+
+            store_keys = [make_key(0), make_key(1)]
+            store_spec = CPULoadStoreSpec(block_ids=[0, 1])
+            prefiller.submit_store(
+                JobMetadata(job_id=2, keys=store_keys, spec=store_spec)
+            )
+
+            assert h0 not in prefiller._pending_blocks
+            assert h1 not in prefiller._pending_blocks
+            assert h0 not in prefiller._block_to_job
+            assert h1 not in prefiller._block_to_job
+            # key(2) was not in the store job — still pending
+            assert h2 in prefiller._pending_blocks
+        finally:
+            prefiller.close()
 
 
 # ---------------------------------------------------------------------------

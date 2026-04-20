@@ -59,6 +59,18 @@ class _StoreJob:
     remaining: int
 
 
+@dataclass
+class _PendingBlock:
+    peer_id: str
+    remote_block_idx: int
+
+
+@dataclass
+class _LoadJob:
+    job_id: JobId
+    peer_id: str
+
+
 class PDConnector(SecondaryTierManager):
     """
     Secondary tier for PD (Prefill-Decode) disaggregation.
@@ -100,10 +112,15 @@ class PDConnector(SecondaryTierManager):
 
         # Store job tracking (Step 6)
         self._store_jobs: dict[JobId, _StoreJob] = {}
-        self._pending_blocks: dict[bytes, object] = {}
-        self._block_to_job: dict[bytes, tuple[JobId, int]] = {}
-        self._inflight_xfers: dict[object, tuple[JobId, int]] = {}
+        self._pending_blocks: dict[bytes, _PendingBlock] = {}
+        self._block_to_job: dict[bytes, list[tuple[JobId, int]]] = {}
+        self._inflight_xfers: dict[object, dict[JobId, int]] = {}
         self._finished_jobs: list[JobResult] = []
+
+        # Load job tracking (Step 7)
+        self._load_jobs: dict[JobId, _LoadJob] = {}
+        # Temporary until peer_id is added to JobMetadata
+        self._request_to_peer: dict[JobId, str] = {}
 
         self._zmq_ctx = zmq.Context()
 
@@ -197,6 +214,10 @@ class PDConnector(SecondaryTierManager):
                 f"PDConnector: connect handshake timed out for {peer_id}"
             )
 
+    def set_load_peer(self, job_id: JobId, peer_id: str) -> None:
+        """Register the Prefiller peer_id for a load job before submit_load."""
+        self._request_to_peer[job_id] = peer_id
+
     # ------------------------------------------------------------------
     # Messaging
     # ------------------------------------------------------------------
@@ -265,6 +286,42 @@ class PDConnector(SecondaryTierManager):
                 event = self._connect_events.pop(sender_id, None)
             if event:
                 event.set()
+
+        elif msg_type == "lookup_fetch":
+            # Prefiller side: Decoder is requesting blocks.
+            decoder_peer_id = msg["peer_id"]
+            block_hashes = msg["block_hashes"]
+            block_indexes = msg["block_indexes"]
+
+            ready: list[tuple[int, int]] = []
+            job_counts: dict[JobId, int] = {}
+            for block_hash, remote_idx in zip(block_hashes, block_indexes):
+                bh = bytes(block_hash) if not isinstance(block_hash, bytes) else block_hash
+                entries = self._block_to_job.get(bh)
+                if entries:
+                    store_job_id, local_idx = entries.pop(0)
+                    if not entries:
+                        del self._block_to_job[bh]
+                    ready.append((local_idx, remote_idx))
+                    job_counts[store_job_id] = job_counts.get(store_job_id, 0) + 1
+                else:
+                    self._pending_blocks[bh] = _PendingBlock(
+                        peer_id=decoder_peer_id,
+                        remote_block_idx=remote_idx,
+                    )
+
+            if ready:
+                local_idxs = [p[0] for p in ready]
+                remote_idxs = [p[1] for p in ready]
+                handle = self._agent.make_prepped_xfer(
+                    "WRITE",
+                    self._local_dlist,
+                    local_idxs,
+                    self._remote_dlists[decoder_peer_id],
+                    remote_idxs,
+                )
+                self._agent.transfer(handle)
+                self._inflight_xfers[handle] = job_counts
 
         else:
             logger.warning(
@@ -535,29 +592,69 @@ class PDConnector(SecondaryTierManager):
         job = _StoreJob(job_id=job_id, remaining=len(keys))
         self._store_jobs[job_id] = job
 
+        ready: dict[str, list[tuple[int, int]]] = {}
         for key, block_idx in zip(keys, spec.block_ids):
             block_hash = get_offload_block_hash(key)
-            self._block_to_job[block_hash] = (job_id, int(block_idx))
+            pending = self._pending_blocks.pop(block_hash, None)
+            if pending is not None:
+                batch = ready.setdefault(pending.peer_id, [])
+                batch.append((int(block_idx), pending.remote_block_idx))
+            else:
+                self._block_to_job.setdefault(block_hash, []).append(
+                    (job_id, int(block_idx))
+                )
 
-            if block_hash in self._pending_blocks:
-                pass
+        for peer_id, pairs in ready.items():
+            local_idxs = [p[0] for p in pairs]
+            remote_idxs = [p[1] for p in pairs]
+            handle = self._agent.make_prepped_xfer(
+                "WRITE",
+                self._local_dlist,
+                local_idxs,
+                self._remote_dlists[peer_id],
+                remote_idxs,
+            )
+            self._agent.transfer(handle)
+            self._inflight_xfers[handle] = {job_id: len(pairs)}
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
-        raise NotImplementedError
+        job_id = job_metadata.job_id
+        keys = list(job_metadata.keys)
+        spec = job_metadata.spec
+
+        assert isinstance(spec, CPULoadStoreSpec), (
+            f"Expected CPULoadStoreSpec, got {type(spec)}"
+        )
+
+        peer_id = self._request_to_peer.pop(job_id)
+        self._ensure_connected(peer_id)
+
+        self._load_jobs[job_id] = _LoadJob(job_id=job_id, peer_id=peer_id)
+
+        self._send(peer_id, {
+            "type": "lookup_fetch",
+            "peer_id": self._peer_id,
+            "job_id": job_id,
+            "block_hashes": [
+                get_offload_block_hash(k) for k in keys
+            ],
+            "block_indexes": [int(idx) for idx in spec.block_ids],
+        })
 
     def get_finished(self) -> Iterable[JobResult]:
         for handle in list(self._inflight_xfers):
             state = self._agent.check_xfer_state(handle)
             if state == "DONE":
                 self._agent.release_xfer_handle(handle)
-                job_id, num_blocks = self._inflight_xfers.pop(handle)
-                job = self._store_jobs[job_id]
-                job.remaining -= num_blocks
-                if job.remaining == 0:
-                    del self._store_jobs[job_id]
-                    self._finished_jobs.append(
-                        JobResult(job_id=job_id, success=True)
-                    )
+                job_counts = self._inflight_xfers.pop(handle)
+                for job_id, num_blocks in job_counts.items():
+                    job = self._store_jobs[job_id]
+                    job.remaining -= num_blocks
+                    if job.remaining == 0:
+                        del self._store_jobs[job_id]
+                        self._finished_jobs.append(
+                            JobResult(job_id=job_id, success=True)
+                        )
 
         result = self._finished_jobs
         self._finished_jobs = []
