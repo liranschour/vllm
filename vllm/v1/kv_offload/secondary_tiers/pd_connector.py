@@ -45,6 +45,11 @@ _HEARTBEAT_IVL_MS = 2000
 _HEARTBEAT_TIMEOUT_MS = 10000
 _HEARTBEAT_TTL_MS = 10000
 
+# Job timeout constants (seconds). Tests may monkey-patch these globals.
+_STORE_TIMEOUT_S     = 30.0   # max wait for lookup_fetch to match a store job
+_LOAD_TIMEOUT_S      = 30.0   # max wait for transfer_done on a load job
+_ABORT_ACK_TIMEOUT_S = 10.0   # max wait for abort_ack after abort_lookup_fetch
+
 
 def _apply_heartbeat(sock: zmq.Socket) -> None:
     """Apply ZMTP heartbeat options to a socket."""
@@ -57,6 +62,7 @@ def _apply_heartbeat(sock: zmq.Socket) -> None:
 class _StoreJob:
     job_id: JobId
     remaining: int
+    submitted_at: float  # time.monotonic() at submit_store() time
 
 
 @dataclass
@@ -70,6 +76,7 @@ class _PendingBlock:
 class _LoadJob:
     job_id: JobId
     peer_id: str
+    submitted_at: float  # time.monotonic() at submit_load() time
 
 
 @dataclass
@@ -134,6 +141,9 @@ class PDConnector(SecondaryTierManager):
         self._load_jobs: dict[JobId, _LoadJob] = {}
         # Temporary until peer_id is added to JobMetadata
         self._request_to_peer: dict[JobId, str] = {}
+        # Decoder side: load jobs awaiting abort_ack (Step 11)
+        # value = (peer_id, abort_sent_at monotonic)
+        self._aborting_loads: dict[JobId, tuple[str, float]] = {}
 
         # Prefiller side: tracks remaining-block count per lookup_fetch job
         # keyed by (decoder_peer_id, decoder_job_id)
@@ -369,6 +379,66 @@ class PDConnector(SecondaryTierManager):
                         JobResult(job_id=job_id, success=success)
                     )
 
+        elif msg_type == "abort_lookup_fetch":
+            # Prefiller side: Decoder is cancelling a timed-out load job.
+            decoder_peer_id = msg["peer_id"]
+            decoder_job_id: JobId = msg["job_id"]
+            fkey = (decoder_peer_id, decoder_job_id)
+            handles_to_release: list[object] = []
+
+            with self._lock:
+                # Remove pending blocks belonging to the aborted fetch job.
+                dead_hashes = [
+                    bh for bh, pb in self._pending_blocks.items()
+                    if pb.peer_id == decoder_peer_id
+                    and pb.decoder_job_id == decoder_job_id
+                ]
+                for bh in dead_hashes:
+                    del self._pending_blocks[bh]
+
+                # Remove fetch job tracking.
+                self._fetch_jobs.pop(fkey, None)
+
+                # Remove fkey from each in-flight handle's fetch count dict.
+                # Best-effort cancel: if a handle exclusively served this fetch
+                # job (dict becomes empty), pull it from _inflight_xfers too.
+                for handle in list(self._inflight_fetch_counts):
+                    fdict = self._inflight_fetch_counts[handle]
+                    fdict.pop(fkey, None)
+                    if not fdict:
+                        del self._inflight_fetch_counts[handle]
+                        self._inflight_xfers.pop(handle, None)
+                        self._inflight_xfer_peer.pop(handle, None)
+                        handles_to_release.append(handle)
+
+            if self._agent is not None:
+                for handle in handles_to_release:
+                    try:
+                        self._agent.release_xfer_handle(handle)
+                    except Exception:
+                        pass
+
+            try:
+                self._send(decoder_peer_id, {
+                    "type": "abort_ack",
+                    "job_id": decoder_job_id,
+                })
+            except Exception:
+                logger.warning(
+                    "PDConnector %s: failed to send abort_ack to %s job %d",
+                    self._peer_id, decoder_peer_id, decoder_job_id,
+                )
+
+        elif msg_type == "abort_ack":
+            # Decoder side: Prefiller confirmed abort; fail the load job now.
+            job_id = msg["job_id"]
+            with self._lock:
+                if job_id in self._aborting_loads:
+                    del self._aborting_loads[job_id]
+                    self._finished_jobs.append(
+                        JobResult(job_id=job_id, success=False)
+                    )
+
         else:
             logger.warning(
                 "PDConnector %s: unknown message type %r from %s",
@@ -512,6 +582,15 @@ class PDConnector(SecondaryTierManager):
             ]
             for jid in dead_load_ids:
                 del self._load_jobs[jid]
+                self._finished_jobs.append(JobResult(job_id=jid, success=False))
+            # Decoder side: fail any aborting load jobs waiting for abort_ack
+            # from the now-dead prefiller peer.
+            dead_aborting = [
+                jid for jid, (pid, _) in self._aborting_loads.items()
+                if pid == peer_id
+            ]
+            for jid in dead_aborting:
+                del self._aborting_loads[jid]
                 self._finished_jobs.append(JobResult(job_id=jid, success=False))
 
         logger.warning("PDConnector %s: peer %s is down", self._peer_id, peer_id)
@@ -663,7 +742,7 @@ class PDConnector(SecondaryTierManager):
             f"{len(spec.block_ids)} block_ids in spec"
         )
 
-        job = _StoreJob(job_id=job_id, remaining=len(keys))
+        job = _StoreJob(job_id=job_id, remaining=len(keys), submitted_at=time.monotonic())
         ready: dict[str, list[tuple[int, int]]] = {}
         remote_dlists: dict[str, object] = {}
         # fetch_groups[peer_id] maps (decoder_peer_id, decoder_job_id) → count
@@ -727,7 +806,9 @@ class PDConnector(SecondaryTierManager):
         peer_id = self._request_to_peer.pop(job_id)
         self._ensure_connected(peer_id)
 
-        self._load_jobs[job_id] = _LoadJob(job_id=job_id, peer_id=peer_id)
+        self._load_jobs[job_id] = _LoadJob(
+            job_id=job_id, peer_id=peer_id, submitted_at=time.monotonic()
+        )
 
         self._send(peer_id, {
             "type": "lookup_fetch",
@@ -740,6 +821,70 @@ class PDConnector(SecondaryTierManager):
         })
 
     def get_finished(self) -> Iterable[JobResult]:
+        # ── Timeout checks ────────────────────────────────────────────────────
+        now = time.monotonic()
+
+        # ① Store job timeout (Prefiller context)
+        with self._lock:
+            timed_out_stores = [
+                jid for jid, job in self._store_jobs.items()
+                if now - job.submitted_at >= _STORE_TIMEOUT_S
+            ]
+            for jid in timed_out_stores:
+                for bh in list(self._block_to_job):
+                    entries = [
+                        (j, idx) for j, idx in self._block_to_job[bh] if j != jid
+                    ]
+                    if entries:
+                        self._block_to_job[bh] = entries
+                    else:
+                        del self._block_to_job[bh]
+                del self._store_jobs[jid]
+                self._finished_jobs.append(JobResult(job_id=jid, success=False))
+                logger.warning(
+                    "PDConnector %s: store job %d timed out after %.1fs",
+                    self._peer_id, jid, _STORE_TIMEOUT_S,
+                )
+
+        # ② Load job timeout → send abort_lookup_fetch (Decoder context)
+        with self._lock:
+            timed_out_loads = [
+                (jid, lj) for jid, lj in self._load_jobs.items()
+                if now - lj.submitted_at >= _LOAD_TIMEOUT_S
+            ]
+            for jid, lj in timed_out_loads:
+                del self._load_jobs[jid]
+                self._aborting_loads[jid] = (lj.peer_id, time.monotonic())
+            to_abort = [(lj.peer_id, jid) for jid, lj in timed_out_loads]
+        for peer_id, jid in to_abort:
+            try:
+                self._send(peer_id, {
+                    "type": "abort_lookup_fetch",
+                    "peer_id": self._peer_id,
+                    "job_id": jid,
+                })
+            except Exception:
+                logger.warning(
+                    "PDConnector %s: failed to send abort_lookup_fetch "
+                    "for load job %d to %s",
+                    self._peer_id, jid, peer_id,
+                )
+
+        # ③ Aborting load timeout → fail without ack (Decoder context)
+        with self._lock:
+            expired_aborting = [
+                jid for jid, (_, sent_at) in self._aborting_loads.items()
+                if now - sent_at >= _ABORT_ACK_TIMEOUT_S
+            ]
+            for jid in expired_aborting:
+                del self._aborting_loads[jid]
+                self._finished_jobs.append(JobResult(job_id=jid, success=False))
+                logger.warning(
+                    "PDConnector %s: abort_ack timed out for load job %d",
+                    self._peer_id, jid,
+                )
+        # ── End timeout checks ─────────────────────────────────────────────────
+
         with self._lock:
             handles = list(self._inflight_xfers)
 

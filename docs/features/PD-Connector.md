@@ -808,3 +808,93 @@ To run:
 .venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
+### Step 11: Error Handling — Store and Load Job Timeouts
+
+#### Motivation
+
+Without timeouts, a blocked `submit_store` (no `lookup_fetch` ever arrives) or a blocked `submit_load` (Prefiller crashes or is slow) can hold state forever. Step 11 adds timeout-based failure paths for both cases.
+
+#### Timeout constants (module-level, monkey-patchable in tests)
+
+```python
+_STORE_TIMEOUT_S     = 30.0   # max wait for lookup_fetch to match a store job
+_LOAD_TIMEOUT_S      = 30.0   # max wait for transfer_done on a load job
+_ABORT_ACK_TIMEOUT_S = 10.0   # max wait for abort_ack after abort_lookup_fetch
+```
+
+#### Store job timeout (Prefiller)
+
+When `get_finished()` detects that a `_StoreJob.submitted_at` is older than `_STORE_TIMEOUT_S`:
+1. Remove all `_block_to_job` entries for that job (blocks waiting for a future `lookup_fetch`)
+2. Delete the `_StoreJob`
+3. Append `JobResult(job_id, success=False)` to `_finished_jobs`
+
+Blocks already in `_inflight_xfers` continue to completion; `_store_jobs.get(jid)` returns `None` and they are silently skipped.
+
+#### Load job timeout and abort protocol (Decoder)
+
+**State machine for a load job:**
+
+```
+_load_jobs  →  (timeout)  →  _aborting_loads  →  (abort_ack or ack timeout)  →  _finished_jobs(failure)
+                                               →  (peer down)               →  _finished_jobs(failure)
+```
+
+When `get_finished()` detects `_LoadJob.submitted_at` is older than `_LOAD_TIMEOUT_S`:
+1. Move job from `_load_jobs` to `_aborting_loads[job_id] = (peer_id, abort_sent_at)`
+2. Send `abort_lookup_fetch` to the Prefiller (outside lock)
+
+When `get_finished()` detects `_aborting_loads` entry is older than `_ABORT_ACK_TIMEOUT_S`:
+- Fail the job with `JobResult(job_id, False)` regardless of ack
+
+#### New control messages
+
+| Direction | Type | Fields |
+|-----------|------|--------|
+| Decoder → Prefiller | `abort_lookup_fetch` | `peer_id`, `job_id` |
+| Prefiller → Decoder | `abort_ack` | `job_id` |
+
+**`_handle_message("abort_lookup_fetch")` — Prefiller:**
+1. Remove `_pending_blocks` for `(decoder_peer_id, decoder_job_id)`
+2. Remove `_fetch_jobs[(decoder_peer_id, decoder_job_id)]`
+3. Remove `fkey` from each `_inflight_fetch_counts[handle]` dict; best-effort cancel: if a handle's `_inflight_fetch_counts` dict becomes empty, pull it from `_inflight_xfers`/`_inflight_xfer_peer` and release it outside the lock
+4. Send `abort_ack` outside the lock
+
+**`_handle_message("abort_ack")` — Decoder:**
+- Pop `_aborting_loads[job_id]`; append `JobResult(job_id, False)` to `_finished_jobs`
+
+**`_on_peer_down()` extension:**
+- Fail all `_aborting_loads` entries whose `peer_id` matches the downed peer
+
+#### Data model changes
+
+- `_StoreJob.submitted_at: float` — set to `time.monotonic()` in `submit_store()`
+- `_LoadJob.submitted_at: float` — set to `time.monotonic()` in `submit_load()`
+- `_aborting_loads: dict[JobId, tuple[str, float]]` — `(peer_id, abort_sent_at)` per aborting job
+
+#### Tasks
+
+- [x] Add `_STORE_TIMEOUT_S`, `_LOAD_TIMEOUT_S`, `_ABORT_ACK_TIMEOUT_S` module constants
+- [x] Add `submitted_at: float` to `_StoreJob` and `_LoadJob`
+- [x] Add `_aborting_loads: dict[JobId, tuple[str, float]]` to `__init__`
+- [x] `submit_store()`: pass `submitted_at=time.monotonic()`
+- [x] `submit_load()`: pass `submitted_at=time.monotonic()`
+- [x] `get_finished()`: add ① store timeout, ② load timeout + abort send, ③ aborting timeout checks
+- [x] `_handle_message("abort_lookup_fetch")`: pending cleanup, best-effort NIXL cancel, send `abort_ack`
+- [x] `_handle_message("abort_ack")`: fail the aborting load job
+- [x] `_on_peer_down()`: fail `_aborting_loads` for the downed peer
+- [x] `TestErrorHandling::test_store_job_timeout`
+- [x] `TestErrorHandling::test_load_job_timeout_sends_abort`
+- [x] `TestErrorHandling::test_load_abort_clears_prefiller_pending`
+- [x] `TestErrorHandling::test_load_abort_ack_timeout`
+- [x] `TestErrorHandling::test_peer_down_fails_aborting_load`
+
+#### Tests
+
+Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
+
+To run:
+```bash
+.venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
+```
+

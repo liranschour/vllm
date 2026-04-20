@@ -27,6 +27,7 @@ from vllm.v1.kv_offload.abstract import (
     get_offload_block_hash,
 )
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
+import vllm.v1.kv_offload.secondary_tiers.pd_connector as _pd_mod
 from vllm.v1.kv_offload.secondary_tiers.pd_connector import (
     PDConnector,
     _FetchJob,
@@ -748,7 +749,7 @@ class TestRaceConditions:
             for i, key in enumerate(keys):
                 bh = get_offload_block_hash(key)
                 prefiller._block_to_job[bh] = [(i, i % 16)]
-                prefiller._store_jobs[i] = _StoreJob(job_id=i, remaining=1)
+                prefiller._store_jobs[i] = _StoreJob(job_id=i, remaining=1, submitted_at=0.0)
 
             counter = itertools.count(1)
             prefiller._agent.make_prepped_xfer = MagicMock(
@@ -912,7 +913,7 @@ class TestLoadJobCompletion:
             for i, key in enumerate(keys):
                 bh = get_offload_block_hash(key)
                 prefiller._block_to_job[bh] = [(100 + i, i)]
-                prefiller._store_jobs[100 + i] = _StoreJob(job_id=100 + i, remaining=1)
+                prefiller._store_jobs[100 + i] = _StoreJob(job_id=100 + i, remaining=1, submitted_at=0.0)
 
             sent_msgs: list[dict] = []
             orig_send = prefiller._send
@@ -1033,7 +1034,7 @@ class TestLoadJobCompletion:
             # Pre-populate one ready block.
             bh0 = get_offload_block_hash(ready_key)
             prefiller._block_to_job[bh0] = [(300, 0)]
-            prefiller._store_jobs[300] = _StoreJob(job_id=300, remaining=1)
+            prefiller._store_jobs[300] = _StoreJob(job_id=300, remaining=1, submitted_at=0.0)
 
             prefiller._handle_message(decoder_peer, {
                 "type": "lookup_fetch",
@@ -1368,3 +1369,255 @@ class TestEndToEndDataIntegrity:
         finally:
             decoder.close()
             prefiller.close()
+
+
+# ---------------------------------------------------------------------------
+# Step 11: Error handling — store and load job timeouts
+# ---------------------------------------------------------------------------
+
+class TestErrorHandling:
+    """
+    Verify that store and load jobs fail gracefully when they exceed their
+    timeouts. Timeouts are exercised by monkey-patching _pd_mod constants to
+    very small values so tests don't sleep for 30 s.
+    """
+
+    def test_store_job_timeout(self, monkeypatch):
+        """
+        A store job that never gets a matching lookup_fetch times out and
+        get_finished() returns JobResult(job_id, success=False).
+        The corresponding _block_to_job entries must be cleaned up.
+        """
+        monkeypatch.setattr(_pd_mod, "_STORE_TIMEOUT_S", 0.05)
+
+        p = free_port()
+        prefiller = PDConnector("127.0.0.1", p)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+
+            keys = [make_key(0), make_key(1)]
+            spec = CPULoadStoreSpec(block_ids=[0, 1])
+            prefiller.submit_store(JobMetadata(job_id=10, keys=keys, spec=spec))
+
+            # Blocks must be in _block_to_job before timeout
+            h0 = get_offload_block_hash(keys[0])
+            h1 = get_offload_block_hash(keys[1])
+            assert h0 in prefiller._block_to_job
+            assert h1 in prefiller._block_to_job
+
+            # Wait for timeout to expire, then poll
+            time.sleep(0.1)
+            results = list(prefiller.get_finished())
+
+            assert len(results) == 1
+            assert results[0].job_id == 10
+            assert results[0].success is False
+
+            # _block_to_job must be cleaned up
+            assert h0 not in prefiller._block_to_job
+            assert h1 not in prefiller._block_to_job
+        finally:
+            prefiller.close()
+
+    def test_load_job_timeout_sends_abort(self, monkeypatch):
+        """
+        End-to-end: Decoder load job times out → abort_lookup_fetch sent to
+        Prefiller → Prefiller clears _pending_blocks and _fetch_jobs, sends
+        abort_ack → Decoder's get_finished() returns JobResult(job_id, False).
+        """
+        monkeypatch.setattr(_pd_mod, "_LOAD_TIMEOUT_S", 0.05)
+
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder   = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            keys = [make_key(0), make_key(1)]
+            decoder_job_id = 77
+
+            decoder.set_load_peer(decoder_job_id, prefiller._peer_id)
+            decoder.submit_load(
+                JobMetadata(job_id=decoder_job_id, keys=keys,
+                            spec=CPULoadStoreSpec(block_ids=[0, 1]))
+            )
+
+            # Wait for lookup_fetch → both blocks go to _pending_blocks
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                with prefiller._lock:
+                    n = len(prefiller._pending_blocks)
+                if n == 2:
+                    break
+                time.sleep(0.02)
+            assert n == 2, "lookup_fetch did not arrive in time"
+
+            # Let the load job timeout expire, then poll decoder
+            time.sleep(0.1)
+            deadline = time.time() + 5.0
+            results: list = []
+            while time.time() < deadline:
+                prefiller.get_finished()   # keep prefiller message loop alive
+                results = list(decoder.get_finished())
+                if results:
+                    break
+                time.sleep(0.05)
+
+            assert len(results) == 1, f"Expected 1 result, got {results}"
+            assert results[0].job_id == decoder_job_id
+            assert results[0].success is False
+
+            # Prefiller state must be clean
+            time.sleep(0.1)   # allow abort_lookup_fetch to arrive
+            with prefiller._lock:
+                assert not prefiller._pending_blocks
+                assert (decoder._peer_id, decoder_job_id) not in prefiller._fetch_jobs
+        finally:
+            decoder.close()
+            prefiller.close()
+
+    def test_load_abort_clears_prefiller_pending(self, monkeypatch):
+        """
+        After an abort_lookup_fetch, the Prefiller's _pending_blocks for that
+        job are removed and the _fetch_jobs entry is gone.
+        """
+        monkeypatch.setattr(_pd_mod, "_LOAD_TIMEOUT_S", 0.05)
+
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder   = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            keys = [make_key(i) for i in range(3)]
+            decoder_job_id = 55
+            decoder.set_load_peer(decoder_job_id, prefiller._peer_id)
+            decoder.submit_load(
+                JobMetadata(job_id=decoder_job_id, keys=keys,
+                            spec=CPULoadStoreSpec(block_ids=[0, 1, 2]))
+            )
+
+            # Wait for all 3 blocks to land in _pending_blocks
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                with prefiller._lock:
+                    n = len(prefiller._pending_blocks)
+                if n == 3:
+                    break
+                time.sleep(0.02)
+            assert n == 3
+
+            # Trigger timeout on decoder, then drive the abort round-trip
+            time.sleep(0.1)
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                decoder.get_finished()
+                prefiller.get_finished()
+                with prefiller._lock:
+                    pending_gone = len(prefiller._pending_blocks) == 0
+                if pending_gone:
+                    break
+                time.sleep(0.05)
+
+            with prefiller._lock:
+                assert len(prefiller._pending_blocks) == 0
+                assert (decoder._peer_id, decoder_job_id) not in prefiller._fetch_jobs
+        finally:
+            decoder.close()
+            prefiller.close()
+
+    def test_load_abort_ack_timeout(self, monkeypatch):
+        """
+        Decoder sends abort_lookup_fetch but never receives abort_ack.
+        After _ABORT_ACK_TIMEOUT_S elapses, get_finished() returns
+        JobResult(job_id, success=False) anyway.
+        """
+        monkeypatch.setattr(_pd_mod, "_LOAD_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(_pd_mod, "_ABORT_ACK_TIMEOUT_S", 0.1)
+
+        p = free_port()
+        decoder = PDConnector("127.0.0.1", p)
+        try:
+            decoder.set_primary_view(make_primary_view())
+
+            # Directly inject a timed-out load job (simulates expired state)
+            decoder._load_jobs[99] = _pd_mod._LoadJob(
+                job_id=99,
+                peer_id="127.0.0.1:9999",
+                submitted_at=time.monotonic() - 1.0,  # already expired
+            )
+            # Inject a fake dealer so _send doesn't raise
+            decoder._dealers["127.0.0.1:9999"] = MagicMock()
+            decoder._dealers["127.0.0.1:9999"].send = MagicMock()
+
+            # First get_finished: detects timeout, sends abort, moves to _aborting_loads
+            decoder.get_finished()
+            assert 99 in decoder._aborting_loads
+
+            # Wait for _ABORT_ACK_TIMEOUT_S to elapse
+            time.sleep(0.15)
+
+            # Second get_finished: abort_ack timeout fires, fails the job
+            results = list(decoder.get_finished())
+            assert len(results) == 1
+            assert results[0].job_id == 99
+            assert results[0].success is False
+            assert 99 not in decoder._aborting_loads
+        finally:
+            decoder.close()
+
+    def test_peer_down_fails_aborting_load(self, monkeypatch):
+        """
+        If the Prefiller goes down while a load job is in _aborting_loads
+        (waiting for abort_ack), _on_peer_down immediately fails the job.
+        """
+        monkeypatch.setattr(_pd_mod, "_LOAD_TIMEOUT_S", 0.05)
+
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder   = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            decoder_job_id = 33
+            decoder.set_load_peer(decoder_job_id, prefiller._peer_id)
+            decoder.submit_load(
+                JobMetadata(job_id=decoder_job_id, keys=[make_key(0)],
+                            spec=CPULoadStoreSpec(block_ids=[0]))
+            )
+
+            # Wait for connection to be established
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                with decoder._lock:
+                    connected = prefiller._peer_id in decoder._connections
+                if connected:
+                    break
+                time.sleep(0.02)
+
+            # Let the load job timeout expire; move it to _aborting_loads
+            time.sleep(0.1)
+            decoder.get_finished()
+            assert decoder_job_id in decoder._aborting_loads
+
+            # Now prefiller drops off
+            prefiller.close()
+
+            # _on_peer_down should fire on decoder and fail the aborting job
+            deadline = time.time() + 5.0
+            results: list = []
+            while time.time() < deadline:
+                results = list(decoder.get_finished())
+                if results:
+                    break
+                time.sleep(0.1)
+
+            assert len(results) == 1
+            assert results[0].job_id == decoder_job_id
+            assert results[0].success is False
+            assert decoder_job_id not in decoder._aborting_loads
+        finally:
+            decoder.close()
