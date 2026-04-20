@@ -63,12 +63,20 @@ class _StoreJob:
 class _PendingBlock:
     peer_id: str
     remote_block_idx: int
+    decoder_job_id: JobId
 
 
 @dataclass
 class _LoadJob:
     job_id: JobId
     peer_id: str
+
+
+@dataclass
+class _FetchJob:
+    decoder_peer_id: str
+    decoder_job_id: JobId
+    remaining: int          # blocks not yet confirmed DONE by NIXL
 
 
 class PDConnector(SecondaryTierManager):
@@ -116,12 +124,20 @@ class PDConnector(SecondaryTierManager):
         self._block_to_job: dict[bytes, list[tuple[JobId, int]]] = {}
         self._inflight_xfers: dict[object, dict[JobId, int]] = {}
         self._inflight_xfer_peer: dict[object, str] = {}
+        # Prefiller side: per-handle block counts attributed to fetch jobs
+        self._inflight_fetch_counts: dict[
+            object, dict[tuple[str, JobId], int]
+        ] = {}
         self._finished_jobs: list[JobResult] = []
 
         # Load job tracking (Step 7)
         self._load_jobs: dict[JobId, _LoadJob] = {}
         # Temporary until peer_id is added to JobMetadata
         self._request_to_peer: dict[JobId, str] = {}
+
+        # Prefiller side: tracks remaining-block count per lookup_fetch job
+        # keyed by (decoder_peer_id, decoder_job_id)
+        self._fetch_jobs: dict[tuple[str, JobId], _FetchJob] = {}
 
         self._zmq_ctx = zmq.Context()
 
@@ -291,18 +307,24 @@ class PDConnector(SecondaryTierManager):
         elif msg_type == "lookup_fetch":
             # Prefiller side: Decoder is requesting blocks.
             decoder_peer_id = msg["peer_id"]
+            decoder_job_id: JobId = msg["job_id"]
             block_hashes = msg["block_hashes"]
             block_indexes = msg["block_indexes"]
+            n_blocks = len(block_hashes)
 
             ready: list[tuple[int, int]] = []
             job_counts: dict[JobId, int] = {}
             remote_dlist = None
+            fkey = (decoder_peer_id, decoder_job_id)
 
-            # Atomically match blocks against _block_to_job / _pending_blocks
-            # and snapshot the remote dlist ref.  submit_store (Thread 1) also
-            # touches these dicts, so the entire check-and-update must be under
-            # _lock to prevent silent missed transfers.
+            # Atomically match blocks against _block_to_job / _pending_blocks,
+            # register the fetch job, and snapshot the remote dlist ref.
             with self._lock:
+                self._fetch_jobs[fkey] = _FetchJob(
+                    decoder_peer_id=decoder_peer_id,
+                    decoder_job_id=decoder_job_id,
+                    remaining=n_blocks,
+                )
                 for block_hash, remote_idx in zip(block_hashes, block_indexes):
                     bh = bytes(block_hash) if not isinstance(block_hash, bytes) else block_hash
                     entries = self._block_to_job.get(bh)
@@ -316,6 +338,7 @@ class PDConnector(SecondaryTierManager):
                         self._pending_blocks[bh] = _PendingBlock(
                             peer_id=decoder_peer_id,
                             remote_block_idx=remote_idx,
+                            decoder_job_id=decoder_job_id,
                         )
                 remote_dlist = self._remote_dlists.get(decoder_peer_id)
 
@@ -333,6 +356,18 @@ class PDConnector(SecondaryTierManager):
                 with self._lock:
                     self._inflight_xfers[handle] = job_counts
                     self._inflight_xfer_peer[handle] = decoder_peer_id
+                    self._inflight_fetch_counts[handle] = {fkey: len(ready)}
+
+        elif msg_type == "transfer_done":
+            # Decoder side: Prefiller confirms all blocks for a load job arrived.
+            job_id: JobId = msg["job_id"]
+            success: bool = msg.get("success", True)
+            with self._lock:
+                load_job = self._load_jobs.pop(job_id, None)
+                if load_job is not None:
+                    self._finished_jobs.append(
+                        JobResult(job_id=job_id, success=success)
+                    )
 
         else:
             logger.warning(
@@ -465,6 +500,19 @@ class PDConnector(SecondaryTierManager):
             for h in dead_handles:
                 self._inflight_xfers.pop(h, None)
                 self._inflight_xfer_peer.pop(h, None)
+                self._inflight_fetch_counts.pop(h, None)
+            # Prefiller side: discard fetch jobs for the dead decoder.
+            dead_fkeys = [k for k in self._fetch_jobs if k[0] == peer_id]
+            for k in dead_fkeys:
+                del self._fetch_jobs[k]
+            # Decoder side: fail any load jobs waiting on the dead prefiller.
+            dead_load_ids = [
+                jid for jid, lj in self._load_jobs.items()
+                if lj.peer_id == peer_id
+            ]
+            for jid in dead_load_ids:
+                del self._load_jobs[jid]
+                self._finished_jobs.append(JobResult(job_id=jid, success=False))
 
         logger.warning("PDConnector %s: peer %s is down", self._peer_id, peer_id)
 
@@ -618,6 +666,8 @@ class PDConnector(SecondaryTierManager):
         job = _StoreJob(job_id=job_id, remaining=len(keys))
         ready: dict[str, list[tuple[int, int]]] = {}
         remote_dlists: dict[str, object] = {}
+        # fetch_groups[peer_id] maps (decoder_peer_id, decoder_job_id) → count
+        fetch_groups: dict[str, dict[tuple[str, JobId], int]] = {}
 
         # Atomically scan _pending_blocks / _block_to_job and snapshot any
         # remote dlist refs needed for the NIXL calls below.  Both this method
@@ -631,6 +681,9 @@ class PDConnector(SecondaryTierManager):
                 if pending is not None:
                     batch = ready.setdefault(pending.peer_id, [])
                     batch.append((int(block_idx), pending.remote_block_idx))
+                    fkey = (pending.peer_id, pending.decoder_job_id)
+                    peer_group = fetch_groups.setdefault(pending.peer_id, {})
+                    peer_group[fkey] = peer_group.get(fkey, 0) + 1
                 else:
                     self._block_to_job.setdefault(block_hash, []).append(
                         (job_id, int(block_idx))
@@ -659,6 +712,8 @@ class PDConnector(SecondaryTierManager):
             with self._lock:
                 self._inflight_xfers[handle] = {job_id: len(pairs)}
                 self._inflight_xfer_peer[handle] = peer_id
+                if peer_id in fetch_groups:
+                    self._inflight_fetch_counts[handle] = fetch_groups[peer_id]
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
         job_id = job_metadata.job_id
@@ -703,15 +758,44 @@ class PDConnector(SecondaryTierManager):
         # have already removed a handle (and called release_xfer_handle on it);
         # pop(None) detects that and skips the duplicate release.
         mine: dict[object, dict[JobId, int]] = {}
+        # Fetch jobs whose remaining count just reached zero: (peer_id, job_id)
+        to_notify: list[tuple[str, JobId]] = []
         with self._lock:
             for handle in done:
                 job_counts = self._inflight_xfers.pop(handle, None)
+                fetch_counts = self._inflight_fetch_counts.pop(handle, None)
                 self._inflight_xfer_peer.pop(handle, None)
                 if job_counts is not None:
                     mine[handle] = job_counts
+                if fetch_counts is not None:
+                    for fkey, count in fetch_counts.items():
+                        fj = self._fetch_jobs.get(fkey)
+                        if fj is not None:
+                            fj.remaining -= count
+                            if fj.remaining <= 0:
+                                del self._fetch_jobs[fkey]
+                                to_notify.append(
+                                    (fj.decoder_peer_id, fj.decoder_job_id)
+                                )
 
         for handle in mine:
             self._agent.release_xfer_handle(handle)
+
+        # Send transfer_done outside the lock (_send acquires _lock internally).
+        for peer_id, job_id in to_notify:
+            try:
+                self._send(peer_id, {
+                    "type": "transfer_done",
+                    "job_id": job_id,
+                    "success": True,
+                })
+            except Exception:
+                logger.warning(
+                    "PDConnector %s: failed to send transfer_done to %s job %d",
+                    self._peer_id,
+                    peer_id,
+                    job_id,
+                )
 
         with self._lock:
             for job_counts in mine.values():

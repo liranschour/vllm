@@ -28,6 +28,7 @@ from vllm.v1.kv_offload.abstract import (
 from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 from vllm.v1.kv_offload.secondary_tiers.pd_connector import (
     PDConnector,
+    _FetchJob,
     _PendingBlock,
     _StoreJob,
 )
@@ -436,13 +437,13 @@ class TestSubmitLoadAndLookupFetch:
             h1 = get_offload_block_hash(keys[1])
             h2 = get_offload_block_hash(keys[2])
             prefiller._pending_blocks[h0] = _PendingBlock(
-                peer_id="127.0.0.1:9999", remote_block_idx=3
+                peer_id="127.0.0.1:9999", remote_block_idx=3, decoder_job_id=0
             )
             prefiller._pending_blocks[h1] = _PendingBlock(
-                peer_id="127.0.0.1:9999", remote_block_idx=5
+                peer_id="127.0.0.1:9999", remote_block_idx=5, decoder_job_id=0
             )
             prefiller._pending_blocks[h2] = _PendingBlock(
-                peer_id="127.0.0.1:9999", remote_block_idx=7
+                peer_id="127.0.0.1:9999", remote_block_idx=7, decoder_job_id=0
             )
 
             # Mock NIXL transport and remote dlist.
@@ -821,6 +822,7 @@ class TestRaceConditions:
                             prefiller._pending_blocks[bh] = _PendingBlock(
                                 peer_id=decoder_peer,
                                 remote_block_idx=i % 16,
+                                decoder_job_id=i,
                             )
                             prefiller._remote_dlists[decoder_peer] = MagicMock()
                         spec = CPULoadStoreSpec(block_ids=[i % 16])
@@ -848,3 +850,329 @@ class TestRaceConditions:
             assert not errors, f"Unexpected exceptions: {errors}"
         finally:
             prefiller.close()
+
+
+# ---------------------------------------------------------------------------
+# Step 9: Load job completion tests
+# ---------------------------------------------------------------------------
+
+class TestLoadJobCompletion:
+    """
+    Verify the full transfer_done notification path:
+    Prefiller detects NIXL completion → sends transfer_done → Decoder's
+    get_finished() returns JobResult for the load job.
+    """
+
+    def _make_prefiller_with_mocked_nixl(self) -> PDConnector:
+        """Return a PDConnector with a mocked NIXL agent."""
+        p = free_port()
+        c = PDConnector("127.0.0.1", p)
+        c.set_primary_view(make_primary_view())
+        counter = itertools.count(1)
+        c._agent.make_prepped_xfer = MagicMock(
+            side_effect=lambda *a, **kw: next(counter)
+        )
+        c._agent.transfer = MagicMock()
+        c._agent.check_xfer_state = MagicMock(return_value="DONE")
+        c._agent.release_xfer_handle = MagicMock()
+        return c
+
+    def test_transfer_done_sent_when_all_blocks_ready(self):
+        """
+        All N blocks are in _block_to_job at lookup_fetch time.
+        After NIXL reports DONE, get_finished() sends transfer_done.
+        """
+        N = 4
+        p = free_port()
+        prefiller = PDConnector("127.0.0.1", p)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+
+            decoder_peer = "127.0.0.1:9999"
+            prefiller._agent.make_prepped_xfer = MagicMock(return_value=1)
+            prefiller._agent.transfer = MagicMock()
+            prefiller._agent.check_xfer_state = MagicMock(return_value="DONE")
+            prefiller._agent.release_xfer_handle = MagicMock()
+            prefiller._remote_dlists[decoder_peer] = MagicMock()
+
+            keys = [make_key(i) for i in range(N)]
+            # Pre-populate _block_to_job (simulating a prior submit_store).
+            for i, key in enumerate(keys):
+                bh = get_offload_block_hash(key)
+                prefiller._block_to_job[bh] = [(100 + i, i)]
+                prefiller._store_jobs[100 + i] = _StoreJob(job_id=100 + i, remaining=1)
+
+            sent_msgs: list[dict] = []
+            orig_send = prefiller._send
+
+            def capturing_send(pid: str, msg: dict) -> None:
+                sent_msgs.append(msg)
+                orig_send(pid, msg)
+
+            prefiller._send = capturing_send  # type: ignore[method-assign]
+            # Open a channel so _send doesn't raise (no real dealer needed for
+            # capture; intercept before the real call which would fail).
+            prefiller._dealers[decoder_peer] = MagicMock()
+            prefiller._dealers[decoder_peer].send = MagicMock()
+
+            decoder_job_id = 42
+            prefiller._handle_message(decoder_peer, {
+                "type": "lookup_fetch",
+                "peer_id": decoder_peer,
+                "job_id": decoder_job_id,
+                "block_hashes": [get_offload_block_hash(k) for k in keys],
+                "block_indexes": list(range(N)),
+            })
+
+            # All blocks matched → one NIXL handle in flight.
+            assert 1 in prefiller._inflight_xfers
+
+            # Trigger completion polling.
+            prefiller.get_finished()
+
+            # transfer_done must have been sent.
+            td_msgs = [m for m in sent_msgs if m.get("type") == "transfer_done"]
+            assert len(td_msgs) == 1, f"Expected 1 transfer_done, got {td_msgs}"
+            assert td_msgs[0]["job_id"] == decoder_job_id
+            assert td_msgs[0]["success"] is True
+        finally:
+            prefiller.close()
+
+    def test_transfer_done_sent_after_pending_blocks_matched(self):
+        """
+        All N blocks go to _pending_blocks; a subsequent submit_store matches
+        them.  transfer_done is sent only after those NIXL transfers complete.
+        """
+        N = 3
+        p = free_port()
+        prefiller = self._make_prefiller_with_mocked_nixl()
+        try:
+            decoder_peer = "127.0.0.1:9999"
+            prefiller._remote_dlists[decoder_peer] = MagicMock()
+            prefiller._dealers[decoder_peer] = MagicMock()
+            prefiller._dealers[decoder_peer].send = MagicMock()
+
+            keys = [make_key(i) for i in range(N)]
+            decoder_job_id = 7
+
+            # lookup_fetch arrives — no blocks stored yet.
+            prefiller._handle_message(decoder_peer, {
+                "type": "lookup_fetch",
+                "peer_id": decoder_peer,
+                "job_id": decoder_job_id,
+                "block_hashes": [get_offload_block_hash(k) for k in keys],
+                "block_indexes": list(range(N)),
+            })
+
+            # All blocks should be pending.
+            assert len(prefiller._pending_blocks) == N
+            # No inflight transfers yet.
+            assert not prefiller._inflight_xfers
+
+            sent_msgs: list[dict] = []
+            orig_send = prefiller._send
+
+            def capturing_send(pid: str, msg: dict) -> None:
+                sent_msgs.append(msg)
+                orig_send(pid, msg)
+
+            prefiller._send = capturing_send  # type: ignore[method-assign]
+
+            # submit_store matches all pending blocks.
+            spec = CPULoadStoreSpec(block_ids=list(range(N)))
+            prefiller.submit_store(JobMetadata(job_id=200, keys=keys, spec=spec))
+
+            # Now there should be inflight handles.
+            assert prefiller._inflight_xfers
+
+            # Before get_finished: no transfer_done yet.
+            td_before = [m for m in sent_msgs if m.get("type") == "transfer_done"]
+            assert not td_before
+
+            # Trigger completion.
+            prefiller.get_finished()
+
+            td_msgs = [m for m in sent_msgs if m.get("type") == "transfer_done"]
+            assert len(td_msgs) == 1
+            assert td_msgs[0]["job_id"] == decoder_job_id
+        finally:
+            prefiller.close()
+
+    def test_transfer_done_only_after_all_split_stores_complete(self):
+        """
+        k blocks are ready at lookup_fetch time; the remaining N-k arrive via
+        two separate submit_store calls.  transfer_done is sent only after all
+        three NIXL transfers complete.
+        """
+        p = free_port()
+        prefiller = self._make_prefiller_with_mocked_nixl()
+        try:
+            decoder_peer = "127.0.0.1:9999"
+            prefiller._remote_dlists[decoder_peer] = MagicMock()
+            prefiller._dealers[decoder_peer] = MagicMock()
+            prefiller._dealers[decoder_peer].send = MagicMock()
+
+            # 1 block ready, 2 blocks will be pending.
+            ready_key = make_key(0)
+            pending_keys = [make_key(1), make_key(2)]
+            all_keys = [ready_key] + pending_keys
+            decoder_job_id = 55
+
+            # Pre-populate one ready block.
+            bh0 = get_offload_block_hash(ready_key)
+            prefiller._block_to_job[bh0] = [(300, 0)]
+            prefiller._store_jobs[300] = _StoreJob(job_id=300, remaining=1)
+
+            prefiller._handle_message(decoder_peer, {
+                "type": "lookup_fetch",
+                "peer_id": decoder_peer,
+                "job_id": decoder_job_id,
+                "block_hashes": [get_offload_block_hash(k) for k in all_keys],
+                "block_indexes": [0, 1, 2],
+            })
+
+            sent_msgs: list[dict] = []
+            orig_send = prefiller._send
+
+            def capturing_send(pid: str, msg: dict) -> None:
+                sent_msgs.append(msg)
+                orig_send(pid, msg)
+
+            prefiller._send = capturing_send  # type: ignore[method-assign]
+
+            # First get_finished: completes the 1-block ready transfer.
+            prefiller.get_finished()
+            td = [m for m in sent_msgs if m.get("type") == "transfer_done"]
+            assert not td, "Should not send transfer_done with 2 blocks still pending"
+
+            # submit_store matches one of the two pending blocks.
+            prefiller.submit_store(
+                JobMetadata(job_id=301, keys=[pending_keys[0]],
+                            spec=CPULoadStoreSpec(block_ids=[1]))
+            )
+            prefiller.get_finished()
+            td = [m for m in sent_msgs if m.get("type") == "transfer_done"]
+            assert not td, "Should not send transfer_done with 1 block still pending"
+
+            # submit_store matches the last pending block.
+            prefiller.submit_store(
+                JobMetadata(job_id=302, keys=[pending_keys[1]],
+                            spec=CPULoadStoreSpec(block_ids=[2]))
+            )
+            prefiller.get_finished()
+            td = [m for m in sent_msgs if m.get("type") == "transfer_done"]
+            assert len(td) == 1, f"Expected 1 transfer_done, got {td}"
+            assert td[0]["job_id"] == decoder_job_id
+        finally:
+            prefiller.close()
+
+    def test_decoder_get_finished_returns_load_job_result(self):
+        """
+        End-to-end: Decoder submits a load job; Prefiller sends transfer_done
+        via the real ZMQ channel; Decoder's get_finished() returns a JobResult.
+        """
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            keys = [make_key(0), make_key(1)]
+            decoder_job_id = 99
+
+            # Decoder submits the load (this sends lookup_fetch to prefiller).
+            decoder.set_load_peer(decoder_job_id, prefiller._peer_id)
+            decoder.submit_load(
+                JobMetadata(job_id=decoder_job_id, keys=keys,
+                            spec=CPULoadStoreSpec(block_ids=[0, 1]))
+            )
+
+            # Wait for lookup_fetch to arrive and populate pending_blocks.
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                with prefiller._lock:
+                    n_pending = len(prefiller._pending_blocks)
+                if n_pending == len(keys):
+                    break
+                time.sleep(0.05)
+            assert n_pending == len(keys), "lookup_fetch did not arrive in time"
+
+            # Mock NIXL on prefiller so submit_store triggers a transfer.
+            prefiller._agent.make_prepped_xfer = MagicMock(return_value=77)
+            prefiller._agent.transfer = MagicMock()
+            prefiller._agent.check_xfer_state = MagicMock(return_value="DONE")
+            prefiller._agent.release_xfer_handle = MagicMock()
+
+            # submit_store matches all pending blocks and creates a handle.
+            prefiller.submit_store(
+                JobMetadata(job_id=400, keys=keys,
+                            spec=CPULoadStoreSpec(block_ids=[0, 1]))
+            )
+
+            # get_finished on prefiller: completes handle, sends transfer_done.
+            prefiller.get_finished()
+
+            # Allow transfer_done to travel over ZMQ to decoder.
+            deadline = time.time() + 3.0
+            results: list[JobResult] = []
+            while time.time() < deadline:
+                results = list(decoder.get_finished())
+                if results:
+                    break
+                time.sleep(0.05)
+
+            assert len(results) == 1, f"Expected 1 JobResult, got {results}"
+            assert results[0].job_id == decoder_job_id
+            assert results[0].success is True
+        finally:
+            decoder.close()
+            prefiller.close()
+
+    def test_peer_down_fails_decoder_load_job(self):
+        """
+        When the Prefiller goes down while a load job is in flight, the
+        Decoder's _on_peer_down fails the load job and get_finished() returns
+        JobResult(success=False).
+        """
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+            decoder.set_primary_view(make_primary_view())
+
+            decoder_job_id = 11
+            decoder.set_load_peer(decoder_job_id, prefiller._peer_id)
+            decoder.submit_load(
+                JobMetadata(job_id=decoder_job_id, keys=[make_key(0)],
+                            spec=CPULoadStoreSpec(block_ids=[0]))
+            )
+
+            # Wait until lookup_fetch arrives (decoder is connected).
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                with decoder._lock:
+                    connected = prefiller._peer_id in decoder._connections
+                if connected:
+                    break
+                time.sleep(0.05)
+
+            # Prefiller drops off the network.
+            prefiller.close()
+
+            # Decoder's _on_peer_down should fire (via disconnect message or
+            # heartbeat). Wait for it.
+            deadline = time.time() + 5.0
+            results: list[JobResult] = []
+            while time.time() < deadline:
+                results = list(decoder.get_finished())
+                if results:
+                    break
+                time.sleep(0.1)
+
+            assert len(results) == 1, f"Expected failure JobResult, got {results}"
+            assert results[0].job_id == decoder_job_id
+            assert results[0].success is False
+        finally:
+            decoder.close()

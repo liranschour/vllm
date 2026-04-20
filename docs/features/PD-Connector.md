@@ -679,3 +679,69 @@ To run:
 .venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
+### Step 9: Load Job Completion
+
+#### Problem
+
+After the Decoder calls `submit_load()`, it records a `_LoadJob` and sends a `lookup_fetch` control message to the Prefiller. The Prefiller initiates NIXL WRITE transfers. However, the Decoder has no way to learn when those transfers finish: `get_finished()` only polls `_inflight_xfers` (Prefiller-side NIXL handles) and never produces a `JobResult` for load jobs. As a result, `TieringOffloadingManager._process_finished_jobs()` never calls `primary_tier.complete_write()`, so promoted blocks are never made available for GPU use.
+
+#### Fix
+
+Once all NIXL blocks of a `lookup_fetch` job complete on the Prefiller, the Prefiller sends a `transfer_done` control message to the Decoder. The Decoder receives it and enqueues a `JobResult` into `_finished_jobs`, which `get_finished()` already drains.
+
+**New control message — Prefiller → Decoder:**
+```json
+{"type": "transfer_done", "job_id": <decoder_job_id>, "success": true}
+```
+
+**New dataclass `_FetchJob` (Prefiller side):**
+Tracks remaining NIXL blocks to transfer for one `lookup_fetch` job.
+```python
+@dataclass
+class _FetchJob:
+    decoder_peer_id: str
+    decoder_job_id: JobId
+    remaining: int          # blocks not yet confirmed DONE by NIXL
+```
+
+**`_PendingBlock` extended:**
+`decoder_job_id: JobId` added so `submit_store()` can attribute matched pending blocks to their originating fetch job.
+
+**New state in `__init__`:**
+- `_fetch_jobs: dict[tuple[str, JobId], _FetchJob]` — keyed by `(decoder_peer_id, decoder_job_id)`
+- `_inflight_fetch_counts: dict[object, dict[tuple[str, JobId], int]]` — per NIXL handle, how many blocks belong to each fetch job
+
+**`get_finished()` (Prefiller side):**
+When popping a completed NIXL handle, also pop its `_inflight_fetch_counts` entry; decrement each `_FetchJob.remaining`; when `remaining` reaches zero collect `(decoder_peer_id, decoder_job_id)` into a `to_notify` list (under lock). After releasing NIXL handles (outside lock), send `transfer_done` for each entry in `to_notify`.
+
+**`_handle_message("transfer_done")` (Decoder side, new handler):**
+Pops `_load_jobs[job_id]`; appends `JobResult(job_id, success)` to `_finished_jobs` under `_lock`.
+
+**`_on_peer_down()` cleanup:**
+Removes `_fetch_jobs` and `_inflight_fetch_counts` entries for the dead peer; fails all dangling `_load_jobs` with `JobResult(success=False)` so the TieringManager gets a failure result.
+
+#### Tasks
+
+- [x] Add `_FetchJob` dataclass
+- [x] Add `decoder_job_id: JobId` field to `_PendingBlock`
+- [x] Add `_fetch_jobs` and `_inflight_fetch_counts` to `__init__`
+- [x] `_handle_message("lookup_fetch")`: extract `decoder_job_id`, create `_FetchJob`, update `_PendingBlock` construction, populate `_inflight_fetch_counts` for ready transfers
+- [x] `submit_store()`: accumulate `fetch_groups` during scan, populate `_inflight_fetch_counts` per handle
+- [x] `get_finished()`: pop `_inflight_fetch_counts`, decrement `_fetch_jobs.remaining`, collect `to_notify`, send `transfer_done` outside lock
+- [x] `_handle_message("transfer_done")`: Decoder handler — pop `_load_jobs`, append to `_finished_jobs`
+- [x] `_on_peer_down()`: clean up `_fetch_jobs`, `_inflight_fetch_counts`, and fail dangling `_load_jobs`
+- [x] `TestLoadJobCompletion::test_transfer_done_sent_when_all_blocks_ready`
+- [x] `TestLoadJobCompletion::test_transfer_done_sent_after_pending_blocks_matched`
+- [x] `TestLoadJobCompletion::test_transfer_done_only_after_all_split_stores_complete`
+- [x] `TestLoadJobCompletion::test_decoder_get_finished_returns_load_job_result`
+- [x] `TestLoadJobCompletion::test_peer_down_fails_decoder_load_job`
+
+#### Tests
+
+Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
+
+To run:
+```bash
+.venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
+```
+
