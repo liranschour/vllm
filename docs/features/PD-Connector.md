@@ -745,3 +745,66 @@ To run:
 .venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
+### Step 10: End-to-End Data Integrity Test
+
+#### Motivation
+
+All prior tests either mock NIXL (`make_prepped_xfer` / `transfer` / `check_xfer_state`) or test control-channel plumbing only. No test has verified that bytes written by the Prefiller actually appear in the Decoder's memory after the full pipeline completes. Step 10 adds two real NIXL integration tests that exercise the entire path — ZMQ handshake, NIXL WRITE, `transfer_done` notification — and assert byte-level correctness.
+
+#### Memory Layout
+
+Each connector is initialised with a real numpy array as its primary view:
+
+```python
+NUM_TOTAL   = 8    # total blocks per connector
+NUM_XFER    = 6    # blocks actually transferred
+BLOCK_BYTES = 64   # bytes per block
+
+# Prefiller: unique fill per block
+prefiller_arr[i, :] = (i + 1) % 256   # block 0 → 0x01, block 1 → 0x02, …
+
+# Decoder: zero-initialised
+decoder_arr = np.zeros((NUM_TOTAL, BLOCK_BYTES), dtype=np.uint8)
+```
+
+`set_primary_view(memoryview(arr))` triggers real NIXL registration with UCX.
+
+#### Test 1: `test_split_stores_data_integrity`
+
+`submit_store` is called in three phases around `submit_load`, simulating async KV cache block arrival:
+
+| Phase | Who | Call | Job ID | Keys | Local block_ids |
+|-------|-----|------|--------|------|-----------------|
+| 1 | Prefiller | `submit_store` | 1 | key_0, key_1 | [0, 1] |
+| | Decoder | `submit_load` | 100 | key_0…key_5 | [0..5] |
+| — wait for `lookup_fetch`: key_2..key_5 pending — |
+| 2 | Prefiller | `submit_store` | 2 | key_2, key_3 | [2, 3] |
+| 3 | Prefiller | `submit_store` | 3 | key_4, key_5 | [4, 5] |
+
+- `lookup_fetch` matches key_0/key_1 immediately → NIXL handle A; key_2–key_5 → `_pending_blocks`
+- Phase 2 matches pending key_2/key_3 → NIXL handle B
+- Phase 3 matches pending key_4/key_5 → NIXL handle C
+- `_FetchJob.remaining` decremented by 2 per handle; hits 0 after C → `transfer_done` sent
+- Decoder's `get_finished()` returns `JobResult(100, True)`
+- Assert `decoder_arr[:6] == prefiller_arr[:6]`
+
+#### Test 2: `test_all_blocks_stored_before_load_data_integrity`
+
+Simpler baseline: all 6 blocks stored before `submit_load`. `lookup_fetch` matches all 6 → single NIXL handle → `transfer_done` → same data integrity assertion.
+
+#### Tasks
+
+- [x] Add `import numpy as np` to test imports
+- [x] Add `_make_real_bufs(num_total, block_bytes)` helper
+- [x] `TestEndToEndDataIntegrity::test_split_stores_data_integrity`
+- [x] `TestEndToEndDataIntegrity::test_all_blocks_stored_before_load_data_integrity`
+
+#### Tests
+
+Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
+
+To run:
+```bash
+.venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
+```
+

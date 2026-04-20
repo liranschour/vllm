@@ -17,6 +17,7 @@ import threading
 import time
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -56,6 +57,17 @@ def make_key(i: int) -> OffloadKey:
 def make_primary_view() -> memoryview:
     tensor = torch.zeros((16, 8), dtype=torch.float32)
     return memoryview(tensor.numpy())
+
+
+def _make_real_bufs(
+    num_total: int, block_bytes: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (prefiller_arr, decoder_arr) with unique per-block fill pattern."""
+    p = np.empty((num_total, block_bytes), dtype=np.uint8)
+    for i in range(num_total):
+        p[i, :] = (i + 1) % 256
+    d = np.zeros((num_total, block_bytes), dtype=np.uint8)
+    return p, d
 
 
 class _MinimalPrimary(CPUPrimaryTierOffloadingManager):
@@ -1176,3 +1188,183 @@ class TestLoadJobCompletion:
             assert results[0].success is False
         finally:
             decoder.close()
+
+
+# ---------------------------------------------------------------------------
+# Step 10: End-to-end data integrity tests (real NIXL, no mocks)
+# ---------------------------------------------------------------------------
+
+class TestEndToEndDataIntegrity:
+    """
+    Real NIXL WRITE transfers — no mocking of make_prepped_xfer / transfer /
+    check_xfer_state.  Verifies that bytes written by the Prefiller actually
+    appear in the Decoder's memory buffer after get_finished() completes.
+    """
+
+    _NUM_TOTAL  = 8    # total blocks allocated per connector
+    _NUM_XFER   = 6    # blocks actually transferred
+    _BLOCK_BYTES = 64  # bytes per block
+
+    def test_split_stores_data_integrity(self):
+        """
+        submit_store is called in 3 phases around submit_load:
+          Phase 1 (2 blocks) before submit_load
+          Phase 2 (2 blocks) after lookup_fetch arrives (blocks pending)
+          Phase 3 (2 blocks) after lookup_fetch arrives (blocks pending)
+
+        All 6 transferred blocks must contain the exact bytes from
+        Prefiller's memory.
+        """
+        N = self._NUM_XFER
+        prefiller_arr, decoder_arr = _make_real_bufs(
+            self._NUM_TOTAL, self._BLOCK_BYTES
+        )
+
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder   = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(memoryview(prefiller_arr))
+            decoder.set_primary_view(memoryview(decoder_arr))
+
+            keys = [make_key(i) for i in range(N)]
+
+            # Phase 1: store blocks 0-1 before submit_load
+            prefiller.submit_store(
+                JobMetadata(
+                    job_id=1, keys=keys[0:2],
+                    spec=CPULoadStoreSpec(block_ids=[0, 1]),
+                )
+            )
+
+            # Decoder requests all 6 blocks
+            decoder.set_load_peer(100, prefiller._peer_id)
+            decoder.submit_load(
+                JobMetadata(
+                    job_id=100, keys=keys,
+                    spec=CPULoadStoreSpec(block_ids=list(range(N))),
+                )
+            )
+
+            # Wait for lookup_fetch: blocks 0-1 matched, blocks 2-5 pending
+            deadline = time.time() + 5.0
+            n_pending = 0
+            while time.time() < deadline:
+                with prefiller._lock:
+                    n_pending = len(prefiller._pending_blocks)
+                if n_pending == 4:
+                    break
+                time.sleep(0.05)
+            assert n_pending == 4, (
+                f"lookup_fetch did not produce 4 pending blocks; got {n_pending}"
+            )
+
+            # Phase 2: blocks 2-3 match pending
+            prefiller.submit_store(
+                JobMetadata(
+                    job_id=2, keys=keys[2:4],
+                    spec=CPULoadStoreSpec(block_ids=[2, 3]),
+                )
+            )
+
+            # Phase 3: blocks 4-5 match remaining pending
+            prefiller.submit_store(
+                JobMetadata(
+                    job_id=3, keys=keys[4:6],
+                    spec=CPULoadStoreSpec(block_ids=[4, 5]),
+                )
+            )
+
+            # Poll until decoder's load job completes
+            deadline = time.time() + 15.0
+            load_results: list = []
+            store_results: list = []
+            while time.time() < deadline:
+                store_results += list(prefiller.get_finished())
+                load_results = list(decoder.get_finished())
+                if load_results:
+                    break
+                time.sleep(0.05)
+
+            assert len(load_results) == 1, (
+                f"Expected 1 load result, got {load_results}"
+            )
+            assert load_results[0].job_id == 100
+            assert load_results[0].success is True
+
+            store_job_ids = {r.job_id for r in store_results}
+            assert store_job_ids == {1, 2, 3}, (
+                f"Expected store job IDs {{1,2,3}}, got {store_job_ids}"
+            )
+            assert all(r.success for r in store_results)
+
+            # Data integrity: decoder memory must match prefiller memory
+            np.testing.assert_array_equal(
+                decoder_arr[:N], prefiller_arr[:N],
+                err_msg="Decoder memory does not match Prefiller after NIXL transfer",
+            )
+        finally:
+            decoder.close()
+            prefiller.close()
+
+    def test_all_blocks_stored_before_load_data_integrity(self):
+        """
+        Baseline: all 6 blocks are in Prefiller before submit_load.
+        lookup_fetch matches all 6 → single NIXL handle.
+        Verify data integrity after transfer completes.
+        """
+        N = self._NUM_XFER
+        prefiller_arr, decoder_arr = _make_real_bufs(
+            self._NUM_TOTAL, self._BLOCK_BYTES
+        )
+
+        pp, pd = free_port(), free_port()
+        prefiller = PDConnector("127.0.0.1", pp)
+        decoder   = PDConnector("127.0.0.1", pd)
+        try:
+            prefiller.set_primary_view(memoryview(prefiller_arr))
+            decoder.set_primary_view(memoryview(decoder_arr))
+
+            keys = [make_key(i) for i in range(N)]
+
+            # Store all 6 blocks before the Decoder loads
+            prefiller.submit_store(
+                JobMetadata(
+                    job_id=1, keys=keys,
+                    spec=CPULoadStoreSpec(block_ids=list(range(N))),
+                )
+            )
+
+            # Decoder loads all 6 blocks
+            decoder.set_load_peer(100, prefiller._peer_id)
+            decoder.submit_load(
+                JobMetadata(
+                    job_id=100, keys=keys,
+                    spec=CPULoadStoreSpec(block_ids=list(range(N))),
+                )
+            )
+
+            # Poll until load job completes
+            deadline = time.time() + 15.0
+            load_results: list = []
+            while time.time() < deadline:
+                prefiller.get_finished()
+                load_results = list(decoder.get_finished())
+                if load_results:
+                    break
+                time.sleep(0.05)
+
+            assert len(load_results) == 1, (
+                f"Expected 1 load result, got {load_results}"
+            )
+            assert load_results[0].job_id == 100
+            assert load_results[0].success is True
+
+            # Data integrity check
+            np.testing.assert_array_equal(
+                decoder_arr[:N], prefiller_arr[:N],
+                err_msg="Decoder memory does not match Prefiller after NIXL transfer",
+            )
+        finally:
+            decoder.close()
+            prefiller.close()
