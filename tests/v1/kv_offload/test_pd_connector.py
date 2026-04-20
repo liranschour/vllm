@@ -2,13 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Unit tests for PDConnector.
-
-Step 1: skeleton — tier name, primary view, TieringOffloadingManager wiring,
-        unimplemented method stubs.
-Step 2: ZMQ control channel — bidirectional messaging, clean-disconnect
-        notification via _on_peer_down.
-Step 6: submit_store() job tracking and get_finished().
-Step 7: submit_load(), lookup_fetch handling, pending_blocks matching.
 """
 
 import itertools
@@ -80,7 +73,7 @@ class _MinimalPrimary(CPUPrimaryTierOffloadingManager):
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Skeleton tests
+# Skeleton tests
 # ---------------------------------------------------------------------------
 
 class TestPDConnectorSkeleton:
@@ -141,7 +134,7 @@ class TestPDConnectorSkeleton:
 
 
 # ---------------------------------------------------------------------------
-# Step 2: ZMQ control channel tests
+# ZMQ control channel tests
 # ---------------------------------------------------------------------------
 
 class _CapturingConnector(PDConnector):
@@ -276,7 +269,7 @@ class TestZMQControlChannel:
 
 
 # ---------------------------------------------------------------------------
-# Step 6: submit_store() and get_finished() tests
+# submit_store() and get_finished() tests
 # ---------------------------------------------------------------------------
 
 class TestSubmitStoreJobTracking:
@@ -345,7 +338,7 @@ class TestSubmitStoreJobTracking:
 
 
 # ---------------------------------------------------------------------------
-# Step 7: submit_load() and lookup_fetch tests
+# submit_load() and lookup_fetch tests
 # ---------------------------------------------------------------------------
 
 class TestSubmitLoadAndLookupFetch:
@@ -481,7 +474,7 @@ class TestSubmitLoadAndLookupFetch:
 
 
 # ---------------------------------------------------------------------------
-# Step 4: NIXL registration tests
+# NIXL registration tests
 # ---------------------------------------------------------------------------
 
 pytest.importorskip("nixl._api", reason="NIXL not installed")
@@ -525,7 +518,7 @@ class TestNIXLRegistration:
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Connection establishment tests
+# Connection establishment tests
 # ---------------------------------------------------------------------------
 
 
@@ -637,7 +630,7 @@ class TestConnectionEstablishment:
 
 
 # ---------------------------------------------------------------------------
-# Step 8: Race-condition tests
+# Race-condition tests
 # ---------------------------------------------------------------------------
 
 class TestRaceConditions:
@@ -866,7 +859,7 @@ class TestRaceConditions:
 
 
 # ---------------------------------------------------------------------------
-# Step 9: Load job completion tests
+# Load job completion tests
 # ---------------------------------------------------------------------------
 
 class TestLoadJobCompletion:
@@ -1192,7 +1185,7 @@ class TestLoadJobCompletion:
 
 
 # ---------------------------------------------------------------------------
-# Step 10: End-to-end data integrity tests (real NIXL, no mocks)
+# End-to-end data integrity tests (real NIXL, no mocks)
 # ---------------------------------------------------------------------------
 
 class TestEndToEndDataIntegrity:
@@ -1372,7 +1365,7 @@ class TestEndToEndDataIntegrity:
 
 
 # ---------------------------------------------------------------------------
-# Step 11: Error handling — store and load job timeouts
+# Error handling — store and load job timeouts
 # ---------------------------------------------------------------------------
 
 class TestErrorHandling:

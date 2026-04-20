@@ -125,7 +125,7 @@ class PDConnector(SecondaryTierManager):
         self._remote_dlists: dict[str, object] = {}
         self._peer_nixl_names: dict[str, str] = {}
 
-        # Store job tracking (Step 6)
+        # Store job tracking
         self._store_jobs: dict[JobId, _StoreJob] = {}
         self._pending_blocks: dict[bytes, _PendingBlock] = {}
         self._block_to_job: dict[bytes, list[tuple[JobId, int]]] = {}
@@ -137,11 +137,11 @@ class PDConnector(SecondaryTierManager):
         ] = {}
         self._finished_jobs: list[JobResult] = []
 
-        # Load job tracking (Step 7)
+        # Load job tracking
         self._load_jobs: dict[JobId, _LoadJob] = {}
         # Temporary until peer_id is added to JobMetadata
         self._request_to_peer: dict[JobId, str] = {}
-        # Decoder side: load jobs awaiting abort_ack (Step 11)
+        # Decoder side: load jobs awaiting abort_ack
         # value = (peer_id, abort_sent_at monotonic)
         self._aborting_loads: dict[JobId, tuple[str, float]] = {}
 
