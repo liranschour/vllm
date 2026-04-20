@@ -621,3 +621,61 @@ To run:
 .venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
 ```
 
+### Step 8: Fix Races Between Thread 1 and Thread 2
+
+**Thread 1** (TieringManager thread) calls `submit_store`, `submit_load`, `get_finished`.
+**Thread 2** (listener thread) calls `_listener_loop` → `_handle_message` → `lookup_fetch`/`connect` handlers.
+
+#### Races
+
+| Shared field | Thread 1 access | Thread 2 access | Race |
+|---|---|---|---|
+| `_block_to_job` | `submit_store`: write | `lookup_fetch` handler: read + pop | TOCTOU |
+| `_pending_blocks` | `submit_store`: pop | `lookup_fetch` handler: write | TOCTOU |
+| `_inflight_xfers` | `submit_store`: write; `get_finished`: iterate + pop | `lookup_fetch` handler: write | lost handles / iterator invalidation |
+| `_remote_dlists` | `submit_store`: read (no lock) | `connect` handler: write (under `_lock`); `_on_peer_down`: pop (under `_lock`) | `KeyError` if peer goes down mid-transfer |
+
+The most dangerous race is between `submit_store` and `_handle_message("lookup_fetch")` on `_block_to_job`/`_pending_blocks`: if both threads simultaneously decide the block "isn't in the other's map" before the other's write lands, neither match fires — the block is stranded with no transfer ever initiated (silent missed transfer).
+
+#### Fix: extend `_lock` + collect-then-execute
+
+Extend the existing `_lock` to cover all job-tracking state. Adopt the **collect under lock → execute NIXL outside lock** pattern so the listener thread is not blocked while NIXL calls are in flight.
+
+**`submit_store()`**:
+- Acquire `_lock` while scanning `_pending_blocks`, updating `_block_to_job`, writing `_store_jobs`, and snapshotting `_remote_dlists` references
+- Release `_lock` before NIXL calls (`make_prepped_xfer`, `transfer`)
+- Re-acquire `_lock` to write `_inflight_xfers`
+
+**`get_finished()`**:
+- Acquire `_lock` to snapshot `list(_inflight_xfers)` keys
+- Release `_lock` for NIXL polling (`check_xfer_state`, `release_xfer_handle`)
+- Re-acquire `_lock` to pop from `_inflight_xfers`, update `_store_jobs`, drain and return `_finished_jobs`
+- Use `.pop(handle, None)` guard instead of `[handle]` in case `_on_peer_down` races with completion
+
+**`_handle_message("lookup_fetch")`**:
+- Acquire `_lock` while reading/updating `_block_to_job`, `_pending_blocks`, and snapshotting `_remote_dlists`
+- Release `_lock` before NIXL calls
+- Re-acquire `_lock` to write `_inflight_xfers`
+
+**`_on_peer_down()`**:
+- Already holds `_lock` for ZMQ teardown — extend to also clear any `_inflight_xfers` entries associated with the downed peer, releasing their handles so `get_finished()` does not poll dead handles
+
+#### Tasks
+
+- [x] `submit_store()`: wrap state-scan phase under `_lock`; snapshot `_remote_dlists`; NIXL outside lock; write `_inflight_xfers` under `_lock`
+- [x] `get_finished()`: snapshot handles under `_lock`; poll NIXL outside; update `_inflight_xfers`/`_store_jobs`/`_finished_jobs` and drain result under `_lock`
+- [x] `_handle_message("lookup_fetch")`: wrap state reads/writes under `_lock`; snapshot `_remote_dlists`; NIXL outside; write `_inflight_xfers` under `_lock`
+- [x] `_on_peer_down()`: extend to cancel and remove any `_inflight_xfers` entries associated with the downed peer
+- [x] `TestRaceConditions::test_concurrent_submit_store_and_lookup_fetch`: two threads issue `submit_store` and `_handle_message("lookup_fetch")` on the same block hash 1 000 times via mock NIXL; assert no missed transfers (no block stranded in both maps simultaneously)
+- [x] `TestRaceConditions::test_get_finished_concurrent_with_lookup_fetch`: `get_finished` and `_handle_message("lookup_fetch")` run concurrently; assert no `KeyError` and all handles processed exactly once
+- [x] `TestRaceConditions::test_peer_down_during_submit_store`: `_on_peer_down` fires while `submit_store` is reading `_remote_dlists`; assert no `KeyError`
+
+#### Tests
+
+Tests are located in `tests/v1/kv_offload/test_pd_connector.py`.
+
+To run:
+```bash
+.venv/bin/python -m pytest tests/v1/kv_offload/test_pd_connector.py -v --noconftest
+```
+

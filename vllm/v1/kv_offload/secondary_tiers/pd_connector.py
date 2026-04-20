@@ -115,6 +115,7 @@ class PDConnector(SecondaryTierManager):
         self._pending_blocks: dict[bytes, _PendingBlock] = {}
         self._block_to_job: dict[bytes, list[tuple[JobId, int]]] = {}
         self._inflight_xfers: dict[object, dict[JobId, int]] = {}
+        self._inflight_xfer_peer: dict[object, str] = {}
         self._finished_jobs: list[JobResult] = []
 
         # Load job tracking (Step 7)
@@ -295,33 +296,43 @@ class PDConnector(SecondaryTierManager):
 
             ready: list[tuple[int, int]] = []
             job_counts: dict[JobId, int] = {}
-            for block_hash, remote_idx in zip(block_hashes, block_indexes):
-                bh = bytes(block_hash) if not isinstance(block_hash, bytes) else block_hash
-                entries = self._block_to_job.get(bh)
-                if entries:
-                    store_job_id, local_idx = entries.pop(0)
-                    if not entries:
-                        del self._block_to_job[bh]
-                    ready.append((local_idx, remote_idx))
-                    job_counts[store_job_id] = job_counts.get(store_job_id, 0) + 1
-                else:
-                    self._pending_blocks[bh] = _PendingBlock(
-                        peer_id=decoder_peer_id,
-                        remote_block_idx=remote_idx,
-                    )
+            remote_dlist = None
 
-            if ready:
+            # Atomically match blocks against _block_to_job / _pending_blocks
+            # and snapshot the remote dlist ref.  submit_store (Thread 1) also
+            # touches these dicts, so the entire check-and-update must be under
+            # _lock to prevent silent missed transfers.
+            with self._lock:
+                for block_hash, remote_idx in zip(block_hashes, block_indexes):
+                    bh = bytes(block_hash) if not isinstance(block_hash, bytes) else block_hash
+                    entries = self._block_to_job.get(bh)
+                    if entries:
+                        store_job_id, local_idx = entries.pop(0)
+                        if not entries:
+                            del self._block_to_job[bh]
+                        ready.append((local_idx, remote_idx))
+                        job_counts[store_job_id] = job_counts.get(store_job_id, 0) + 1
+                    else:
+                        self._pending_blocks[bh] = _PendingBlock(
+                            peer_id=decoder_peer_id,
+                            remote_block_idx=remote_idx,
+                        )
+                remote_dlist = self._remote_dlists.get(decoder_peer_id)
+
+            if ready and remote_dlist is not None:
                 local_idxs = [p[0] for p in ready]
                 remote_idxs = [p[1] for p in ready]
                 handle = self._agent.make_prepped_xfer(
                     "WRITE",
                     self._local_dlist,
                     local_idxs,
-                    self._remote_dlists[decoder_peer_id],
+                    remote_dlist,
                     remote_idxs,
                 )
                 self._agent.transfer(handle)
-                self._inflight_xfers[handle] = job_counts
+                with self._lock:
+                    self._inflight_xfers[handle] = job_counts
+                    self._inflight_xfer_peer[handle] = decoder_peer_id
 
         else:
             logger.warning(
@@ -445,6 +456,15 @@ class PDConnector(SecondaryTierManager):
             event = self._connect_events.pop(peer_id, None)
             nixl_name = self._peer_nixl_names.pop(peer_id, None)
             dlist = self._remote_dlists.pop(peer_id, None)
+            # Cancel any in-flight NIXL transfers targeting this peer so that
+            # get_finished() does not poll handles whose remote dlist is gone.
+            dead_handles = [
+                h for h, pid in self._inflight_xfer_peer.items()
+                if pid == peer_id
+            ]
+            for h in dead_handles:
+                self._inflight_xfers.pop(h, None)
+                self._inflight_xfer_peer.pop(h, None)
 
         logger.warning("PDConnector %s: peer %s is down", self._peer_id, peer_id)
 
@@ -453,10 +473,16 @@ class PDConnector(SecondaryTierManager):
 
         if event:
             event.set()
-        if nixl_name and self._agent is not None:
-            self._agent.remove_remote_agent(nixl_name)
-        if dlist and self._agent is not None:
-            self._agent.release_dlist_handle(dlist)
+        if self._agent is not None:
+            for h in dead_handles:
+                try:
+                    self._agent.release_xfer_handle(h)
+                except Exception:
+                    pass
+            if nixl_name:
+                self._agent.remove_remote_agent(nixl_name)
+            if dlist:
+                self._agent.release_dlist_handle(dlist)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -590,32 +616,49 @@ class PDConnector(SecondaryTierManager):
         )
 
         job = _StoreJob(job_id=job_id, remaining=len(keys))
-        self._store_jobs[job_id] = job
-
         ready: dict[str, list[tuple[int, int]]] = {}
-        for key, block_idx in zip(keys, spec.block_ids):
-            block_hash = get_offload_block_hash(key)
-            pending = self._pending_blocks.pop(block_hash, None)
-            if pending is not None:
-                batch = ready.setdefault(pending.peer_id, [])
-                batch.append((int(block_idx), pending.remote_block_idx))
-            else:
-                self._block_to_job.setdefault(block_hash, []).append(
-                    (job_id, int(block_idx))
-                )
+        remote_dlists: dict[str, object] = {}
 
+        # Atomically scan _pending_blocks / _block_to_job and snapshot any
+        # remote dlist refs needed for the NIXL calls below.  Both this method
+        # (Thread 1) and _handle_message("lookup_fetch") (Thread 2) touch these
+        # dicts, so the entire check-and-update must be under _lock.
+        with self._lock:
+            self._store_jobs[job_id] = job
+            for key, block_idx in zip(keys, spec.block_ids):
+                block_hash = get_offload_block_hash(key)
+                pending = self._pending_blocks.pop(block_hash, None)
+                if pending is not None:
+                    batch = ready.setdefault(pending.peer_id, [])
+                    batch.append((int(block_idx), pending.remote_block_idx))
+                else:
+                    self._block_to_job.setdefault(block_hash, []).append(
+                        (job_id, int(block_idx))
+                    )
+            for peer_id in ready:
+                dlist = self._remote_dlists.get(peer_id)
+                if dlist is not None:
+                    remote_dlists[peer_id] = dlist
+
+        # NIXL calls outside the lock to avoid blocking the listener thread.
         for peer_id, pairs in ready.items():
+            dlist = remote_dlists.get(peer_id)
+            if dlist is None:
+                # Peer went down between the scan and here; skip this batch.
+                continue
             local_idxs = [p[0] for p in pairs]
             remote_idxs = [p[1] for p in pairs]
             handle = self._agent.make_prepped_xfer(
                 "WRITE",
                 self._local_dlist,
                 local_idxs,
-                self._remote_dlists[peer_id],
+                dlist,
                 remote_idxs,
             )
             self._agent.transfer(handle)
-            self._inflight_xfers[handle] = {job_id: len(pairs)}
+            with self._lock:
+                self._inflight_xfers[handle] = {job_id: len(pairs)}
+                self._inflight_xfer_peer[handle] = peer_id
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
         job_id = job_metadata.job_id
@@ -642,20 +685,45 @@ class PDConnector(SecondaryTierManager):
         })
 
     def get_finished(self) -> Iterable[JobResult]:
-        for handle in list(self._inflight_xfers):
-            state = self._agent.check_xfer_state(handle)
-            if state == "DONE":
-                self._agent.release_xfer_handle(handle)
-                job_counts = self._inflight_xfers.pop(handle)
-                for job_id, num_blocks in job_counts.items():
-                    job = self._store_jobs[job_id]
-                    job.remaining -= num_blocks
-                    if job.remaining == 0:
-                        del self._store_jobs[job_id]
-                        self._finished_jobs.append(
-                            JobResult(job_id=job_id, success=True)
-                        )
+        with self._lock:
+            handles = list(self._inflight_xfers)
 
-        result = self._finished_jobs
-        self._finished_jobs = []
+        # Poll NIXL outside the lock so the listener thread is never blocked.
+        # _on_peer_down may release a handle concurrently; guard with try/except.
+        done: list[object] = []
+        for handle in handles:
+            try:
+                state = self._agent.check_xfer_state(handle)
+            except Exception:
+                continue
+            if state == "DONE":
+                done.append(handle)
+
+        # Atomically claim ownership of each done handle.  _on_peer_down may
+        # have already removed a handle (and called release_xfer_handle on it);
+        # pop(None) detects that and skips the duplicate release.
+        mine: dict[object, dict[JobId, int]] = {}
+        with self._lock:
+            for handle in done:
+                job_counts = self._inflight_xfers.pop(handle, None)
+                self._inflight_xfer_peer.pop(handle, None)
+                if job_counts is not None:
+                    mine[handle] = job_counts
+
+        for handle in mine:
+            self._agent.release_xfer_handle(handle)
+
+        with self._lock:
+            for job_counts in mine.values():
+                for job_id, num_blocks in job_counts.items():
+                    job = self._store_jobs.get(job_id)
+                    if job is not None:
+                        job.remaining -= num_blocks
+                        if job.remaining == 0:
+                            del self._store_jobs[job_id]
+                            self._finished_jobs.append(
+                                JobResult(job_id=job_id, success=True)
+                            )
+            result = self._finished_jobs
+            self._finished_jobs = []
         return result

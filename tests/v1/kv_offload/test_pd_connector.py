@@ -11,6 +11,7 @@ Step 6: submit_store() job tracking and get_finished().
 Step 7: submit_load(), lookup_fetch handling, pending_blocks matching.
 """
 
+import itertools
 import socket
 import threading
 import time
@@ -28,6 +29,7 @@ from vllm.v1.kv_offload.mediums import CPULoadStoreSpec
 from vllm.v1.kv_offload.secondary_tiers.pd_connector import (
     PDConnector,
     _PendingBlock,
+    _StoreJob,
 )
 from vllm.v1.kv_offload.tiering.manager import (
     CPUPrimaryTierOffloadingManager,
@@ -616,5 +618,233 @@ class TestConnectionEstablishment:
             time.sleep(0.3)
 
             assert decoder._peer_id not in prefiller._remote_dlists
+        finally:
+            prefiller.close()
+
+
+# ---------------------------------------------------------------------------
+# Step 8: Race-condition tests
+# ---------------------------------------------------------------------------
+
+class TestRaceConditions:
+    """
+    Verify that concurrent access between Thread 1 (submit_store / get_finished)
+    and Thread 2 (_handle_message / lookup_fetch) does not produce TOCTOU
+    races, iterator invalidation, or KeyErrors.
+    """
+
+    def test_concurrent_submit_store_and_lookup_fetch(self):
+        """
+        No block stranded in both maps; all N unique blocks produce transfers.
+
+        The TOCTOU race: without _lock, submit_store and _handle_message can
+        simultaneously decide a block "isn't in the other's map" and each insert
+        into their own structure, leaving the block with no transfer ever fired.
+        """
+        N = 300
+        p = free_port()
+        prefiller = PDConnector("127.0.0.1", p)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+
+            decoder_peer = "127.0.0.1:9999"
+            counter = itertools.count(1)
+            prefiller._agent.make_prepped_xfer = MagicMock(
+                side_effect=lambda *a, **kw: next(counter)
+            )
+            prefiller._agent.transfer = MagicMock()
+            prefiller._remote_dlists[decoder_peer] = MagicMock()
+
+            keys = [make_key(i) for i in range(N)]
+            errors: list[Exception] = []
+
+            def do_store() -> None:
+                try:
+                    for i, key in enumerate(keys):
+                        spec = CPULoadStoreSpec(block_ids=[i % 16])
+                        prefiller.submit_store(
+                            JobMetadata(job_id=i, keys=[key], spec=spec)
+                        )
+                except Exception as exc:
+                    errors.append(exc)
+
+            def do_fetch() -> None:
+                try:
+                    for i, key in enumerate(keys):
+                        bh = get_offload_block_hash(key)
+                        prefiller._handle_message(decoder_peer, {
+                            "type": "lookup_fetch",
+                            "peer_id": decoder_peer,
+                            "job_id": N + i,
+                            "block_hashes": [bh],
+                            "block_indexes": [i % 16],
+                        })
+                except Exception as exc:
+                    errors.append(exc)
+
+            t1 = threading.Thread(target=do_store)
+            t2 = threading.Thread(target=do_fetch)
+            t1.start()
+            t2.start()
+            t1.join(timeout=10.0)
+            t2.join(timeout=10.0)
+
+            assert not errors, f"Unexpected exceptions: {errors}"
+
+            # Core invariant: no block in both maps simultaneously after completion.
+            with prefiller._lock:
+                both = set(prefiller._block_to_job) & set(prefiller._pending_blocks)
+            assert not both, f"Block in both maps (TOCTOU race): {both}"
+
+            # All N blocks must be accounted for: matched (transfer) or pending
+            # in exactly one map (store arrived before its fetch, or vice-versa).
+            with prefiller._lock:
+                unmatched = (
+                    sum(len(v) for v in prefiller._block_to_job.values())
+                    + len(prefiller._pending_blocks)
+                )
+            transfers = prefiller._agent.make_prepped_xfer.call_count
+            assert transfers + unmatched == N, (
+                f"Accounting mismatch: {transfers} transfers + "
+                f"{unmatched} unmatched != {N}"
+            )
+            # With correct locking every block should match.
+            assert transfers == N, (
+                f"Expected {N} transfers, got {transfers}; "
+                f"{unmatched} blocks stranded"
+            )
+        finally:
+            prefiller.close()
+
+    def test_get_finished_concurrent_with_lookup_fetch(self):
+        """
+        get_finished() and _handle_message("lookup_fetch") run concurrently;
+        no KeyError and every NIXL handle is released exactly once.
+        """
+        N = 300
+        p = free_port()
+        prefiller = PDConnector("127.0.0.1", p)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+
+            decoder_peer = "127.0.0.1:9999"
+            prefiller._remote_dlists[decoder_peer] = MagicMock()
+
+            # Pre-populate _block_to_job and _store_jobs before threads start.
+            keys = [make_key(i) for i in range(N)]
+            for i, key in enumerate(keys):
+                bh = get_offload_block_hash(key)
+                prefiller._block_to_job[bh] = [(i, i % 16)]
+                prefiller._store_jobs[i] = _StoreJob(job_id=i, remaining=1)
+
+            counter = itertools.count(1)
+            prefiller._agent.make_prepped_xfer = MagicMock(
+                side_effect=lambda *a, **kw: next(counter)
+            )
+            prefiller._agent.transfer = MagicMock()
+            prefiller._agent.check_xfer_state = MagicMock(return_value="DONE")
+            prefiller._agent.release_xfer_handle = MagicMock()
+
+            errors: list[Exception] = []
+            stop = threading.Event()
+
+            def do_get_finished() -> None:
+                try:
+                    while not stop.is_set():
+                        prefiller.get_finished()
+                except Exception as exc:
+                    errors.append(exc)
+
+            def do_lookup_fetch() -> None:
+                try:
+                    for i, key in enumerate(keys):
+                        bh = get_offload_block_hash(key)
+                        prefiller._handle_message(decoder_peer, {
+                            "type": "lookup_fetch",
+                            "peer_id": decoder_peer,
+                            "job_id": N + i,
+                            "block_hashes": [bh],
+                            "block_indexes": [i % 16],
+                        })
+                except Exception as exc:
+                    errors.append(exc)
+
+            t_gf = threading.Thread(target=do_get_finished)
+            t_lf = threading.Thread(target=do_lookup_fetch)
+            t_gf.start()
+            t_lf.start()
+            t_lf.join(timeout=10.0)
+            stop.set()
+            t_gf.join(timeout=5.0)
+
+            # Drain any handles still in flight after stop.
+            prefiller.get_finished()
+
+            assert not errors, f"Unexpected exceptions: {errors}"
+
+            # Every handle that was transferred must be released exactly once.
+            transferred = prefiller._agent.transfer.call_count
+            released = prefiller._agent.release_xfer_handle.call_count
+            assert released == transferred, (
+                f"release_xfer_handle called {released} times "
+                f"but transfer called {transferred} times"
+            )
+        finally:
+            prefiller.close()
+
+    def test_peer_down_during_submit_store(self):
+        """
+        _remote_dlists cleared concurrently with submit_store does not raise
+        KeyError; the missing dlist is silently skipped.
+        """
+        N = 300
+        p = free_port()
+        prefiller = PDConnector("127.0.0.1", p)
+        try:
+            prefiller.set_primary_view(make_primary_view())
+
+            decoder_peer = "127.0.0.1:9999"
+            prefiller._agent.make_prepped_xfer = MagicMock(return_value=1)
+            prefiller._agent.transfer = MagicMock()
+            prefiller._agent.release_xfer_handle = MagicMock()
+            prefiller._agent.remove_remote_agent = MagicMock()
+            prefiller._agent.release_dlist_handle = MagicMock()
+
+            errors: list[Exception] = []
+
+            def do_store() -> None:
+                try:
+                    for i in range(N):
+                        key = make_key(i)
+                        bh = get_offload_block_hash(key)
+                        with prefiller._lock:
+                            prefiller._pending_blocks[bh] = _PendingBlock(
+                                peer_id=decoder_peer,
+                                remote_block_idx=i % 16,
+                            )
+                            prefiller._remote_dlists[decoder_peer] = MagicMock()
+                        spec = CPULoadStoreSpec(block_ids=[i % 16])
+                        prefiller.submit_store(
+                            JobMetadata(job_id=i, keys=[key], spec=spec)
+                        )
+                except Exception as exc:
+                    errors.append(exc)
+
+            def do_clear_dlists() -> None:
+                try:
+                    for _ in range(N * 3):
+                        with prefiller._lock:
+                            prefiller._remote_dlists.pop(decoder_peer, None)
+                except Exception as exc:
+                    errors.append(exc)
+
+            t1 = threading.Thread(target=do_store)
+            t2 = threading.Thread(target=do_clear_dlists)
+            t1.start()
+            t2.start()
+            t1.join(timeout=10.0)
+            t2.join(timeout=10.0)
+
+            assert not errors, f"Unexpected exceptions: {errors}"
         finally:
             prefiller.close()
