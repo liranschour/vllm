@@ -18,9 +18,13 @@ from typing import TYPE_CHECKING, Any
 from typing_extensions import override
 
 import vllm.envs as envs
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LookupResult,
+    OffloadingMetricMetadata,
     OffloadKey,
     ReqContext,
     RequestOffloadingContext,
@@ -34,6 +38,10 @@ from vllm.v1.kv_offload.tiering.base import (
 )
 from vllm.v1.kv_offload.tiering.p2p.control import ControlTransport, ZmqTransport
 from vllm.v1.kv_offload.tiering.p2p.data import DataTransport, NixlTransport
+from vllm.v1.kv_offload.tiering.p2p.metrics import (
+    P2PMetricNames,
+    build_p2p_metric_definitions,
+)
 from vllm.v1.kv_offload.tiering.p2p.session import P2PSession
 
 if TYPE_CHECKING:
@@ -321,6 +329,10 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         # handle is valid.
         self._failed_serve_ctxs: list[ReqContext] = []
 
+        # Prometheus metric samples accumulated across polls; snapshotted
+        # and reset by get_stats(). Written on the scheduler thread only.
+        self._stats = OffloadingConnectorStats()
+
     # ------------------------------------------------------------------
     # SecondaryTierManager interface
     # ------------------------------------------------------------------
@@ -599,6 +611,35 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             session.flush_pending_lookups()
 
     # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
+    @classmethod
+    @override
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        return build_p2p_metric_definitions()
+
+    @override
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        """Snapshot the accumulated metrics and reset for the next interval.
+
+        Counters and lookup/fetch histograms are filled during _poll_once /
+        _reap_*; the NIXL transfer telemetry and gauges are drained/snapshotted
+        here (the data transport is long-lived, so nothing is lost by draining
+        it once per stats interval rather than per poll).
+        """
+        self._record_transport_telemetry()
+        self._stats.set_gauge(P2PMetricNames.ACTIVE_SESSIONS, len(self._sessions))
+        self._stats.set_gauge(
+            P2PMetricNames.INFLIGHT_TRANSFERS, self._data.inflight_count
+        )
+        out = self._stats
+        self._stats = OffloadingConnectorStats()
+        return None if out.is_empty() else out
+
+    # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
@@ -678,11 +719,20 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             ]
             for kid in stale_kv_ids:
                 del self._kv_to_session[kid]
+            self._stats.increase_counter(P2PMetricNames.PEER_DISCONNECTS)
             close_result = session.close()
             for job_id in close_result.failed_jobs:
                 self._finished_jobs.append(JobResult(job_id=job_id, success=False))
+            if close_result.failed_jobs:
+                self._stats.increase_counter(
+                    P2PMetricNames.LOAD_FAILURES, len(close_result.failed_jobs)
+                )
             for job_id in close_result.failed_stores:
                 self._finished_jobs.append(JobResult(job_id=job_id, success=False))
+            if close_result.failed_stores:
+                self._stats.increase_counter(
+                    P2PMetricNames.STORE_FAILURES, len(close_result.failed_stores)
+                )
             # Fail every client-side request (in-flight loads plus unresolved
             # symmetric-P2P probes) toward the dead peer so lookup() returns
             # MISS (local prefill) instead of RETRY forever — even if a fresh
@@ -721,6 +771,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 self._finished_jobs.append(
                     JobResult(job_id=batch.job_id, success=False)
                 )
+            self._stats.increase_counter(
+                P2PMetricNames.UNBOUND_STORE_TIMEOUTS, len(batches)
+            )
             logger.warning(
                 "P2P %s: unbound store kv_request_id=%s timed out after %.0fs "
                 "without a fetch — failing %d job(s)",
@@ -760,10 +813,14 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 )
                 if not lr.success:
                     self._failed_req_ids.add(lr.kv_request_id)
+                    self._stats.increase_counter(P2PMetricNames.LOAD_FAILURES)
             for sr in result.stores:
                 self._finished_jobs.append(
                     JobResult(job_id=sr.job_id, success=sr.success)
                 )
+                if not sr.success:
+                    self._stats.increase_counter(P2PMetricNames.STORE_FAILURES)
+            self._record_client_metrics(session.drain_metrics())
             # Bind kv_request_id → session for any FetchMsg this tick and
             # replay any submit_store batches parked while no peer was
             # asking. ServerRole.on_fetch already recorded the demand
@@ -778,6 +835,39 @@ class P2PSecondaryTierManager(SecondaryTierManager):
 
         self._reap_dead_sessions()
         self._reap_unbound_stores()
+
+    def _record_client_metrics(self, metrics: Any) -> None:
+        """Fold a session's drained client-role metric samples into stats."""
+        for rtt in metrics.lookup_rtts:
+            self._stats.observe_histogram(P2PMetricNames.LOOKUP_RTT, rtt)
+        for rtt in metrics.fetch_rtts:
+            self._stats.observe_histogram(P2PMetricNames.FETCH_RTT, rtt)
+        if metrics.lookup_hits:
+            self._stats.increase_counter(
+                P2PMetricNames.LOOKUP_HITS, metrics.lookup_hits
+            )
+        if metrics.lookup_misses:
+            self._stats.increase_counter(
+                P2PMetricNames.LOOKUP_MISSES, metrics.lookup_misses
+            )
+        if metrics.load_timeouts:
+            self._stats.increase_counter(
+                P2PMetricNames.LOAD_TIMEOUTS, metrics.load_timeouts
+            )
+
+    def _record_transport_telemetry(self) -> None:
+        """Fold NIXL per-transfer telemetry into stats (data-plane metrics)."""
+        for rec in self._data.drain_telemetry():
+            self._stats.observe_histogram(
+                P2PMetricNames.TRANSFER_TIME, rec.xfer_duration_s
+            )
+            self._stats.observe_histogram(P2PMetricNames.POST_TIME, rec.post_duration_s)
+            self._stats.observe_histogram(
+                P2PMetricNames.TRANSFER_BYTES, rec.total_bytes
+            )
+            self._stats.observe_histogram(
+                P2PMetricNames.NUM_DESCRIPTORS, rec.desc_count
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -17,6 +17,7 @@ from vllm.v1.kv_offload.tiering.p2p.data.base import (
     CancelMode,
     DataTransport,
     PollResult,
+    TransferTelemetry,
 )
 
 logger = init_logger(__name__)
@@ -66,12 +67,25 @@ class NixlTransport(DataTransport):
         # transfer_id → _Inflight(peer_id, handle).
         self._inflight: dict[int, _Inflight] = {}
         self._next_id = itertools.count()
+        # Per-transfer telemetry captured on completion, drained by the
+        # manager into its stats. NIXL captures it when the agent is built
+        # with capture_telemetry=True (see _init).
+        self._telemetry: list[TransferTelemetry] = []
 
         self._init(view)
 
     @property
     def available(self) -> bool:
         return self._agent is not None
+
+    @property
+    def inflight_count(self) -> int:
+        return len(self._inflight)
+
+    def drain_telemetry(self) -> list[TransferTelemetry]:
+        out = self._telemetry
+        self._telemetry = []
+        return out
 
     def _init(self, view: memoryview) -> None:
         if _NixlAgent is None:
@@ -231,7 +245,9 @@ class NixlTransport(DataTransport):
 
         handles_to_release = []
         for tid in done_ids or ():
-            handles_to_release.append(self._inflight.pop(tid).handle)
+            handle = self._inflight.pop(tid).handle
+            self._record_telemetry(handle)
+            handles_to_release.append(handle)
         for tid in failed_ids or ():
             handles_to_release.append(self._inflight.pop(tid).handle)
         self._release_handles(handles_to_release)
@@ -303,6 +319,34 @@ class NixlTransport(DataTransport):
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _record_telemetry(self, handle: object) -> None:
+        """Capture NIXL telemetry for a completed transfer.
+
+        The agent is built with ``capture_telemetry=True``; read it before
+        the handle is released. Best-effort — a telemetry read failure must
+        not stop the handle from being released, so it is only logged.
+        """
+        if self._agent is None:
+            return
+        try:
+            res = self._agent.get_xfer_telemetry(handle)
+        except Exception as exc:
+            logger.debug(
+                "NixlTransport %s: get_xfer_telemetry failed: %s",
+                self._agent_name,
+                exc,
+            )
+            return
+        # Keep units consistent with the rest of the code: us -> s.
+        self._telemetry.append(
+            TransferTelemetry(
+                xfer_duration_s=res.xferDuration / 1e6,
+                post_duration_s=res.postDuration / 1e6,
+                total_bytes=res.totalBytes,
+                desc_count=res.descCount,
+            )
+        )
 
     def _release_handles(self, handles: list[object]) -> None:
         if self._agent is None:

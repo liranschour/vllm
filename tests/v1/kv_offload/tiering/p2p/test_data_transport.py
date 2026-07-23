@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ctypes
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -295,6 +296,73 @@ class TestNixlTransportWithMockedAgent:
         assert transport._agent is None
         assert transport._inflight == {}
         assert transport._remote_dlists == {}
+
+    def test_inflight_count_tracks_transfers(self):
+        transport = self._make_transport()
+        transport.add_remote_peer("peer:1", b"meta", 0x1000, 8, 1024)
+        assert transport.inflight_count == 0
+
+        transport.write_blocks("peer:1", [0], [1])
+        transport.write_blocks("peer:1", [2], [3])
+        assert transport.inflight_count == 2
+
+        transport._agent.check_xfer_state.return_value = "DONE"
+        transport.poll(peer_id="peer:1")
+        assert transport.inflight_count == 0
+
+    def test_telemetry_captured_on_completion(self):
+        """A completed transfer reads NIXL telemetry (us->s) before release."""
+        transport = self._make_transport()
+        transport.add_remote_peer("peer:1", b"meta", 0x1000, 8, 1024)
+        transport._agent.get_xfer_telemetry.return_value = SimpleNamespace(
+            xferDuration=1500.0,  # us
+            postDuration=200.0,  # us
+            totalBytes=4096,
+            descCount=8,
+        )
+
+        tid = transport.write_blocks("peer:1", [0], [1])
+        transport._agent.check_xfer_state.return_value = "DONE"
+        result = transport.poll(peer_id="peer:1")
+
+        assert tid in result.done
+        transport._agent.get_xfer_telemetry.assert_called_once()
+        transport._agent.release_xfer_handle.assert_called()
+
+        drained = transport.drain_telemetry()
+        assert len(drained) == 1
+        rec = drained[0]
+        assert rec.xfer_duration_s == 1500.0 / 1e6
+        assert rec.post_duration_s == 200.0 / 1e6
+        assert rec.total_bytes == 4096
+        assert rec.desc_count == 8
+        # Drained buffer is now empty.
+        assert transport.drain_telemetry() == []
+
+    def test_no_telemetry_for_failed_transfer(self):
+        """Failed transfers are released without a telemetry read."""
+        transport = self._make_transport()
+        transport.add_remote_peer("peer:1", b"meta", 0x1000, 8, 1024)
+
+        transport.write_blocks("peer:1", [0], [1])
+        transport._agent.check_xfer_state.return_value = "ERR"
+        transport.poll(peer_id="peer:1")
+
+        transport._agent.get_xfer_telemetry.assert_not_called()
+        assert transport.drain_telemetry() == []
+
+    def test_telemetry_read_failure_still_releases(self):
+        """A get_xfer_telemetry error must not block handle release."""
+        transport = self._make_transport()
+        transport.add_remote_peer("peer:1", b"meta", 0x1000, 8, 1024)
+        transport._agent.get_xfer_telemetry.side_effect = RuntimeError("boom")
+
+        transport.write_blocks("peer:1", [0], [1])
+        transport._agent.check_xfer_state.return_value = "DONE"
+        transport.poll(peer_id="peer:1")
+
+        transport._agent.release_xfer_handle.assert_called()
+        assert transport.drain_telemetry() == []
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,11 @@ from typing import TYPE_CHECKING, NamedTuple
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import OffloadKey
 from vllm.v1.kv_offload.tiering.p2p.control.base import ControlConnection
-from vllm.v1.kv_offload.tiering.p2p.session.client import ClientRole, LoadResult
+from vllm.v1.kv_offload.tiering.p2p.session.client import (
+    ClientMetrics,
+    ClientRole,
+    LoadResult,
+)
 from vllm.v1.kv_offload.tiering.p2p.session.protocol import (
     TYPE_KEY,
     AbortAckMsg,
@@ -246,6 +250,10 @@ class P2PSession:
         only for the duration of this call.
         """
         self._server.serve_external_requests(parent)
+
+    def drain_metrics(self) -> ClientMetrics:
+        """Return and reset the client role's metric samples for this interval."""
+        return self._client.drain_metrics()
 
     def poll(self) -> SessionPollResult:
         """Process incoming messages, drive transfers, apply timeouts."""

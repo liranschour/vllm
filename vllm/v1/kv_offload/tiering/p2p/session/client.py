@@ -63,6 +63,22 @@ class _InboundLoadState:
 
 
 @dataclass
+class ClientMetrics:
+    """Client-side metric samples accumulated since the last drain.
+
+    Drained once per scheduler step by the manager (via
+    ``P2PSession.drain_metrics``) into its ``OffloadingConnectorStats``.
+    RTTs are in seconds; counters are plain totals for the interval.
+    """
+
+    lookup_rtts: list[float] = field(default_factory=list)
+    fetch_rtts: list[float] = field(default_factory=list)
+    lookup_hits: int = 0
+    lookup_misses: int = 0
+    load_timeouts: int = 0
+
+
+@dataclass
 class _ClientRequestState:
     """Per-kv_request_id client-side state.
 
@@ -82,6 +98,11 @@ class _ClientRequestState:
     # OffloadKeys registered but not yet flushed onto the wire. Drained and
     # cleared by the next flush_pending_lookups.
     unsent: list[OffloadKey] = field(default_factory=list)
+    # Monotonic send timestamps of LookupMsgs still awaiting a response,
+    # in send order. Appended by flush_pending_lookups, popped FIFO by
+    # on_lookup_resp to compute the lookup RTT (the control connection is
+    # ordered, so responses match sends in order). Cleared on finish.
+    lookup_sent_ts: list[float] = field(default_factory=list)
 
     # Monotonic lookup/fetch signalling phase; see ``ClientPhase``.
     phase: ClientPhase = ClientPhase.REGISTERED
@@ -140,6 +161,14 @@ class ClientRole:
         # discarded wherever load is cleared, and cleared on close.
         self._active_loads: set[str] = set()
         self._completed_loads: list[LoadResult] = []
+        # Metric samples for the current interval; drained by the manager.
+        self._metrics = ClientMetrics()
+
+    def drain_metrics(self) -> ClientMetrics:
+        """Return the accumulated metric samples and reset the buffer."""
+        metrics = self._metrics
+        self._metrics = ClientMetrics()
+        return metrics
 
     # ------------------------------------------------------------------
     # State helpers
@@ -270,6 +299,7 @@ class ClientRole:
             )
         st.probes.clear()
         st.unsent.clear()
+        st.lookup_sent_ts.clear()
         self._flush_pending.discard(kv_request_id)
         self._maybe_prune(kv_request_id)
 
@@ -277,6 +307,7 @@ class ClientRole:
         """Handle a TransferDoneMsg from the peer."""
         st = self._requests.get(kv_request_id)
         if st is not None and st.load is not None:
+            self._metrics.fetch_rtts.append(time.monotonic() - st.load.submitted_at)
             self._completed_loads.append(
                 LoadResult(
                     job_id=st.load.job_id,
@@ -416,6 +447,7 @@ class ClientRole:
                 }
             )
             st.unsent = []
+            st.lookup_sent_ts.append(time.monotonic())
         self._flush_pending.clear()
 
     def on_lookup_resp(
@@ -447,6 +479,13 @@ class ClientRole:
             key = OffloadKey(h)
             if key in st.probes:
                 st.probes[key] = hit
+        self._metrics.lookup_hits += n_hit
+        self._metrics.lookup_misses += len(hits) - n_hit
+        # Match this response to the oldest unanswered LookupMsg send.
+        if st.lookup_sent_ts:
+            self._metrics.lookup_rtts.append(
+                time.monotonic() - st.lookup_sent_ts.pop(0)
+            )
 
     def collect_results(self) -> list[LoadResult]:
         """Walk load timeouts and drain completed loads.
@@ -467,6 +506,7 @@ class ClientRole:
             if load.aborted_at is None:
                 if now - load.submitted_at >= _LOAD_TIMEOUT_S:
                     load.aborted_at = now
+                    self._metrics.load_timeouts += 1
                     logger.warning(
                         "P2PSession %s: %s timed out, sending abort",
                         self._peer_id,

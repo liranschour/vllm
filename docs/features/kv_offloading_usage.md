@@ -241,6 +241,28 @@ Runtime handshake for a P2P (or P/D) pull, once the orchestrator has set the key
 
 In classic **P/D mode** (`remote_prefiller` set, no `remote_kv_source`), the lookup phase (steps 2–4) is skipped: the decode consumer assumes the prefiller holds all of the request's blocks, so every block `lookup()` returns an immediate hit and the consumer jumps straight to the **`FetchMsg`** in step 5. The `LookupMsg`/`LookupRespMsg` round-trip only happens in P2P mode, where the consumer does not know in advance which blocks the peer has cached.
 
+### P2P Prometheus metrics
+
+The P2P tier exports the following `vllm:kv_offload_p2p_*` metrics (all labeled by `model_name` and `engine`):
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `..._lookup_rtt_seconds` | Histogram | Control-plane round trip: `LookupMsg` sent → matching `LookupRespMsg` resolves (step 2 → 3). |
+| `..._fetch_rtt_seconds` | Histogram | Fetch round trip: `FetchMsg` sent → `TransferDone` received (step 5 → 6). |
+| `..._transfer_time_seconds` | Histogram | NIXL WRITE transfer duration (from NIXL telemetry). |
+| `..._post_time_seconds` | Histogram | NIXL transfer post time (from NIXL telemetry). |
+| `..._transfer_bytes` | Histogram | Bytes moved per NIXL transfer. |
+| `..._num_descriptors` | Histogram | NIXL descriptors per transfer. |
+| `..._lookup_hits` / `..._lookup_misses` | Counter | Per-block probe outcomes on the consumer. |
+| `..._load_failures` / `..._store_failures` | Counter | Failed fetch (consumer) / serve (producer) jobs. |
+| `..._load_timeouts` | Counter | Fetches aborted after the load timeout. |
+| `..._unbound_store_timeouts` | Counter | Producer store batches that expired with no peer fetch. |
+| `..._active_sessions` | Gauge | Live peer sessions. |
+| `..._peer_disconnects` | Counter | Peer sessions reaped after disconnect. |
+| `..._inflight_transfers` | Gauge | NIXL transfers currently in flight. |
+
+The transfer histograms are sourced from NIXL's own per-transfer telemetry (the agent is created with `capture_telemetry=True`), mirroring the `vllm:nixl_*` metrics that `NixlConnector` exports.
+
 ## Tuning Tips
 
 - `cpu_bytes_to_use`: a bigger CPU tier means fewer trips to slower secondary tiers and a higher hit rate. The value is total across all workers, not per-worker. Leave headroom for the rest of the host workload.

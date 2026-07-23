@@ -93,6 +93,18 @@ class PollResult(NamedTuple):
     failed: Sequence[int]
 
 
+class TransferTelemetry(NamedTuple):
+    """Per-transfer telemetry drained from the data plane.
+
+    Durations are in seconds (converted from the transport's native units).
+    """
+
+    xfer_duration_s: float
+    post_duration_s: float
+    total_bytes: int
+    desc_count: int
+
+
 class DataTransport(ABC):
     """Abstract data-plane transport for RDMA-style block transfers.
 
@@ -266,3 +278,15 @@ class DataTransport(ABC):
         After close(), no other methods may be called.
         """
         ...
+
+    def drain_telemetry(self) -> list[TransferTelemetry]:
+        """Return and clear per-transfer telemetry collected since last call.
+
+        Default is a no-op for transports that don't expose telemetry.
+        """
+        return []
+
+    @property
+    def inflight_count(self) -> int:
+        """Number of transfers currently in flight. Default 0."""
+        return 0

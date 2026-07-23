@@ -102,6 +102,10 @@ def _job_metadata(
 
 def _make_manager() -> P2PSecondaryTierManager:
     """Create a manager with stubbed __init__."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+        OffloadingConnectorStats,
+    )
+
     mgr = P2PSecondaryTierManager.__new__(P2PSecondaryTierManager)
     mgr._local_id = "127.0.0.1:7777"
     mgr._hash_seed = "0"
@@ -111,6 +115,7 @@ def _make_manager() -> P2PSecondaryTierManager:
     mgr._kv_to_session = {}
     mgr._unbound_stores = {}
     mgr._failed_serve_ctxs = []
+    mgr._stats = OffloadingConnectorStats()
     return mgr
 
 
@@ -601,6 +606,11 @@ class _FakeSession:
         self._stores = []
         self._new_fetch_ids = []
         return result
+
+    def drain_metrics(self):
+        from vllm.v1.kv_offload.tiering.p2p.session.client import ClientMetrics
+
+        return ClientMetrics()
 
     def request_blocks(self, job_id, kv_request_id, keys, block_ids):
         self.requests.append((job_id, kv_request_id))
