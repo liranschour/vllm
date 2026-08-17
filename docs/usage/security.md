@@ -172,6 +172,7 @@ When `--api-key` is configured, the following `/v1` endpoints require Bearer tok
 - `/v1/rerank` - Reranking API
 - `/v1/load_lora_adapter` - Load a LoRA adapter (can alter model behavior; only available when `--enable-lora` is set and `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`)
 - `/v1/unload_lora_adapter` - Unload a LoRA adapter (can alter model behavior; only available when `--enable-lora` is set and `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True`)
+- `/v1/kv_connector/rpc` - Generic control RPC to the configured KV connector (hands attacker-controllable bytes to connector code; only meaningful when a KV connector is configured, and the connector is responsible for validating and bounding the payload)
 - `/inference/v1/generate` - Generate completions
 - `/v2/embed` - Cohere Embed API
 - `/v2/rerank` - Cohere Rerank API
