@@ -11,7 +11,7 @@ import time
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from typing_extensions import override
 
@@ -205,6 +205,10 @@ class P2PSecondaryTierManager(SecondaryTierManager):
     ``has_pending_work()`` keeps the engine ticking so the control transport
     and existing sessions are polled even when no requests are scheduled.
     """
+
+    # Symmetric-P2P consumers address a peer per request, so this tier can
+    # serve a proactive migration. See SecondaryTierManager.supports_migration.
+    supports_migration: ClassVar[bool] = True
 
     def __init__(
         self,
