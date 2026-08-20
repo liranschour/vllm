@@ -58,6 +58,13 @@ from vllm.v1.kv_offload.tiering.metrics import TieringMetricsTracker
 
 logger = init_logger(__name__)
 
+# Proactive migration: a hash stuck probing (no LookupResp) or promoting (stuck
+# transfer) past this deadline is force-resolved so the migration terminates.
+_MIGRATION_TIMEOUT_S = 300.0
+# How long a terminal (completed/failed/cancelled) migration is retained so the
+# orchestrator can poll its outcome before it is reaped and poll returns unknown.
+_MIGRATION_REAP_TTL_S = 300.0
+
 
 @dataclass
 class PendingPromotion:
@@ -79,6 +86,32 @@ class RequestState:
 class JobMetadata(NamedTuple):
     transfer_job: TransferJob
     tier_idx: int
+
+
+@dataclass
+class _MigrationState:
+    """A proactive block-migration submitted via the control RPC.
+
+    Driven request-lessly by ``_drive_migrations`` through the normal
+    ``lookup()`` -> promotion machinery: each key is probed against the tiers
+    (the synthetic ``req_context`` carries the ``remote_kv_source`` params so
+    the P2P tier fetches from the named peer), promoted into the CPU primary
+    tier, and committed there — but never pulled to GPU. Each key is in exactly
+    one of ``active`` (``"probe"`` or ``"promoting"``), ``done``, ``missing``
+    (no tier holds it), or ``failed`` (promotion/transfer error).
+    """
+
+    transfer_id: str
+    req_context: ReqContext
+    total: int
+    active: dict[OffloadKey, str]
+    done: set[OffloadKey] = field(default_factory=set)
+    missing: set[OffloadKey] = field(default_factory=set)
+    failed: set[OffloadKey] = field(default_factory=set)
+    deadline: float = 0.0
+    terminal: str | None = None
+    terminal_at: float | None = None
+    finalized: bool = False
 
 
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
@@ -229,6 +262,10 @@ class TieringOffloadingManager(OffloadingManager):
             tier: _SecondaryTierFacingParent(self, tier_idx)
             for tier_idx, tier in enumerate(self.secondary_tiers)
         }
+
+        # Active/terminal proactive migrations, keyed by orchestrator transfer_id.
+        # Driven once per step by _drive_migrations() in on_schedule_end().
+        self._migrations: dict[str, _MigrationState] = {}
 
     @property
     def _transfer_jobs(self) -> dict[JobId, JobMetadata]:
@@ -767,6 +804,162 @@ class TieringOffloadingManager(OffloadingManager):
         self._metrics.on_request_finished(state.req_context)
         del self._req_state[req_id]
 
+    # ------------------------------------------------------------------
+    # Proactive migration (control-RPC driven)
+    # ------------------------------------------------------------------
+
+    def submit_migration(
+        self,
+        transfer_id: str,
+        host: str,
+        port: int,
+        keys: Sequence[OffloadKey],
+    ) -> tuple[bool, int, str | None]:
+        """Register a proactive pull of ``keys`` from a remote peer into CPU.
+
+        Non-blocking: builds a synthetic ``remote_kv_source`` request context
+        (which opens the P2P session and caches its routing state via
+        ``on_new_request``), records migration state, and returns. The transfer
+        is advanced request-lessly by ``_drive_migrations`` on later steps.
+
+        ``transfer_id`` is supplied by the orchestrator and used verbatim as the
+        on-wire ``kv_request_id``.
+
+        Returns:
+            ``(accepted, num_blocks, error)``. ``error`` is set and ``accepted``
+            is False on a rejected submission (duplicate id, no keys).
+        """
+        if not keys:
+            return (False, 0, "no_blocks")
+        if transfer_id in self._migrations:
+            return (False, 0, "duplicate_transfer_id")
+
+        req_context = ReqContext(
+            req_id=f"p2p-migration:{transfer_id}",
+            kv_transfer_params={
+                "remote_kv_source": {
+                    "remote_host": host,
+                    "remote_port": port,
+                    "kv_request_id": transfer_id,
+                }
+            },
+        )
+        # Opens the P2P session toward the peer and caches P2PSourceInfo on the
+        # ctx (fanned out to every secondary tier, harmless for the others).
+        self.on_new_request(req_context)
+
+        self._migrations[transfer_id] = _MigrationState(
+            transfer_id=transfer_id,
+            req_context=req_context,
+            total=len(keys),
+            active={key: "probe" for key in keys},
+            deadline=time.monotonic() + _MIGRATION_TIMEOUT_S,
+        )
+        return (True, len(keys), None)
+
+    def poll_migration(self, transfer_id: str) -> dict[str, object] | None:
+        """Return a migration's status, or None if the id is unknown/reaped."""
+        mig = self._migrations.get(transfer_id)
+        if mig is None:
+            return None
+        state = mig.terminal if mig.terminal is not None else "running"
+        error: str | None = None
+        if mig.terminal == "failed":
+            error = "transfer_failed"
+        elif mig.terminal == "cancelled":
+            error = "cancelled"
+        return {
+            "state": state,
+            "blocks_total": mig.total,
+            "blocks_done": len(mig.done),
+            "blocks_missing": len(mig.missing),
+            "blocks_failed": len(mig.failed),
+            "error": error,
+        }
+
+    def cancel_migration(self, transfer_id: str) -> bool:
+        """Abort an in-flight migration. Returns False if unknown/already done."""
+        mig = self._migrations.get(transfer_id)
+        if mig is None or mig.terminal is not None:
+            return False
+        self._finalize_migration(mig, "cancelled", time.monotonic())
+        return True
+
+    def _finalize_migration(
+        self, mig: _MigrationState, terminal: str, now: float
+    ) -> None:
+        """Release the synthetic request and mark the migration terminal.
+
+        ``on_request_finished`` finalizes immediately (no primary stores were
+        issued) and tears down the P2P session state for the id, cancelling any
+        still-pending fetch.
+        """
+        if not mig.finalized:
+            self.on_request_finished(mig.req_context)
+            mig.finalized = True
+        mig.terminal = terminal
+        mig.terminal_at = now
+
+    def _drive_migrations(self) -> None:
+        """Advance every active migration by one step; reap terminal ones.
+
+        Called from ``on_schedule_end`` after the finished-job poll and gate
+        reset. Uses a per-key state machine that never re-probes a resolved key,
+        so a source miss cannot loop forever.
+        """
+        if not self._migrations:
+            return
+        # Commit any promotions that finished since the top-of-step poll so a
+        # migration whose keys are all "promoting" (no probe lookup this step to
+        # trigger the poll) still observes completion via primary_tier.lookup.
+        self._maybe_process_finished_jobs()
+        now = time.monotonic()
+        for transfer_id, mig in list(self._migrations.items()):
+            if mig.terminal is not None:
+                if (
+                    mig.terminal_at is not None
+                    and now - mig.terminal_at > _MIGRATION_REAP_TTL_S
+                ):
+                    del self._migrations[transfer_id]
+                continue
+
+            ctx = mig.req_context
+            for key, key_state in list(mig.active.items()):
+                if key_state == "probe":
+                    # Generic fan-out lookup: any tier holding the block starts
+                    # its promotion; the P2P tier fetches from the named peer.
+                    result = self.lookup(key, ctx)
+                    if result is LookupResult.HIT:
+                        mig.active.pop(key)
+                        mig.done.add(key)
+                    elif result is LookupResult.HIT_PENDING:
+                        mig.active[key] = "promoting"
+                    elif result is LookupResult.MISS:
+                        mig.active.pop(key)
+                        mig.missing.add(key)
+                    # RETRY: probe still pending on the peer; leave as-is.
+                else:  # "promoting"
+                    result = self.primary_tier.lookup(key, ctx)
+                    if result is LookupResult.HIT:
+                        mig.active.pop(key)
+                        mig.done.add(key)
+                    elif result is LookupResult.MISS:
+                        mig.active.pop(key)
+                        mig.failed.add(key)
+                    # HIT_PENDING: promotion still in flight; leave as-is.
+
+            if mig.active and now > mig.deadline:
+                for key, key_state in list(mig.active.items()):
+                    mig.active.pop(key)
+                    if key_state == "promoting":
+                        mig.failed.add(key)
+                    else:
+                        mig.missing.add(key)
+
+            if not mig.active:
+                terminal = "failed" if mig.failed else "completed"
+                self._finalize_migration(mig, terminal, now)
+
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         """End-of-schedule hook: process finished jobs, flush deferred
@@ -786,6 +979,12 @@ class TieringOffloadingManager(OffloadingManager):
         # Reset the per-step gate AFTER serve_external_requests so that
         # lookup() calls within it skip redundant _process_finished_jobs().
         self._processed_jobs_this_step = False
+
+        # Advance proactive migrations before flushing: lookups registered here
+        # get their LookupMsg flushed by tier.on_schedule_end() below, and
+        # promotions initiated here get their FetchMsg flushed by
+        # _flush_pending_promotions() — all within this same step.
+        self._drive_migrations()
 
         self._flush_pending_promotions()
         for tier in self.secondary_tiers:

@@ -1694,5 +1694,23 @@ class OffloadingConnectorScheduler:
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.clear()
 
+    def on_rpc(self, payload: bytes) -> bytes | None:
+        """Dispatch a generic control RPC (proactive P2P migration).
+
+        Returns None when the configured offloading manager cannot migrate
+        (no secondary tiers), so the caller surfaces HTTP 501. Otherwise always
+        returns response bytes; expected errors are encoded in the payload.
+        """
+        from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
+
+        from .migration import handle_migration_rpc
+
+        if not (
+            isinstance(self.manager, TieringOffloadingManager)
+            and self.manager.secondary_tiers
+        ):
+            return None
+        return handle_migration_rpc(self.manager, payload)
+
     def shutdown(self) -> None:
         self.manager.shutdown()
