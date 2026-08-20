@@ -229,7 +229,7 @@ class ClientRole:
             assert all(st.probes.get(key) is True for key in keys)
         st.probes.clear()
 
-    def finish(self, kv_request_id: str) -> None:
+    def finish(self, kv_request_id: str) -> list[JobId]:
         """Finish a request: abort in-flight loads and release lookup state.
 
         Called from the session's ``finish_request``. Sends an
@@ -242,21 +242,32 @@ class ClientRole:
         owed at once.
 
         Then drop all probe/lookup state and prune the entry.
+
+        Returns:
+            The ``job_id`` of every load aborted here. The caller must fail
+            them: this id's state is gone, so no ack can be matched and
+            ``collect_results`` will never surface them.
         """
+        aborted_jobs: list[JobId] = []
         st = self._requests.get(kv_request_id)
         if st is None:
-            return
+            return aborted_jobs
         if st.loads:
             for round_seq, load in st.loads.items():
-                if load.aborted_at is not None:
-                    continue
-                self._send(
-                    {
-                        TYPE_KEY: AbortFetchMsg.TYPE,
-                        AbortFetchMsg.KV_REQUEST_ID: kv_request_id,
-                        AbortFetchMsg.ROUND_SEQ: round_seq,
-                    }
-                )
+                if load.aborted_at is None:
+                    self._send(
+                        {
+                            TYPE_KEY: AbortFetchMsg.TYPE,
+                            AbortFetchMsg.KV_REQUEST_ID: kv_request_id,
+                            AbortFetchMsg.ROUND_SEQ: round_seq,
+                        }
+                    )
+                # This id's state is dropped below, so no AbortAckMsg can ever
+                # be matched to these loads and the abort-ack timeout in
+                # collect_results() will never see them. Report them to the
+                # caller, or the manager's promotion job stays in flight
+                # forever and the primary blocks it reserved are never freed.
+                aborted_jobs.append(load.job_id)
             st.loads.clear()
             self._active_loads.discard(kv_request_id)
         if st.peer_lookup_open:
@@ -274,6 +285,7 @@ class ClientRole:
         st.unsent.clear()
         self._flush_pending.discard(kv_request_id)
         self._maybe_prune(kv_request_id)
+        return aborted_jobs
 
     def on_transfer_done(
         self, kv_request_id: str, success: bool, round_seq: int

@@ -494,6 +494,24 @@ class TestOnRequestFinished:
         mgr.on_request_finished(ctx)
         assert session.finishes == ["req-1"]
 
+    def test_finish_fails_loads_the_session_aborted(self):
+        """finish_request aborts in-flight loads whose ack can no longer be
+        matched, so the manager must surface them as failed jobs. Otherwise the
+        parent never pops the promotion job and the primary blocks it reserved
+        stay write-pending forever — which later trips reset_cache()."""
+        mgr = _make_manager()
+        peer_id = "10.0.0.1:8000"
+        session = _FakeSession(peer_id=peer_id, finish_aborted_jobs=[41, 42])
+        mgr._sessions[peer_id] = session
+        ctx = _req_context(kv_params=_remote_kv_source_kv_params(kv_request_id="req-1"))
+        mgr.on_request_finished(ctx)
+        assert mgr._finished_jobs == [
+            JobResult(job_id=41, success=False),
+            JobResult(job_id=42, success=False),
+        ]
+        # The request is finished, so it must not be parked in _failed_req_ids.
+        assert "req-1" not in mgr._failed_req_ids
+
     def test_prefiller_bound_id_routes_via_kv_to_session(self):
         """Prefiller-side finish for an id whose session is already bound
         (FetchMsg received) routes via _kv_to_session and pops the entry."""
@@ -565,7 +583,9 @@ class _FakeSession:
         close_req_ids: list[str] | None = None,
         close_stores: list[int] | None = None,
         close_failed_serves: list[ReqContext] | None = None,
+        finish_aborted_jobs: list[int] | None = None,
     ) -> None:
+        self.finish_aborted_jobs = finish_aborted_jobs or []
         self.peer_id = peer_id
         self.alive = alive
         self.connected = connected
@@ -614,6 +634,7 @@ class _FakeSession:
 
     def finish_request(self, kv_request_id):
         self.finishes.append(kv_request_id)
+        return list(self.finish_aborted_jobs)
 
     def close(self):
         return SessionCloseResult(

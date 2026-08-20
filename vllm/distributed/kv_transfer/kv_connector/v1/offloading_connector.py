@@ -204,7 +204,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         return True
 
     def on_rpc(self, payload: bytes) -> bytes | None:
-        assert self.connector_scheduler is not None
+        # Only the scheduler-side instance handles RPCs; the worker-side one
+        # has no scheduler and reports "not implemented" rather than raising.
+        if self.connector_scheduler is None:
+            return None
         return self.connector_scheduler.on_rpc(payload)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:

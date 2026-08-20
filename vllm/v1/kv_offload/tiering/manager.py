@@ -64,6 +64,18 @@ _MIGRATION_TIMEOUT_S = 300.0
 # How long a terminal (completed/failed/cancelled) migration is retained so the
 # orchestrator can poll its outcome before it is reaped and poll returns unknown.
 _MIGRATION_REAP_TTL_S = 300.0
+# Max keys advanced per engine step, summed across all active migrations.
+# _drive_migrations() runs inside the scheduler's on_schedule_end(), so every
+# key costs a full tier lookup on the critical path; bounding it is what keeps
+# a large prefetch from inflating TTFT for live requests.
+_MIGRATION_KEYS_PER_STEP = 256
+# Max concurrent non-terminal migrations. Beyond this, submit is rejected
+# rather than growing per-step work and CPU pressure without bound.
+_MAX_ACTIVE_MIGRATIONS = 16
+
+# Per-key states within a migration.
+_KEY_PROBE = "probe"
+_KEY_PROMOTING = "promoting"
 
 
 @dataclass
@@ -97,8 +109,10 @@ class _MigrationState:
     (the synthetic ``req_context`` carries the ``remote_kv_source`` params so
     the P2P tier fetches from the named peer), promoted into the CPU primary
     tier, and committed there — but never pulled to GPU. Each key is in exactly
-    one of ``active`` (``"probe"`` or ``"promoting"``), ``done``, ``missing``
-    (no tier holds it), or ``failed`` (promotion/transfer error).
+    one of ``active`` (``_KEY_PROBE`` or ``_KEY_PROMOTING``), ``done``,
+    ``missing`` (no tier holds it), ``no_capacity`` (a tier holds it but the
+    primary tier had no room), or ``failed`` (promotion/transfer error, or
+    unresolved at the deadline).
     """
 
     transfer_id: str
@@ -108,10 +122,39 @@ class _MigrationState:
     done: set[OffloadKey] = field(default_factory=set)
     missing: set[OffloadKey] = field(default_factory=set)
     failed: set[OffloadKey] = field(default_factory=set)
+    # Keys a tier held but the primary tier had no room to promote into.
+    # Kept apart from `missing` so the orchestrator can tell "the source does
+    # not have this" from "I could not make room for it".
+    no_capacity: set[OffloadKey] = field(default_factory=set)
     deadline: float = 0.0
+    timed_out: bool = False
     terminal: str | None = None
     terminal_at: float | None = None
     finalized: bool = False
+
+    def resolve_terminal(self) -> str:
+        """Terminal state for a migration whose keys have all resolved.
+
+        Anything that is not a clean source miss makes the migration
+        ``failed``: an orchestrator reading ``completed`` will route a
+        request expecting a warm cache, so a partial or capacity-starved
+        result must not report success.
+        """
+        if self.failed or self.no_capacity or self.timed_out:
+            return "failed"
+        return "completed"
+
+    def error_reason(self) -> str | None:
+        """Short reason string for a failed/cancelled migration."""
+        if self.terminal == "cancelled":
+            return "cancelled"
+        if self.terminal != "failed":
+            return None
+        if self.timed_out:
+            return "timeout"
+        if self.no_capacity:
+            return "insufficient_capacity"
+        return "transfer_failed"
 
 
 class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
@@ -266,6 +309,13 @@ class TieringOffloadingManager(OffloadingManager):
         # Active/terminal proactive migrations, keyed by orchestrator transfer_id.
         # Driven once per step by _drive_migrations() in on_schedule_end().
         self._migrations: dict[str, _MigrationState] = {}
+        # Rotating start offset for _drive_migrations, so one large migration
+        # cannot starve the others when the per-step key budget runs out.
+        self._migration_cursor: int = 0
+        # Set by _initiate_promotion when it fails for lack of primary-tier
+        # room, so a MISS from lookup() can be attributed to capacity rather
+        # than to the block being absent everywhere. Reset on each lookup().
+        self._promotion_out_of_capacity: bool = False
 
     @property
     def _transfer_jobs(self) -> dict[JobId, JobMetadata]:
@@ -398,6 +448,8 @@ class TieringOffloadingManager(OffloadingManager):
             MISS      — block not found in any tier, or primary is full
                         and cannot accept a promotion.
         """
+        self._promotion_out_of_capacity = False
+
         # Poll first so a promotion that finished since the last call is
         # already reflected as HIT (not stale HIT_PENDING/MISS) below, and
         # so blocks freed by cascade or promotion completions are evictable
@@ -486,6 +538,7 @@ class TieringOffloadingManager(OffloadingManager):
             # Primary tier is full; caller should treat the block as unavailable
             # rather than retrying indefinitely.
             self._metrics.on_promotion_allocation_failure()
+            self._promotion_out_of_capacity = True
             return False
 
         store_spec = primary_write_result.store_spec
@@ -825,14 +878,39 @@ class TieringOffloadingManager(OffloadingManager):
         ``transfer_id`` is supplied by the orchestrator and used verbatim as the
         on-wire ``kv_request_id``.
 
+        Duplicate keys are collapsed, so ``num_blocks`` (and the
+        ``blocks_total`` later reported by ``poll_migration``) is the number of
+        distinct blocks and always reconciles against done/missing/failed.
+
         Returns:
             ``(accepted, num_blocks, error)``. ``error`` is set and ``accepted``
-            is False on a rejected submission (duplicate id, no keys).
+            is False on a rejected submission: ``no_blocks``,
+            ``duplicate_transfer_id``, ``too_many_migrations``, or
+            ``insufficient_capacity``.
         """
         if not keys:
             return (False, 0, "no_blocks")
         if transfer_id in self._migrations:
             return (False, 0, "duplicate_transfer_id")
+
+        active = sum(1 for mig in self._migrations.values() if mig.terminal is None)
+        if active >= _MAX_ACTIVE_MIGRATIONS:
+            return (False, 0, "too_many_migrations")
+
+        # Collapse duplicates: `active` is keyed by OffloadKey, so a repeated
+        # hash would otherwise inflate `total` and leave blocks_total
+        # permanently greater than done + missing + failed.
+        unique_keys = dict.fromkeys(keys)
+        num_blocks = len(unique_keys)
+
+        # Reject upfront what cannot possibly land, rather than reporting it
+        # per-block as a capacity failure after the probes have been paid for.
+        capacity = (
+            self.primary_tier._get_num_free_blocks()
+            + self.primary_tier._num_evictable_cache_blocks
+        )
+        if num_blocks > capacity:
+            return (False, 0, "insufficient_capacity")
 
         req_context = ReqContext(
             req_id=f"p2p-migration:{transfer_id}",
@@ -851,30 +929,25 @@ class TieringOffloadingManager(OffloadingManager):
         self._migrations[transfer_id] = _MigrationState(
             transfer_id=transfer_id,
             req_context=req_context,
-            total=len(keys),
-            active={key: "probe" for key in keys},
+            total=num_blocks,
+            active=dict.fromkeys(unique_keys, _KEY_PROBE),
             deadline=time.monotonic() + _MIGRATION_TIMEOUT_S,
         )
-        return (True, len(keys), None)
+        return (True, num_blocks, None)
 
     def poll_migration(self, transfer_id: str) -> dict[str, object] | None:
         """Return a migration's status, or None if the id is unknown/reaped."""
         mig = self._migrations.get(transfer_id)
         if mig is None:
             return None
-        state = mig.terminal if mig.terminal is not None else "running"
-        error: str | None = None
-        if mig.terminal == "failed":
-            error = "transfer_failed"
-        elif mig.terminal == "cancelled":
-            error = "cancelled"
         return {
-            "state": state,
+            "state": mig.terminal if mig.terminal is not None else "running",
             "blocks_total": mig.total,
             "blocks_done": len(mig.done),
             "blocks_missing": len(mig.missing),
-            "blocks_failed": len(mig.failed),
-            "error": error,
+            "blocks_failed": len(mig.failed) + len(mig.no_capacity),
+            "blocks_no_capacity": len(mig.no_capacity),
+            "error": mig.error_reason(),
         }
 
     def cancel_migration(self, transfer_id: str) -> bool:
@@ -891,8 +964,10 @@ class TieringOffloadingManager(OffloadingManager):
         """Release the synthetic request and mark the migration terminal.
 
         ``on_request_finished`` finalizes immediately (no primary stores were
-        issued) and tears down the P2P session state for the id, cancelling any
-        still-pending fetch.
+        issued) and tears down the P2P session state for the id. Any fetch
+        still in flight is aborted there and reported back as a failed job, so
+        the primary blocks it reserved are released rather than left
+        write-pending forever.
         """
         if not mig.finalized:
             self.on_request_finished(mig.req_context)
@@ -900,12 +975,71 @@ class TieringOffloadingManager(OffloadingManager):
         mig.terminal = terminal
         mig.terminal_at = now
 
+    def _advance_migration(self, mig: _MigrationState, budget: int) -> int:
+        """Advance up to ``budget`` of one migration's keys. Returns keys used.
+
+        Never re-probes a resolved key, so a source miss cannot loop forever.
+        """
+        ctx = mig.req_context
+        used = 0
+        for key, key_state in list(mig.active.items()):
+            if used >= budget:
+                break
+            used += 1
+            if key_state == _KEY_PROBE:
+                # Generic fan-out lookup: any tier holding the block starts
+                # its promotion; the P2P tier fetches from the named peer.
+                result = self.lookup(key, ctx)
+                if result is LookupResult.HIT:
+                    mig.active.pop(key)
+                    mig.done.add(key)
+                elif result is LookupResult.HIT_PENDING:
+                    mig.active[key] = _KEY_PROMOTING
+                elif result is LookupResult.MISS:
+                    mig.active.pop(key)
+                    # A tier held the block but the primary tier could not
+                    # make room: that is our failure, not a source miss.
+                    if self._promotion_out_of_capacity:
+                        mig.no_capacity.add(key)
+                    else:
+                        mig.missing.add(key)
+                # RETRY: probe still pending on the peer; leave as-is.
+            else:  # _KEY_PROMOTING
+                result = self.primary_tier.lookup(key, ctx)
+                if result is LookupResult.HIT:
+                    mig.active.pop(key)
+                    mig.done.add(key)
+                elif result is LookupResult.MISS:
+                    mig.active.pop(key)
+                    mig.failed.add(key)
+                # HIT_PENDING: promotion still in flight; leave as-is.
+        return used
+
+    def _expire_migration(self, mig: _MigrationState) -> None:
+        """Force-resolve every still-active key of a timed-out migration.
+
+        Timed-out keys are ``failed``, never ``missing``: the source may well
+        hold them: we simply never got an answer, and reporting that as a
+        clean miss would let the migration terminate as ``completed``.
+        """
+        mig.timed_out = True
+        logger.warning(
+            "Proactive migration %s timed out with %d block(s) unresolved "
+            "after %.0fs; failing them.",
+            mig.transfer_id,
+            len(mig.active),
+            _MIGRATION_TIMEOUT_S,
+        )
+        for key in list(mig.active):
+            mig.active.pop(key)
+            mig.failed.add(key)
+
     def _drive_migrations(self) -> None:
-        """Advance every active migration by one step; reap terminal ones.
+        """Advance active migrations within a per-step budget; reap terminal ones.
 
         Called from ``on_schedule_end`` after the finished-job poll and gate
-        reset. Uses a per-key state machine that never re-probes a resolved key,
-        so a source miss cannot loop forever.
+        reset. At most ``_MIGRATION_KEYS_PER_STEP`` keys are touched per step
+        across all migrations, so a large prefetch cannot stall the scheduler.
         """
         if not self._migrations:
             return
@@ -914,51 +1048,34 @@ class TieringOffloadingManager(OffloadingManager):
         # trigger the poll) still observes completion via primary_tier.lookup.
         self._maybe_process_finished_jobs()
         now = time.monotonic()
+
+        active: list[_MigrationState] = []
         for transfer_id, mig in list(self._migrations.items()):
-            if mig.terminal is not None:
-                if (
-                    mig.terminal_at is not None
-                    and now - mig.terminal_at > _MIGRATION_REAP_TTL_S
-                ):
-                    del self._migrations[transfer_id]
-                continue
+            if mig.terminal is None:
+                active.append(mig)
+            elif (
+                mig.terminal_at is not None
+                and now - mig.terminal_at > _MIGRATION_REAP_TTL_S
+            ):
+                del self._migrations[transfer_id]
+        if not active:
+            return
 
-            ctx = mig.req_context
-            for key, key_state in list(mig.active.items()):
-                if key_state == "probe":
-                    # Generic fan-out lookup: any tier holding the block starts
-                    # its promotion; the P2P tier fetches from the named peer.
-                    result = self.lookup(key, ctx)
-                    if result is LookupResult.HIT:
-                        mig.active.pop(key)
-                        mig.done.add(key)
-                    elif result is LookupResult.HIT_PENDING:
-                        mig.active[key] = "promoting"
-                    elif result is LookupResult.MISS:
-                        mig.active.pop(key)
-                        mig.missing.add(key)
-                    # RETRY: probe still pending on the peer; leave as-is.
-                else:  # "promoting"
-                    result = self.primary_tier.lookup(key, ctx)
-                    if result is LookupResult.HIT:
-                        mig.active.pop(key)
-                        mig.done.add(key)
-                    elif result is LookupResult.MISS:
-                        mig.active.pop(key)
-                        mig.failed.add(key)
-                    # HIT_PENDING: promotion still in flight; leave as-is.
+        # Rotate the starting point so the same migration does not consume the
+        # whole budget every step while later ones never advance.
+        self._migration_cursor += 1
+        budget = _MIGRATION_KEYS_PER_STEP
+        for offset in range(len(active)):
+            if budget <= 0:
+                break
+            mig = active[(self._migration_cursor + offset) % len(active)]
+            budget -= self._advance_migration(mig, budget)
 
+        for mig in active:
             if mig.active and now > mig.deadline:
-                for key, key_state in list(mig.active.items()):
-                    mig.active.pop(key)
-                    if key_state == "promoting":
-                        mig.failed.add(key)
-                    else:
-                        mig.missing.add(key)
-
+                self._expire_migration(mig)
             if not mig.active:
-                terminal = "failed" if mig.failed else "completed"
-                self._finalize_migration(mig, terminal, now)
+                self._finalize_migration(mig, mig.resolve_terminal(), now)
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
@@ -1001,8 +1118,15 @@ class TieringOffloadingManager(OffloadingManager):
         # In-flight primary<->secondary transfers (pending promotions are
         # translated to transfer jobs in on_schedule_end), plus any work the
         # secondary tiers themselves still have outstanding.
-        return bool(self._jobs) or any(
-            tier.has_pending_work() for tier in self.secondary_tiers
+        #
+        # Proactive migrations count too: between steps a migration can have
+        # no transfer job yet (every key still probing), and _drive_migrations
+        # only runs while the engine keeps stepping. Stating it here means a
+        # migration cannot stall even if a tier stops pinning the engine awake.
+        return (
+            bool(self._jobs)
+            or any(mig.terminal is None for mig in self._migrations.values())
+            or any(tier.has_pending_work() for tier in self.secondary_tiers)
         )
 
     @override

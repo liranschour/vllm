@@ -534,6 +534,42 @@ class TestClientFlows:
         assert abort[TYPE_KEY] == AbortFetchMsg.TYPE
         assert abort[AbortFetchMsg.KV_REQUEST_ID] == "req-1"
 
+    def test_finish_request_reports_inflight_load_as_failed(self):
+        """finish_request drops the id's client state, so the peer's AbortAck
+        can never be matched and collect_results can never surface the load.
+        It must hand the aborted job back to the caller instead, or the
+        manager's promotion job stays in flight forever and the primary blocks
+        it reserved are never released."""
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.request_blocks(
+            job_id=11, kv_request_id="req-11", keys=[b"k"], block_ids=[0]
+        )
+        assert session.finish_request("req-11") == [11]
+        # State is gone, so no later poll can surface it a second time.
+        assert session.poll().loads == []
+        assert "req-11" not in session._client._requests
+
+    def test_finish_request_reports_already_aborting_load(self):
+        """A load that already sent AbortFetch on its load timeout is still
+        owed a result: finish_request removes it before the abort-ack timeout
+        could fire, so it must be reported here too."""
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        session.request_blocks(
+            job_id=12, kv_request_id="req-12", keys=[b"k"], block_ids=[0]
+        )
+        _client_load(session, "req-12").submitted_at = (
+            time.monotonic() - _LOAD_TIMEOUT_S - 1.0
+        )
+        assert session.poll().loads == []  # abort sent, awaiting ack
+        assert session.finish_request("req-12") == [12]
+
+    def test_finish_request_with_no_load_reports_nothing(self):
+        session, conn, _ = _make_session()
+        _activate(session, conn)
+        assert session.finish_request("never-seen") == []
+
     def test_active_loads_work_list_tracks_in_flight(self):
         """collect_results / has_active_loads use the _active_loads work-list,
         armed when a fetch is issued and discarded exactly when its load

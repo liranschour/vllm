@@ -13,7 +13,7 @@ import time
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from typing_extensions import override
 
@@ -38,7 +38,7 @@ from vllm.v1.kv_offload.tiering.p2p.session import P2PSession
 
 if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
-    from vllm.v1.kv_offload.tiering.base import ParentManager
+    from vllm.v1.kv_offload.tiering.base import JobId, ParentManager
     from vllm.v1.kv_offload.tiering.p2p.control.base import ControlConnection
 
 logger = init_logger(__name__)
@@ -197,6 +197,10 @@ class P2PSecondaryTierManager(SecondaryTierManager):
     ``has_pending_work()`` keeps the engine ticking so the control transport
     and existing sessions are polled even when no requests are scheduled.
     """
+
+    # Symmetric-P2P consumers address a peer per request, so this tier can
+    # serve a proactive migration. See SecondaryTierManager.supports_migration.
+    supports_migration: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -373,6 +377,18 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             self._get_or_create_session(source.peer_id)
         return RequestOffloadingContext()
 
+    def _fail_aborted_loads(self, aborted_jobs: list[JobId]) -> None:
+        """Surface loads aborted by ``finish_request`` as failed jobs.
+
+        The id's client state is gone, so the peer's AbortAckMsg can no
+        longer be matched. Without this the parent never pops the job and
+        the primary blocks the promotion reserved stay write-pending
+        forever. ``_failed_req_ids`` is deliberately untouched: the request
+        is finished, so no later lookup() will consult it.
+        """
+        for job_id in aborted_jobs:
+            self._finished_jobs.append(JobResult(job_id=job_id, success=False))
+
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
         """Cancels pending loads and prunes session-scoped state.
@@ -401,13 +417,13 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         if source is not None:
             session = self._sessions.get(source.peer_id)
             if session is not None:
-                session.finish_request(kv_request_id)
+                self._fail_aborted_loads(session.finish_request(kv_request_id))
             return
 
         # Prefiller-side finish: identify the session via kv_request_id.
         session = self._kv_to_session.pop(kv_request_id, None)
         if session is not None:
-            session.finish_request(kv_request_id)
+            self._fail_aborted_loads(session.finish_request(kv_request_id))
             return
 
     @override

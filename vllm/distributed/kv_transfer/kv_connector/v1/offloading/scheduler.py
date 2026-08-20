@@ -500,6 +500,8 @@ class OffloadingConnectorScheduler:
         )
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
+        # Proactive migration is not DP-aware; see on_rpc().
+        self._data_parallel_size = vllm_config.parallel_config.data_parallel_size
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -1697,19 +1699,27 @@ class OffloadingConnectorScheduler:
     def on_rpc(self, payload: bytes) -> bytes | None:
         """Dispatch a generic control RPC (proactive P2P migration).
 
-        Returns None when the configured offloading manager cannot migrate
-        (no secondary tiers), so the caller surfaces HTTP 501. Otherwise always
-        returns response bytes; expected errors are encoded in the payload.
+        Returns None when no configured tier can migrate at all, so the caller
+        surfaces HTTP 501. Otherwise always returns response bytes; expected
+        errors are encoded in the payload.
         """
         from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
 
-        from .migration import handle_migration_rpc
+        from .migration import handle_migration_rpc, unsupported_response
 
-        if not (
-            isinstance(self.manager, TieringOffloadingManager)
-            and self.manager.secondary_tiers
+        if not isinstance(self.manager, TieringOffloadingManager) or not any(
+            tier.supports_migration for tier in self.manager.secondary_tiers
         ):
             return None
+
+        if self._data_parallel_size > 1:
+            # The control RPC carries no DP-rank target: the engine-core client
+            # either broadcasts it to every rank or picks one arbitrarily, and
+            # each rank owns its own CPU cache. Either way the blocks cannot be
+            # aimed at the rank that will serve the request, so refuse rather
+            # than prefetch into the wrong one.
+            return unsupported_response("unsupported_topology: data_parallel_size > 1")
+
         return handle_migration_rpc(self.manager, payload)
 
     def shutdown(self) -> None:

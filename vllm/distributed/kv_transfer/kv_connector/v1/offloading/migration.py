@@ -34,9 +34,26 @@ Response objects::
                 "num_blocks": int}  # or {"accepted": False, "error": str}
     poll    -> {"transfer_id": str, "state": str, "blocks_total": int,
                 "blocks_done": int, "blocks_missing": int,
-                "blocks_failed": int, "error": str | None}
+                "blocks_failed": int, "blocks_no_capacity": int,
+                "error": str | None}
     cancel  -> {"transfer_id": str, "cancelled": bool}
     error   -> {"error": str}   # unparseable/invalid envelope
+
+``poll`` states are ``running``, ``completed``, ``failed``, ``cancelled``, and
+``unknown`` (never seen or already reaped). Only ``completed`` means every
+requested block is resident and indexed in the destination CPU cache; a
+migration that timed out, hit a transfer error, or could not be given room
+reports ``failed`` with ``error`` set to ``timeout``, ``transfer_failed``, or
+``insufficient_capacity``. ``blocks_missing`` counts only clean source misses
+(the peer does not hold that hash); ``blocks_no_capacity`` is the subset of
+``blocks_failed`` the destination had no room for.
+
+``migrate`` rejections use ``no_blocks``, ``duplicate_transfer_id``,
+``too_many_migrations``, ``insufficient_capacity``, ``bad_source``,
+``bad_blocks``, or ``too_many_blocks``. Envelope-level refusals are
+``decode_error``, ``malformed``, ``unknown_op``, ``unsupported_version``, and
+``unsupported_topology`` (e.g. ``data_parallel_size > 1``, which the control
+RPC cannot target).
 """
 
 from __future__ import annotations
@@ -44,6 +61,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import msgspec
+import regex as re
 
 from vllm.logger import init_logger
 
@@ -59,8 +77,17 @@ OP_POLL = "poll"
 OP_CANCEL = "cancel"
 
 # Upper bound on blocks per migrate request; the connector must bound its own
-# input since vLLM performs no schema validation on opaque payloads.
-MAX_BLOCKS_PER_MIGRATE = 100_000
+# input since vLLM performs no schema validation on opaque payloads. The real
+# limit is the destination's CPU capacity, which ``submit_migration`` checks and
+# rejects with ``insufficient_capacity``; this is a sanity ceiling that keeps a
+# malformed payload from allocating a huge dict before that check runs.
+MAX_BLOCKS_PER_MIGRATE = 16_384
+
+# ``transfer_id`` is orchestrator-supplied, goes onto the wire verbatim as the
+# ``kv_request_id``, and is used in a request id and log lines. Bound its length
+# and charset rather than trusting the caller.
+MAX_TRANSFER_ID_LEN = 128
+_TRANSFER_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]+\Z")
 
 
 def _encode(obj: dict[str, Any]) -> bytes:
@@ -90,6 +117,12 @@ def handle_migration_rpc(manager: TieringOffloadingManager, payload: bytes) -> b
     if not isinstance(msg, dict):
         return _error("malformed: expected a msgpack object")
 
+    # A missing "v" is treated as version 1 (the only version shipped); an
+    # explicit mismatch is refused rather than silently misinterpreted.
+    version = msg.get("v", PROTOCOL_VERSION)
+    if version != PROTOCOL_VERSION:
+        return _error(f"unsupported_version: {version!r}")
+
     op = msg.get("op")
     if op == OP_MIGRATE:
         return _handle_migrate(manager, msg)
@@ -102,9 +135,23 @@ def handle_migration_rpc(manager: TieringOffloadingManager, payload: bytes) -> b
 
 def _require_transfer_id(msg: dict[str, Any]) -> str | None:
     transfer_id = msg.get("transfer_id")
-    if isinstance(transfer_id, str) and transfer_id:
+    if (
+        isinstance(transfer_id, str)
+        and len(transfer_id) <= MAX_TRANSFER_ID_LEN
+        and _TRANSFER_ID_RE.match(transfer_id)
+    ):
         return transfer_id
     return None
+
+
+def unsupported_response(reason: str) -> bytes:
+    """Encode a refusal for a connector that implements the hook but cannot
+    serve this request (e.g. no migratable tier, or an unsupported topology).
+
+    Distinct from returning ``None`` from ``on_rpc``, which means "this
+    connector has no RPC hook at all" and surfaces as HTTP 501.
+    """
+    return _error(reason)
 
 
 def _handle_migrate(manager: TieringOffloadingManager, msg: dict[str, Any]) -> bytes:

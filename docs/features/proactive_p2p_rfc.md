@@ -132,11 +132,20 @@ Response:
 { "transfer_id": "...", "accepted": false, "error": "insufficient_capacity" }
 ```
 
+`num_blocks` is the number of **distinct** blocks accepted; duplicate hashes are
+collapsed so `blocks_total` always reconciles against done/missing/failed.
+Rejections are `no_blocks`, `duplicate_transfer_id`, `too_many_migrations`
+(more than `_MAX_ACTIVE_MIGRATIONS` already in flight), `insufficient_capacity`
+(more blocks than the destination CPU tier could hold even after eviction),
+`bad_source`, `bad_blocks`, and `too_many_blocks`.
+
 `transfer_id` is **allocated by the orchestrator**, mirroring today's
 `pd_req_id` / `kv_request_id` convention. This keeps `poll` idempotent and lets
-the orchestrator correlate without a returned-handle race. Submit is
-**non-blocking**: it reserves CPU slots, registers the migration, and returns;
-the `LookupMsg`/`FetchMsg` are sent on the next poll sweep.
+the orchestrator correlate without a returned-handle race. It is bounded to
+`MAX_TRANSFER_ID_LEN` characters of `[A-Za-z0-9._:-]` since it goes on the wire
+verbatim as the `kv_request_id`. Submit is **non-blocking**: it checks capacity,
+registers the migration, and returns; the `LookupMsg`/`FetchMsg` are sent on the
+next poll sweep.
 
 ### `poll` — status (→ destination)
 
@@ -149,17 +158,32 @@ Response:
 ```jsonc
 {
   "transfer_id": "...",
-  "state": "pending" | "running" | "completed" | "failed" | "unknown",
-  "blocks_total":   128,
-  "blocks_done":    128,
-  "blocks_missing":   0,   // source did not hold these hashes
-  "error": null            // or a short reason string when state == "failed"
+  "state": "running" | "completed" | "failed" | "cancelled" | "unknown",
+  "blocks_total":       128,
+  "blocks_done":        128,
+  "blocks_missing":       0,   // source did not hold these hashes
+  "blocks_failed":        0,   // transfer error, timeout, or no room
+  "blocks_no_capacity":   0,   // subset of blocks_failed: no room locally
+  "error": null                // short reason when state is failed|cancelled
 }
 ```
 
-`completed` means the blocks are **resident and indexed in the destination CPU
-cache**; the orchestrator may now route the request. `unknown` is returned for a
-`transfer_id` the destination has never seen or has already reaped.
+`completed` means **every** requested block is resident and indexed in the
+destination CPU cache; the orchestrator may now route the request. A clean
+source miss (`blocks_missing`) is the only shortfall that still reports
+`completed` — the peer simply does not hold those hashes, and no amount of
+waiting changes that.
+
+Anything else is `failed`, with `error` set to `timeout` (probes or transfers
+unresolved past the deadline — we never learned whether the peer had them),
+`insufficient_capacity` (a tier held the block but the CPU tier could not make
+room), or `transfer_failed`. This distinction matters: reporting a timed-out or
+capacity-starved migration as `completed` would send the orchestrator to a cold
+cache believing it was warm.
+
+`cancelled` is returned for a migration the orchestrator aborted. `unknown` is
+returned for a `transfer_id` the destination has never seen or has already
+reaped.
 
 ### `cancel` — optional (→ destination)
 
@@ -168,7 +192,14 @@ cache**; the orchestrator may now route the request. `unknown` is returned for a
 ```
 
 Aborts in-flight transfers (`AbortFetchMsg` + `DataTransport.cancel`) and frees
-reserved CPU slots. Response: `{ "transfer_id": "...", "cancelled": true }`.
+reserved CPU slots. Response: `{ "transfer_id": "...", "cancelled": true }`, or
+`cancelled: false` for an id that is unknown or already terminal.
+
+Freeing the slots is not automatic: the aborted fetch can no longer be acked by
+the peer, so `ClientRole.finish` hands each aborted load back and the P2P tier
+reports it as a failed job. That is what lets the tiering manager pop the
+promotion and release the CPU blocks it had reserved; without it they stay
+write-pending forever and the next `reset_cache()` trips its assertions.
 
 ## Transport & call chain
 
@@ -188,11 +219,20 @@ POST /v1/kv_connector/rpc (migrate|poll|cancel bytes)
 `on_rpc` runs synchronously in the EngineCore busy loop between model steps, so
 every handler is **non-blocking**: `migrate` opens the peer session + registers
 state, `poll`/`cancel` read/flip registry state. The transfer itself advances on
-the scheduler thread via the existing per-step `on_schedule_end()` sweep —
-`P2PSecondaryTierManager.has_pending_work()` already returns `True`
-unconditionally (so `OffloadingConnectorScheduler.has_pending_push_work()` stays
-`True`), keeping the engine stepping — and thus driving migrations — with or
-without request traffic.
+the scheduler thread via the existing per-step `on_schedule_end()` sweep.
+
+`TieringOffloadingManager.has_pending_work()` reports a non-terminal migration
+as pending work, so `OffloadingConnectorScheduler.has_pending_push_work()` stays
+`True` and the engine keeps stepping with or without request traffic. (The P2P
+tier also returns `True` unconditionally today, which would mask a gap here; the
+migration registry states the requirement itself rather than relying on that.)
+
+Because the sweep runs inside the scheduler step, it is budgeted: at most
+`_MIGRATION_KEYS_PER_STEP` keys are advanced per step across all migrations,
+with a rotating start so a large prefetch cannot starve a later one. A migration
+of many thousands of blocks therefore costs many cheap steps rather than one
+long stall — otherwise "off the critical path" would be false for exactly the
+requests the prefetch is meant to help.
 
 ## New / changed surfaces
 
@@ -260,7 +300,16 @@ and *unexpected* failures:
   orchestrator handles these as data, not exceptions.
 - **Truly unexpected** errors let the handler raise → **HTTP 500** (#51639 never
   swallows exceptions).
-- **No P2P tier configured** → `on_rpc` returns `None` → **HTTP 501**.
+- **No migration-capable tier configured** → `on_rpc` returns `None` →
+  **HTTP 501**. The gate is `SecondaryTierManager.supports_migration`, which
+  only the P2P tier sets: a local or shared store has no peer to pull from, so
+  accepting a migrate against one would report `completed` for something that
+  was never a migration.
+- **`data_parallel_size > 1`** → refused in-payload with
+  `unsupported_topology`. The control RPC carries no DP-rank target: the
+  engine-core client either broadcasts it to every rank or picks one
+  arbitrarily, and each rank owns a separate CPU cache, so the blocks cannot be
+  aimed at the rank that will serve the request.
 - **No connector at all** → **HTTP 404** (detected by #51639 before dispatch).
 
 ## MultiConnector

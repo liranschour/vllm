@@ -134,6 +134,12 @@ class SecondaryTierManager(ABC):
 
     medium: ClassVar[Medium | None] = None
 
+    # Whether this tier can pull a named set of blocks from a named remote
+    # peer, which is what a proactive migration (control-RPC driven) needs.
+    # Only tiers that fetch from a peer addressed at request time can; a
+    # local or shared store has no peer to pull from.
+    supports_migration: ClassVar[bool] = False
+
     def __init__(
         self,
         offloading_spec: "OffloadingSpec",

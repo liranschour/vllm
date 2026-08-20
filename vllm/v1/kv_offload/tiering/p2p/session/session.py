@@ -210,16 +210,21 @@ class P2PSession:
         """New blocks stored locally — match against pending fetch demand."""
         self._server.add_stored_blocks(kv_request_id, keys, block_ids, job_id)
 
-    def finish_request(self, kv_request_id: str) -> None:
+    def finish_request(self, kv_request_id: str) -> list[JobId]:
         """Called when the request is finishing locally.
 
         Finishes the client role (aborts any inbound load and drops any
         pending symmetric-P2P lookup state) and finalizes any outbound
         serving (server role) for this id. Roles that aren't active for
         this id are silent no-ops.
+
+        Returns:
+            The ``job_id`` of every inbound load aborted here, which the
+            caller must fail. See ``ClientRole.finish``.
         """
-        self._client.finish(kv_request_id)
+        aborted_jobs = self._client.finish(kv_request_id)
         self._server.finish(kv_request_id)
+        return aborted_jobs
 
     def register_lookup(self, kv_request_id: str, key: bytes) -> bool | None:
         """Register or resolve one (kv_request_id, key) probe.
