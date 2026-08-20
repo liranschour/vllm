@@ -22,8 +22,9 @@ import asyncio
 import itertools
 import logging
 import os
+import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import httpx
 from fastapi import FastAPI, Request
@@ -31,6 +32,20 @@ from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+# Imports used only by --proactive mode (KV-events subscription + migrate RPC).
+# Kept lazy-friendly at module scope; both are vLLM deps present in the venv.
+try:
+    import msgspec
+    import zmq
+    import zmq.asyncio
+
+    from vllm.distributed.kv_events import BlockStored, KVEventBatch
+
+    _PROACTIVE_IMPORTS_OK = True
+except Exception as _exc:  # pragma: no cover - only hit on a broken env
+    _PROACTIVE_IMPORTS_OK = False
+    _PROACTIVE_IMPORT_ERR = _exc
 
 
 @asynccontextmanager
@@ -80,7 +95,34 @@ async def lifespan(app: FastAPI):
     )
     app.state.decode_dp_iterator = itertools.cycle(range(global_args.decoder_dp_size))
 
-    mode = "decoder-first" if global_args.decoder_first else "prefiller-first"
+    # Proactive mode: subscribe to the prefiller's KV-cache events so we can
+    # learn which OffloadKeys it stored and migrate them to the decoder.
+    app.state.proactive = global_args.proactive
+    app.state.collector = None  # set to a list while a migration is capturing
+    app.state.migration_lock = asyncio.Lock()
+    app.state.kv_sub_task = None
+    app.state.kv_ctx = None
+    if global_args.proactive:
+        if not _PROACTIVE_IMPORTS_OK:
+            raise RuntimeError(
+                f"--proactive needs zmq + msgspec + vllm importable: "
+                f"{_PROACTIVE_IMPORT_ERR}"
+            )
+        app.state.kv_ctx = zmq.asyncio.Context()
+        sub = app.state.kv_ctx.socket(zmq.SUB)
+        sub.connect(global_args.kv_events_endpoint)
+        sub.setsockopt_string(zmq.SUBSCRIBE, global_args.kv_events_topic)
+        app.state.kv_sub_task = asyncio.create_task(_kv_events_loop(app, sub))
+        print(
+            f"Proactive: subscribed to KV events at "
+            f"{global_args.kv_events_endpoint} topic={global_args.kv_events_topic!r}"
+        )
+
+    mode = (
+        "proactive"
+        if global_args.proactive
+        else ("decoder-first" if global_args.decoder_first else "prefiller-first")
+    )
     if global_args.p2p:
         mode += ",p2p"
     pd_host = global_args.p2p_connector_host
@@ -95,6 +137,12 @@ async def lifespan(app: FastAPI):
     )
     yield
 
+    if app.state.kv_sub_task is not None:
+        app.state.kv_sub_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await app.state.kv_sub_task
+    if app.state.kv_ctx is not None:
+        app.state.kv_ctx.destroy(linger=0)
     for ci in app.state.prefill_clients:
         await ci["client"].aclose()
     for ci in app.state.decode_clients:
@@ -172,7 +220,41 @@ def parse_args():
         help="Data-parallel replica count of the decoder. When >1 the proxy "
         "round-robins decode across ranks via the X-data-parallel-rank header.",
     )
+    p.add_argument(
+        "--proactive",
+        action="store_true",
+        help="Proactive P2P mode: (1) prefill on the prefiller, (2) subscribe to "
+        "the prefiller's KV-cache events to learn the stored blocks, trigger a "
+        "proactive migration on the decoder via POST /v1/kv_connector/rpc so it "
+        "pulls those blocks into its CPU cache, (3) send a plain decode request "
+        "to the decoder, which serves it from the prefetched cache. Requires the "
+        "prefiller to run with kv-cache events enabled and "
+        "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=0.",
+    )
+    p.add_argument(
+        "--kv-events-endpoint",
+        type=str,
+        default=None,
+        help="ZMQ PUB endpoint of the prefiller's KV-cache events, e.g. "
+        "tcp://127.0.0.1:5557 (proactive mode only).",
+    )
+    p.add_argument(
+        "--kv-events-topic",
+        type=str,
+        default="kv-events",
+        help="KV-cache events subscription topic (must match the prefiller's "
+        "--kv-events-config topic; proactive mode only).",
+    )
+    p.add_argument(
+        "--migration-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to poll a proactive migration before giving up "
+        "(proactive mode only).",
+    )
     args = p.parse_args()
+    if args.proactive and not args.kv_events_endpoint:
+        raise ValueError("--proactive requires --kv-events-endpoint")
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
         raise ValueError("Prefiller host/port count mismatch")
     if len(args.decoder_hosts) != len(args.decoder_ports):
@@ -216,7 +298,10 @@ def _auth_headers(request_id: str) -> dict:
 async def _prefill(client_info, endpoint, req_data, request_id, dp_rank=None):
     """Send a prefill-only request (max_tokens=1) to the prefiller."""
     data = req_data.copy()
-    if global_args.p2p:
+    if global_args.p2p or global_args.proactive:
+        # p2p: decoder pulls reactively. proactive: decoder pulls via an
+        # explicit migrate RPC. Either way the prefiller just offloads to its
+        # own CPU tier — no remote_decoder push target.
         data.pop("kv_transfer_params", None)
     else:
         data["kv_transfer_params"] = {
@@ -386,7 +471,179 @@ async def _handle_completions_decoder_first(api: str, request: Request):
         raise
 
 
+# ---------------------------------------------------------------------------
+# Proactive P2P migration
+# ---------------------------------------------------------------------------
+
+
+def _offload_key_from_event(ev) -> bytes | None:
+    """Reconstruct the OffloadKey bytes from a CPU BlockStored event.
+
+    OffloadKey == block_hash_bytes + group_idx.to_bytes(4, "big") (see
+    make_offload_key in vllm/v1/kv_offload/base.py). The event's last block
+    hash is the chunk's key hash (placeholder events carry exactly one). Only
+    CPU-tier events are relevant; GPU prefix-cache events share the batch.
+    Returns None for anything that isn't a usable CPU store key — including
+    int-mode hashes (VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES must be 0).
+    """
+    if not isinstance(ev, BlockStored):
+        return None
+    if ev.medium != "CPU" or ev.group_idx is None or not ev.block_hashes:
+        return None
+    h = ev.block_hashes[-1]
+    if not isinstance(h, (bytes, bytearray)):
+        return None
+    return bytes(h) + int(ev.group_idx).to_bytes(4, "big", signed=False)
+
+
+async def _kv_events_loop(app, sub):
+    """Background task: decode KV-events and, while a migration is capturing,
+    append reconstructed CPU OffloadKeys to the active collector."""
+    decoder = msgspec.msgpack.Decoder(type=KVEventBatch)
+    try:
+        while True:
+            frames = await sub.recv_multipart()  # (topic, seq, payload)
+            try:
+                batch = decoder.decode(frames[-1])
+            except Exception as exc:
+                logger.warning("KV event decode failed: %s", exc)
+                continue
+            collector = app.state.collector
+            if collector is None:
+                continue
+            for ev in batch.events:
+                key = _offload_key_from_event(ev)
+                if key is not None:
+                    collector.append(key)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        sub.close(linger=0)
+
+
+async def _rpc_call(host: str, port, obj: dict) -> dict:
+    """POST a msgpack control-RPC to a server's /v1/kv_connector/rpc."""
+    url = f"http://{host}:{port}/v1/kv_connector/rpc"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            url,
+            content=msgspec.msgpack.encode(obj),
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        resp.raise_for_status()
+        return msgspec.msgpack.decode(resp.content)
+
+
+async def _poll_migration(host: str, port, transfer_id: str) -> bool:
+    """Poll a migration to a terminal state. Returns True iff completed with
+    at least one block landed."""
+    deadline = time.monotonic() + global_args.migration_timeout
+    while time.monotonic() < deadline:
+        st = await _rpc_call(host, port, {"op": "poll", "transfer_id": transfer_id})
+        state = st.get("state")
+        if state in ("completed", "failed", "unknown"):
+            done = st.get("blocks_done") or 0
+            # print (not logger): the module logger's INFO records do not reach
+            # the proxy's stdout log under uvicorn's logging config, and the e2e
+            # test greps this line for the migration outcome.
+            print(
+                f"MIGRATION transfer_id={transfer_id} state={state} "
+                f"blocks_done={done} blocks_missing={st.get('blocks_missing')} "
+                f"blocks_failed={st.get('blocks_failed')}",
+                flush=True,
+            )
+            return state == "completed" and done > 0
+        await asyncio.sleep(0.1)
+    print(f"MIGRATION transfer_id={transfer_id} state=timeout", flush=True)
+    return False
+
+
+async def _handle_completions_proactive(api: str, request: Request):
+    """Proactive flow: prefill -> capture KV-event block keys -> migrate to the
+    decoder -> poll -> plain decode (served from the prefetched CPU cache)."""
+    try:
+        req_data = await request.json()
+        request_id = str(uuid.uuid4())
+
+        prefill_rank, prefill_hdr = _next_dp_rank(request.app, "prefill")
+        decode_rank, decode_hdr = _next_dp_rank(request.app, "decode")
+        prefill_client = _get_next(request.app, "prefill")
+        decode_client = _get_next(request.app, "decode")
+        dhost, dport = decode_client["host"], decode_client["port"]
+
+        # Serialize the capture+migrate window so KV events map to this request.
+        async with request.app.state.migration_lock:
+            collector: list[bytes] = []
+            request.app.state.collector = collector
+            try:
+                await _prefill(
+                    prefill_client, api, req_data, request_id, dp_rank=prefill_hdr
+                )
+                await asyncio.sleep(0.3)  # drain trailing events
+            finally:
+                request.app.state.collector = None
+
+            keys = list(dict.fromkeys(collector))  # dedup, keep order
+            print(
+                f"proactive {request_id}: captured {len(keys)} CPU block key(s) "
+                f"from prefill",
+                flush=True,
+            )
+
+            if keys:
+                source = {
+                    "host": global_args.p2p_connector_host,
+                    "port": global_args.p2p_connector_port + prefill_rank,
+                }
+                ack = await _rpc_call(
+                    dhost,
+                    dport,
+                    {
+                        "op": "migrate",
+                        "transfer_id": request_id,
+                        "source": source,
+                        "blocks": keys,
+                    },
+                )
+                if ack.get("accepted"):
+                    await _poll_migration(dhost, dport, request_id)
+                else:
+                    print(
+                        f"proactive {request_id}: migrate rejected: {ack}",
+                        flush=True,
+                    )
+            else:
+                print(
+                    f"proactive {request_id}: no CPU blocks captured; "
+                    f"decode will recompute",
+                    flush=True,
+                )
+
+        # Plain decode: no kv_transfer_params, so the decoder serves from the
+        # CPU cache the migration just populated (or recomputes on a miss).
+        decode_data = req_data.copy()
+        decode_data.pop("kv_transfer_params", None)
+
+        async def generate():
+            async for chunk in _stream_decode(
+                decode_client, api, decode_data, request_id, dp_rank=decode_hdr
+            ):
+                yield chunk
+
+        return StreamingResponse(generate(), media_type="application/json")
+
+    except Exception as e:
+        import sys
+        import traceback
+
+        print(f"Proxy error on {api}: {e}")
+        print("".join(traceback.format_exception(*sys.exc_info())))
+        raise
+
+
 def _route_handler(api: str):
+    if global_args.proactive:
+        return lambda req: _handle_completions_proactive(api, req)
     if global_args.decoder_first:
         return lambda req: _handle_completions_decoder_first(api, req)
     return lambda req: _handle_completions(api, req)
