@@ -20,8 +20,11 @@ Architecture
         ├── mark_dead() — signal that the peer is gone
         └── close()     — tear down the connection
 
-Threading model: all I/O is driven by the caller invoking poll().
-No background threads. poll() must be called periodically to:
+Threading model: all I/O is driven by the caller invoking poll(). No
+background threads of its own, and no internal locking, so callers must
+serialize their own access — the P2P tier does so with the tiering manager's
+executor lock. Sockets in particular are not thread-safe, so a caller must
+never poll one from a second thread. poll() must be called periodically to:
   - receive messages (buffered per-connection)
   - accept new inbound peers
   - detect disconnections

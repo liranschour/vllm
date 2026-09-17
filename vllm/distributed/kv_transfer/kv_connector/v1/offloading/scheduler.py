@@ -1741,8 +1741,6 @@ class OffloadingConnectorScheduler:
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
         )
-        self.manager.on_schedule_end(schedule_end_context)
-
         # Flush jobs for preempted requests.
         for req_id in scheduler_output.preempted_req_ids or ():
             req_status = self._req_status.get(req_id)
@@ -1787,6 +1785,12 @@ class OffloadingConnectorScheduler:
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
+
+        # Last manager call of the schedule phase, deliberately. on_schedule_end
+        # releases the tiering manager's executor lock, so anything calling the
+        # manager after it would re-take the lock and hold it across the model
+        # execution wait — which is exactly the window a tier's own thread needs.
+        self.manager.on_schedule_end(schedule_end_context)
         return meta
 
     def has_pending_push_work(self) -> bool:

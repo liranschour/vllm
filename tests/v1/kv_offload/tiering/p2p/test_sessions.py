@@ -13,7 +13,7 @@ completes its own load.
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import pytest
@@ -221,9 +221,9 @@ class FakeParent:
     ``stored`` and removing it from ``pending``/``retry``). ``calls``
     captures every parent invocation in order for assertions.
 
-    Injected per-step via ``session.serve_external_requests(parent)`` —
-    not held by the session, matching how ``TieringOffloadingManager``
-    hands the tier a handle valid only for that call.
+    Bound at session construction and held for its lifetime, matching how
+    ``TieringOffloadingManager`` hands each tier a parent handle via
+    ``bind_parent``.
     """
 
     def __init__(
@@ -280,6 +280,8 @@ def _make_session(
     peer_id: str = "peer:8000",
     local_id: str = "local:9000",
     local_hash_seed: str = _DEFAULT_HASH_SEED,
+    parent: FakeParent | None = None,
+    is_draining: Callable[[], bool] | None = None,
 ) -> tuple[P2PSession, FakeConnection, FakeDataTransport]:
     if conn is None:
         conn = FakeConnection(peer_id=peer_id)
@@ -292,13 +294,15 @@ def _make_session(
         local_block_len=transport.block_len,
         local_hash_seed=local_hash_seed,
         conn=conn,  # type: ignore[arg-type]
+        parent=parent,  # type: ignore[arg-type]
+        is_draining=is_draining,
     )
     return session, conn, transport
 
 
-def _serve(session: P2PSession, parent: FakeParent) -> None:
-    """Resolve enqueued inbound lookups, as the manager does each step."""
-    session.serve_external_requests(parent)  # type: ignore[arg-type]
+def _repoll(session: P2PSession) -> None:
+    """Re-poll parked HIT_PENDING / RETRY keys, as the control sweep does."""
+    session.repoll_lookups()
 
 
 def _activate(
@@ -1014,12 +1018,12 @@ class TestLookupFlow:
         fetches = [m for m in conn._sent[sent_before:] if m[TYPE_KEY] == FetchMsg.TYPE]
         assert fetches == []
 
-    def test_server_lookup_deferred_until_serve_then_all_misses(self):
-        """``poll()`` only enqueues an inbound LookupMsg — no response is
-        sent until ``serve_external_requests``. With an all-miss parent
-        the aggregated LookupRespMsg carries the same keys and
-        ``hits=[False, ...]``."""
-        session, conn, _ = _make_session()
+    def test_server_lookup_answered_inline_all_misses(self):
+        """An inbound LookupMsg is answered during ``poll()`` itself, without
+        waiting for a scheduler step. With an all-miss parent the aggregated
+        LookupRespMsg carries the same keys and ``hits=[False, ...]``."""
+        cb = FakeParent()
+        session, conn, _ = _make_session(parent=cb)
         _activate(session, conn)
 
         sent_before = len(conn._sent)
@@ -1032,14 +1036,6 @@ class TestLookupFlow:
             }
         )
         session.poll()
-
-        # Dispatch alone must not answer — the parent handle is only valid
-        # during serve_external_requests.
-        assert [
-            m for m in conn._sent[sent_before:] if m[TYPE_KEY] == LookupRespMsg.TYPE
-        ] == []
-
-        _serve(session, FakeParent())
 
         resps = [
             m for m in conn._sent[sent_before:] if m[TYPE_KEY] == LookupRespMsg.TYPE
@@ -1054,8 +1050,9 @@ class TestLookupFlow:
 # ---------------------------------------------------------------------------
 # Server-side handling of inbound LookupMsg (ParentManager-driven)
 #
-# poll() only enqueues the LookupMsg; serve_external_requests(parent)
-# resolves it. Tests follow the poll() → _serve() pattern.
+# poll() resolves the LookupMsg inline against the bound parent. _repoll()
+# stands in for the control sweep's slower pass over keys another tier left
+# HIT_PENDING / RETRY.
 # ---------------------------------------------------------------------------
 
 
@@ -1074,19 +1071,132 @@ def _lookup_resps(conn: FakeConnection, since: int = 0) -> list[dict]:
     return [m for m in conn._sent[since:] if m[TYPE_KEY] == LookupRespMsg.TYPE]
 
 
+class _RaisingParent(FakeParent):
+    """Parent whose lookup() fails, standing in for a fault inside the manager.
+
+    The real ones are reachable: a cache assertion, or a KeyError on
+    per-request state. What matters is that they are *our* fault, not the
+    peer's.
+    """
+
+    def __init__(self, exc: BaseException | None = None) -> None:
+        super().__init__()
+        self._exc = exc or RuntimeError("tiering manager exploded")
+
+    def lookup(self, key, ctx):
+        self.calls.append(("lookup", key))
+        raise self._exc
+
+
+class TestInlineLookupFaultIsolation:
+    """A manager fault during inline resolution must not be charged to the peer.
+
+    Resolving inbound lookups during dispatch puts parent calls on the path
+    where _on_message counts exceptions: ValueError disconnects immediately and
+    anything else disconnects after _MAX_CONSECUTIVE_DISPATCH_ERRORS. Left
+    unguarded, a bug on our side would drop an innocent peer's session.
+    """
+
+    def test_parent_failure_answers_all_miss_and_keeps_session(self):
+        cb = _RaisingParent()
+        session, conn, _ = _make_session(parent=cb)
+        _activate(session, conn)
+
+        sent_before = len(conn._sent)
+        _send_lookup(conn, "req-1", [b"hA", b"hB"])
+        session.poll()
+
+        # The peer gets a usable answer and falls back to local prefill.
+        resps = _lookup_resps(conn, sent_before)
+        assert len(resps) == 1
+        assert resps[0][LookupRespMsg.KEYS] == [b"hA", b"hB"]
+        assert resps[0][LookupRespMsg.HITS] == [False, False]
+
+        # The synthetic ctx is released, or the manager leaks per-request state.
+        assert [c for c in cb.calls if c[0] == "on_request_finished"]
+
+        # Not counted against the peer, and the session survives.
+        assert session._dispatch_error_count == 0
+        assert session.alive
+
+    def test_parent_failure_leaves_no_parked_lookup(self):
+        """A failed lookup must not stay parked, or it is re-polled forever."""
+        cb = _RaisingParent()
+        session, conn, _ = _make_session(parent=cb)
+        _activate(session, conn)
+
+        _send_lookup(conn, "req-1", [b"hA"])
+        session.poll()
+
+        assert _srv_lookups(session) == []
+
+    def test_repeated_parent_failures_do_not_disconnect(self):
+        """Even a persistently broken manager must not kill the peer session."""
+        cb = _RaisingParent()
+        session, conn, _ = _make_session(parent=cb)
+        _activate(session, conn)
+
+        for i in range(_MAX_CONSECUTIVE_DISPATCH_ERRORS + 2):
+            _send_lookup(conn, f"req-{i}", [b"hA"])
+            session.poll()
+
+        assert session._dispatch_error_count == 0
+        assert session.alive
+
+    def test_malformed_lookup_still_disconnects(self):
+        """The peer-fault path must keep working: a bad message is still fatal."""
+        cb = FakeParent()
+        session, conn, _ = _make_session(parent=cb)
+        _activate(session, conn)
+
+        # KEYS must be a list; a string is a protocol violation.
+        conn.enqueue(
+            {
+                TYPE_KEY: LookupMsg.TYPE,
+                LookupMsg.ROUND_SEQ: 0,
+                LookupMsg.KV_REQUEST_ID: "req-1",
+                LookupMsg.KEYS: "not-a-list",
+            }
+        )
+        session.poll()
+
+        assert not session.alive
+
+    def test_draining_answers_all_miss_without_touching_parent(self):
+        """While the manager resets, a lookup is answered without querying it.
+
+        drain_jobs() sweeps on the scheduler thread while reset_cache holds the
+        lock, so dispatch can land mid-reset. All-miss is also the honest answer
+        there: the blocks being asked about are on their way out.
+        """
+        cb = FakeParent(stored={b"hA": 1})
+        draining = True
+        session, conn, _ = _make_session(parent=cb, is_draining=lambda: draining)
+        _activate(session, conn)
+
+        sent_before = len(conn._sent)
+        _send_lookup(conn, "req-1", [b"hA"])
+        session.poll()
+
+        resps = _lookup_resps(conn, sent_before)
+        assert len(resps) == 1
+        assert resps[0][LookupRespMsg.HITS] == [False]
+        assert cb.calls == [], "parent was consulted during a reset"
+
+
 class TestServerLookupHandling:
     def test_immediate_hits_create_one_store_job(self):
         """All-HIT batch: one create_store_job call with all keys, one
         LookupRespMsg with hits=[True]*N, on_request_finished fires at the
         end of serve, and `available` is populated for the eventual fetch."""
         cb = FakeParent(stored={b"hA": 1, b"hB": 2, b"hC": 3})
-        session, conn, _ = _make_session()
+        session, conn, _ = _make_session(parent=cb)
         _activate(session, conn)
 
         sent_before = len(conn._sent)
         _send_lookup(conn, "req-1", [b"hA", b"hB", b"hC"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
 
         resps = _lookup_resps(conn, sent_before)
         assert len(resps) == 1
@@ -1110,13 +1220,13 @@ class TestServerLookupHandling:
         """All-MISS batch: no create_store_job call; one LookupRespMsg
         with hits=[False]*N; on_request_finished fires at end of serve."""
         cb = FakeParent()
-        session, conn, _ = _make_session()
+        session, conn, _ = _make_session(parent=cb)
         _activate(session, conn)
 
         sent_before = len(conn._sent)
         _send_lookup(conn, "req-1", [b"hA", b"hB"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
 
         resps = _lookup_resps(conn, sent_before)
         assert len(resps) == 1
@@ -1134,13 +1244,13 @@ class TestServerLookupHandling:
             pending={b"hB"},
             retry={b"hD"},
         )
-        session, conn, _ = _make_session()
+        session, conn, _ = _make_session(parent=cb)
         _activate(session, conn)
 
         sent_before = len(conn._sent)
         _send_lookup(conn, "req-1", [b"hA", b"hB", b"hC", b"hD"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
 
         # No LookupRespMsg yet — hB and hD are still pending.
         assert _lookup_resps(conn, sent_before) == []
@@ -1159,13 +1269,13 @@ class TestServerLookupHandling:
         HIT (the second HIT is pinned when it resolves, not when the
         response goes out)."""
         cb = FakeParent(stored={b"hA": 1}, pending={b"hB"})
-        session, conn, _ = _make_session()
+        session, conn, _ = _make_session(parent=cb)
         _activate(session, conn)
 
         sent_before = len(conn._sent)
         _send_lookup(conn, "req-1", [b"hA", b"hB"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
         # No response yet — hB still pending.
         assert _lookup_resps(conn, sent_before) == []
 
@@ -1173,8 +1283,8 @@ class TestServerLookupHandling:
         cb.pending.discard(b"hB")
         cb.stored[b"hB"] = 2
 
-        # Drive resolver via a second serve_external_requests.
-        _serve(session, cb)
+        # Drive the resolver again via a second re-poll pass.
+        _repoll(session)
 
         resps = _lookup_resps(conn, sent_before)
         assert len(resps) == 1
@@ -1195,13 +1305,13 @@ class TestServerLookupHandling:
         ``deadline`` is force-MISS and never pinned; the deferred
         aggregate response fires with hits=[False]."""
         cb = FakeParent(pending={b"hA"})
-        session, conn, _ = _make_session()
+        session, conn, _ = _make_session(parent=cb)
         _activate(session, conn)
 
         sent_before = len(conn._sent)
         _send_lookup(conn, "req-1", [b"hA"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
         # Initial serve: nothing immediate, lookup parked, no LookupRespMsg.
         assert _lookup_resps(conn, sent_before) == []
 
@@ -1209,7 +1319,7 @@ class TestServerLookupHandling:
         lookup = _srv_lookups(session)[0]
         lookup.deadline = time.monotonic() - 0.1
 
-        _serve(session, cb)
+        _repoll(session)
 
         resps = _lookup_resps(conn, sent_before)
         assert len(resps) == 1
@@ -1222,15 +1332,15 @@ class TestServerLookupHandling:
         """Two LookupMsgs for the same kv_request_id get distinct ctxs
         and two on_request_finished calls (one per batch)."""
         cb = FakeParent(stored={b"hA": 1, b"hB": 2})
-        session, conn, _ = _make_session()
+        session, conn, _ = _make_session(parent=cb)
         _activate(session, conn)
 
         _send_lookup(conn, "req-1", [b"hA"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
         _send_lookup(conn, "req-1", [b"hB"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
 
         finish_calls = [c for c in cb.calls if c[0] == "on_request_finished"]
         assert len(finish_calls) == 2
@@ -1246,12 +1356,12 @@ class TestServerLookupHandling:
         the manager can release the TieringManager's state on its next
         serve."""
         cb = FakeParent(pending={b"hA"})
-        session, conn, _ = _make_session()
+        session, conn, _ = _make_session(parent=cb)
         _activate(session, conn)
 
         _send_lookup(conn, "req-1", [b"hA"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
         assert len(_srv_lookups(session)) == 1
         assert all(c[0] != "on_request_finished" for c in cb.calls)
 
@@ -1263,19 +1373,18 @@ class TestServerLookupHandling:
         assert all(c[0] != "on_request_finished" for c in cb.calls)
 
     def test_wire_finish_drops_pending_batches_for_kv_request_id(self):
-        """``ServerRole.finish(kv_request_id)`` drops every parked batch
-        whose kv_request_id matches and queues its ctx for the next
-        serve's on_request_finished."""
+        """``ServerRole.finish(kv_request_id)`` drops every parked batch whose
+        kv_request_id matches and releases its ctx immediately."""
         cb = FakeParent(pending={b"hA", b"hB"})
-        session, conn, _ = _make_session()
+        session, conn, _ = _make_session(parent=cb)
         _activate(session, conn)
 
         _send_lookup(conn, "req-1", [b"hA"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
         _send_lookup(conn, "req-2", [b"hB"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
         assert len(_srv_lookups(session)) == 2
 
         session._server.finish("req-1")
@@ -1283,30 +1392,29 @@ class TestServerLookupHandling:
         # req-1 batch dropped from parked lookups; its ctx queued for release.
         remaining_kv_request_ids = {b.kv_request_id for b in _srv_lookups(session)}
         assert remaining_kv_request_ids == {"req-2"}
-        queued = session._server._finished_lookup_ctxs
-        assert len(queued) == 1
-        assert ":req-1:" in queued[0].req_id
 
-        # The next serve fires on_request_finished exactly once for req-1.
-        _serve(session, cb)
         finish_calls = [c for c in cb.calls if c[0] == "on_request_finished"]
         assert len(finish_calls) == 1
         assert ":req-1:" in finish_calls[0][1]
 
+        # Releasing is once-only: a later re-poll must not repeat it.
+        _repoll(session)
+        assert len([c for c in cb.calls if c[0] == "on_request_finished"]) == 1
+
     def test_incoming_fetch_drops_pending_lookups_for_kv_request_id(self):
         """A peer FetchMsg terminates the lookup phase for its id: parked
-        lookups with matching kv_request_id are dropped and their
-        ctx queued for on_request_finished; other kv_request_ids untouched."""
+        lookups with matching kv_request_id are dropped and their ctx released
+        during dispatch; other kv_request_ids untouched."""
         cb = FakeParent(pending={b"hA", b"hB"})
-        session, conn, _ = _make_session()
+        session, conn, _ = _make_session(parent=cb)
         _activate(session, conn)
 
         _send_lookup(conn, "req-1", [b"hA"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
         _send_lookup(conn, "req-2", [b"hB"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
         assert len(_srv_lookups(session)) == 2
 
         # Empty FetchMsg: peer signals "lookup phase done" without asking
@@ -1324,28 +1432,26 @@ class TestServerLookupHandling:
 
         remaining_kv_request_ids = {lu.kv_request_id for lu in _srv_lookups(session)}
         assert remaining_kv_request_ids == {"req-2"}
-        # Dispatch queues the ctx but does not call the parent yet.
-        queued = session._server._finished_lookup_ctxs
-        assert len(queued) == 1
-        assert ":req-1:" in queued[0].req_id
 
-        # The next serve fires on_request_finished exactly once for req-1.
-        _serve(session, cb)
+        # Dispatch holds the executor lock, so the release happens right there.
         finish_calls = [c for c in cb.calls if c[0] == "on_request_finished"]
         assert len(finish_calls) == 1
         assert ":req-1:" in finish_calls[0][1]
+
+        _repoll(session)
+        assert len([c for c in cb.calls if c[0] == "on_request_finished"]) == 1
 
     def test_lookup_then_fetch_round_trip_emits_store_result(self):
         """End-to-end: lookup pins primary slots → fetch matches them →
         NIXL transfer completes → StoreResult surfaces with the
         create_store_job's job_id (the engine releases the pin)."""
         cb = FakeParent(stored={b"hA": 7, b"hB": 8})
-        session, conn, transport = _make_session()
+        session, conn, transport = _make_session(parent=cb)
         _activate(session, conn)
 
         _send_lookup(conn, "req-1", [b"hA", b"hB"])
         session.poll()
-        _serve(session, cb)
+        _repoll(session)
         cs = next(c for c in cb.calls if c[0] == "create_store_job")
         # FakeParent issues monotonic job_ids starting at 1000.
         expected_job_id = 1000

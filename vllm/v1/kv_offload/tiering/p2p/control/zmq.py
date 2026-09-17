@@ -43,6 +43,11 @@ def _apply_heartbeat(sock: zmq.Socket) -> None:
     sock.setsockopt(zmq.HEARTBEAT_TTL, _HEARTBEAT_TTL_MS)
 
 
+# Cap on messages parked by a peer that is not draining its socket. Reaching it
+# means the peer is wedged, so failing the send is better than growing forever.
+_MAX_OUTBOX = 4096
+
+
 @dataclass
 class _Sockets:
     dealer: zmq.Socket
@@ -61,6 +66,8 @@ class ZmqConnection(ControlConnection):
         self._dead = False
         self._closed = False
         self._inbox: list[dict] = []
+        # Encoded messages a full send buffer rejected, retried by poll().
+        self._outbox: list[bytes] = []
 
     def send(self, msg: dict) -> None:
         """Send a msgpack-encoded message to this peer."""
@@ -69,7 +76,28 @@ class ZmqConnection(ControlConnection):
                 f"ZmqConnection: send on closed connection to {self.peer_id}"
             )
         data = msgspec.msgpack.encode(msg)
-        self._sockets.dealer.send(data)
+        # NOBLOCK: a DEALER blocks once SNDHWM is reached, and this runs while
+        # the tiering manager's executor lock is held, so a slow peer would
+        # otherwise stall the scheduler for as long as it stayed slow. Park the
+        # message instead and retry on the next sweep.
+        try:
+            self._sockets.dealer.send(data, zmq.NOBLOCK)
+        except zmq.Again:
+            if len(self._outbox) >= _MAX_OUTBOX:
+                raise RuntimeError(
+                    f"ZmqConnection: outbox for {self.peer_id} is full "
+                    f"({_MAX_OUTBOX} messages); peer is not draining"
+                ) from None
+            self._outbox.append(data)
+
+    def flush_outbox(self) -> None:
+        """Retry messages parked by a full send buffer. Called from poll()."""
+        while self._outbox:
+            try:
+                self._sockets.dealer.send(self._outbox[0], zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            self._outbox.pop(0)
 
     def recv(self) -> Sequence[dict]:
         """Drain and return all buffered incoming messages."""
@@ -183,6 +211,11 @@ class ZmqTransport(ControlTransport):
         self._recv_router()
         self._check_monitors()
         self._sweep_dead_connections()
+
+        # Retry anything a full send buffer rejected since the last poll().
+        for open_conn in self._connections.values():
+            if open_conn.alive:
+                open_conn.flush_outbox()
 
         # Create connections for new inbound peers
         new_connections: list[ControlConnection] | None = None

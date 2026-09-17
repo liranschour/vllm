@@ -127,7 +127,7 @@ class ClientRole:
         # kv_request_ids with unsent lookup keys for the next flush to
         # visit — the work-list that keeps flush_pending_lookups from
         # scanning every request each scheduler step. Mirrors the server's
-        # _serve_pending. Populated by register_lookup, drained by
+        # _repoll_pending. Populated by register_lookup, drained by
         # flush_pending_lookups, and discarded on finish/close.
         self._flush_pending: set[str] = set()
         # kv_request_ids with at least one fetch in flight or aborting — the

@@ -10,25 +10,34 @@ state and uses a background thread to execute batch_lookup() calls.
 
 Locking design
 --------------
-There is no explicit lock.  Thread safety is achieved by ownership:
+There is no explicit lock here.  Thread safety is achieved by ownership:
 
-* _lookup_state and _lookup_batch are owned exclusively by the scheduler
-  thread.  lookup(), flush(), and cleanup() read and write them directly.
+* _lookup_state and _lookup_batch are owned by whichever executor holds the
+  tiering manager's ExecutorLock.  lookup(), flush(), and cleanup() read and
+  write them directly, and are reachable only through manager methods, which
+  hold that lock.  That used to mean "the scheduler thread"; it now also
+  admits a tier driving its own thread, which the lock serializes against the
+  scheduler.
 
-* _lookup_queue is written by the scheduler (flush → put_nowait, one item
+* _lookup_queue is written by the lock holder (flush → put_nowait, one item
   per step) and read by the background thread (get).  queue.Queue is
   thread-safe.
 
-* _pending_results is written by the background thread (put) and read by
-  the scheduler (get_nowait inside drain_results).  queue.SimpleQueue is
+* _pending_results is written by the background thread (put) and read by the
+  lock holder (get_nowait inside drain_results).  queue.SimpleQueue is
   thread-safe by design.
 
 lookup() accumulates new keys in _lookup_batch without touching the queue.
 flush() is called once per step from the tier's on_schedule_end(), posting
 the entire batch as a single queue item so the background thread sees one
 batch per step.
-drain_results() is called before any lookup() calls in the same step, so
-lookup() is a pure OrderedDict operation.
+
+drain_results() runs on every lookup() rather than once per step behind a
+flag.  A per-step flag would be consumed by whichever executor called
+lookup() first: a peer-driven lookup arriving between two scheduler steps
+would swallow the drain, and the scheduler's next step would then read stale
+state and answer RETRY for keys whose results had already arrived.  Draining
+an empty SimpleQueue is cheap.
 """
 
 import queue
@@ -99,7 +108,6 @@ class AsyncLookupManager(ABC):
         self._pending_results: queue.SimpleQueue[list[tuple[OffloadKey, int, bool]]] = (
             queue.SimpleQueue()
         )
-        self._need_to_drain: bool = False
 
         self._thread = threading.Thread(
             target=self._worker,
@@ -135,9 +143,7 @@ class AsyncLookupManager(ABC):
             False — block is not present in this tier.
             None  — result not yet available; retry next step.
         """
-        if self._need_to_drain:
-            self.drain_results()
-            self._need_to_drain = False
+        self.drain_results()
         req_id = req_context.req_id
         state = self._lookup_state.get(key)
         if state is None:
@@ -157,7 +163,6 @@ class AsyncLookupManager(ABC):
         the model-execution window, maximising time available before the next
         step's drain_results().  Safe to call with an empty batch (no-op).
         """
-        self._need_to_drain = True
         batch = self._lookup_batch
         self._lookup_batch = []
         batch = [

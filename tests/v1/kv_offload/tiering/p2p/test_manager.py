@@ -117,8 +117,21 @@ def _make_manager() -> P2PSecondaryTierManager:
     mgr._sessions = {}
     mgr._kv_to_session = {}
     mgr._unbound_stores = {}
-    mgr._failed_serve_ctxs = []
+    mgr._parent = None
+    mgr._control_thread = None
+    mgr._draining = False
+    mgr._last_repoll = 0.0
     return mgr
+
+
+def _drive(mgr: P2PSecondaryTierManager) -> list[JobResult]:
+    """Sweep the control plane, then collect results, as the control thread does.
+
+    get_finished_jobs() is a pure handoff — the sweep it used to trigger now
+    belongs to P2PControlThread — so a test that wants a sweep must ask for one.
+    """
+    mgr._poll_once()
+    return list(mgr.get_finished_jobs())
 
 
 def _init_offloading_spec() -> SimpleNamespace:
@@ -268,7 +281,7 @@ def test_on_new_request_policy(monkeypatch, kv_params, expected):
 
 
 # ---------------------------------------------------------------------------
-# Tests for serve_external_requests
+# Tests for releasing a reaped session's lookup ctxs
 # ---------------------------------------------------------------------------
 
 
@@ -293,48 +306,55 @@ class _RecordingParent:
         self.finished.append(ctx.req_id)
 
 
-class _RecordingSession:
-    """Fake P2PSession that records the parent it was served with."""
+class TestReapReleasesFailedServes:
+    def test_reaped_session_ctxs_released_through_bound_parent(self):
+        """A reaped session's unresolved lookup ctxs are released immediately.
 
-    def __init__(self) -> None:
-        self.served_with: list[object] = []
+        Reaping runs inside a turn, so the parent is callable there; this used
+        to be parked until the next serve_external_requests, which was the only
+        window that had a handle.
+        """
 
-    def serve_external_requests(self, parent) -> None:
-        self.served_with.append(parent)
+        class _FakeData:
+            def remove_remote_peer(self, pid):
+                pass
 
-
-class TestServeExternalRequests:
-    def test_flushes_failed_serve_ctxs_then_serves_each_session(self):
-        """serve_external_requests releases the failed serves left by
-        reaped sessions via parent.on_request_finished (clearing the
-        queue), then delegates to every live session with the same parent."""
         mgr = _make_manager()
+        mgr._data = _FakeData()  # type: ignore[assignment]
+        parent = _RecordingParent()
+        mgr._parent = parent  # type: ignore[assignment]
         ctx = ReqContext(req_id="p2p:peer:req-1:lu1")
-        mgr._failed_serve_ctxs = [ctx]
-        sess_a = _RecordingSession()
-        sess_b = _RecordingSession()
-        mgr._sessions = {"a": sess_a, "b": sess_b}  # type: ignore[assignment]
+        mgr._sessions["dead:1"] = _FakeSession(  # type: ignore[assignment]
+            peer_id="dead:1",
+            alive=False,
+            connected=True,
+            close_failed_serves=[ctx],
+        )
 
-        parent = _RecordingParent()
-        mgr.serve_external_requests(parent)  # type: ignore[arg-type]
+        mgr._reap_dead_sessions()
 
-        # Failed serve released and queue cleared.
         assert parent.finished == ["p2p:peer:req-1:lu1"]
-        assert mgr._failed_serve_ctxs == []
-        # Every live session served with the same parent handle.
-        assert sess_a.served_with == [parent]
-        assert sess_b.served_with == [parent]
+        assert "dead:1" not in mgr._sessions
 
-    def test_no_failed_serves_still_serves_sessions(self):
+    def test_reap_without_bound_parent_does_not_raise(self):
+        """Reaping before bind_parent drops the ctxs rather than failing."""
+
+        class _FakeData:
+            def remove_remote_peer(self, pid):
+                pass
+
         mgr = _make_manager()
-        sess = _RecordingSession()
-        mgr._sessions = {"a": sess}  # type: ignore[assignment]
+        mgr._data = _FakeData()  # type: ignore[assignment]
+        mgr._sessions["dead:1"] = _FakeSession(  # type: ignore[assignment]
+            peer_id="dead:1",
+            alive=False,
+            connected=True,
+            close_failed_serves=[ReqContext(req_id="p2p:peer:req-1:lu1")],
+        )
 
-        parent = _RecordingParent()
-        mgr.serve_external_requests(parent)  # type: ignore[arg-type]
+        mgr._reap_dead_sessions()
 
-        assert parent.finished == []
-        assert sess.served_with == [parent]
+        assert "dead:1" not in mgr._sessions
 
 
 # ---------------------------------------------------------------------------
@@ -715,7 +735,7 @@ class TestGetFinished:
         )
         mgr._sessions["dead:1234"] = dead  # type: ignore[assignment]
 
-        results = list(mgr.get_finished_jobs())
+        results = _drive(mgr)
         # 2 baseline + 1 failed load + 2 failed stores
         assert len(results) == 5
         assert JobResult(job_id=10, success=False) in results
@@ -742,7 +762,7 @@ class TestGetFinished:
         )
         mgr._sessions["dead:1234"] = dead  # type: ignore[assignment]
 
-        list(mgr.get_finished_jobs())
+        _drive(mgr)
         assert "dead:1234" not in mgr._sessions
         assert "req-probe-1" in mgr._failed_req_ids
         assert "req-probe-2" in mgr._failed_req_ids
@@ -773,7 +793,7 @@ class TestGetFinished:
             _UnboundStoreBatch(job_id=11, keys=[b"k2"], block_ids=[1]),
         ]
 
-        results = list(mgr.get_finished_jobs())
+        results = _drive(mgr)
 
         assert "req-stale" not in mgr._unbound_stores
         # 2 baseline + 2 buffered stores
@@ -1096,11 +1116,94 @@ class _FakeData:
         pass
 
 
+class TestControlThreadLifecycle:
+    """The control thread is what makes an inbound message not wait for a step.
+
+    It must start only once the engine is really running, must be joined before
+    its transports are torn down, and must never be joined from inside the lock
+    it is waiting for.
+    """
+
+    def test_bind_parent_does_not_start_the_thread(self):
+        """Binding happens during construction, before the KV cache exists.
+
+        A thread started there would also run through the model profile run.
+        """
+        mgr = _make_manager()
+        mgr.bind_parent(_RecordingParent())  # type: ignore[arg-type]
+        assert mgr._control_thread is None
+
+    def test_thread_starts_lazily_on_first_manager_call(self):
+        mgr = _make_manager()
+        mgr.bind_parent(_RecordingParent())  # type: ignore[arg-type]
+        try:
+            list(mgr.get_finished_jobs())
+            assert mgr._control_thread is not None
+            assert mgr._control_thread.is_alive()
+        finally:
+            mgr.stop_executor()
+
+    def test_no_thread_without_a_bound_parent(self):
+        """Without a parent there is no way to take a turn, so no thread."""
+        mgr = _make_manager()
+        list(mgr.get_finished_jobs())
+        assert mgr._control_thread is None
+
+    def test_stop_executor_joins_and_is_idempotent(self):
+        mgr = _make_manager()
+        mgr.bind_parent(_RecordingParent())  # type: ignore[arg-type]
+        list(mgr.get_finished_jobs())
+        thread = mgr._control_thread
+        assert thread is not None
+
+        mgr.stop_executor()
+        assert not thread.is_alive(), "control thread was not joined"
+        assert mgr._control_thread is None
+        mgr.stop_executor()
+
+
+class TestDrainingGuard:
+    def test_drain_jobs_sets_and_clears_the_draining_flag(self):
+        """Inbound lookups must not query a manager that is mid-reset.
+
+        drain_jobs() runs on the scheduler thread while reset_cache holds the
+        executor lock, so dispatch during it would otherwise reach a manager
+        whose caches are being torn down.
+        """
+        mgr = _make_manager()
+        seen: list[bool] = []
+
+        class _Control:
+            def poll(self):
+                seen.append(mgr._is_draining())
+                return []
+
+        mgr._control = _Control()  # type: ignore[assignment]
+        assert not mgr._is_draining()
+
+        mgr.drain_jobs()
+
+        assert seen == [True], "draining flag was not set during the sweep"
+        assert not mgr._is_draining(), "draining flag was not cleared"
+
+    def test_draining_flag_cleared_even_if_the_sweep_raises(self):
+        mgr = _make_manager()
+
+        class _Control:
+            def poll(self):
+                raise RuntimeError("transport exploded")
+
+        mgr._control = _Control()  # type: ignore[assignment]
+        with pytest.raises(RuntimeError):
+            mgr.drain_jobs()
+        assert not mgr._is_draining()
+
+
 def _build_paired_managers() -> tuple[P2PSecondaryTierManager, P2PSecondaryTierManager]:
     """Two managers each acting as both client and server toward the other.
 
     Wires _LoopbackControl pair + per-side _FakeData so transfers complete
-    on the next poll. The test drives polling by calling get_finished_jobs(),
+    on the next poll. The test drives polling with _drive(),
     which invokes _poll_once synchronously on the calling thread.
     """
     mgr_a = _make_manager()
@@ -1187,12 +1290,12 @@ class TestBidirectionalManager:
         )
 
         # 4. Drive several poll iterations on each side. Each
-        # get_finished_jobs() call invokes _poll_once synchronously.
+        # _drive() sweeps synchronously on the calling thread.
         all_a: list[JobResult] = []
         all_b: list[JobResult] = []
         for _ in range(8):
-            all_a.extend(list(mgr_a.get_finished_jobs()))
-            all_b.extend(list(mgr_b.get_finished_jobs()))
+            all_a.extend(_drive(mgr_a))
+            all_b.extend(_drive(mgr_b))
 
         # Both load jobs and both store jobs must complete successfully.
         a_ok = {r.job_id for r in all_a if r.success}
@@ -1588,7 +1691,7 @@ class TestConnectionDeathMidTransfer:
 
         # Drain anything the loopback can deliver synchronously, but stop
         # before the remote side has had time to complete the transfers.
-        list(mgr_a.get_finished_jobs())
+        _drive(mgr_a)
 
         # Sanity: store 900 is parked in unbound_stores, not in any
         # session — the producer no longer learns the peer at store time.
@@ -1605,7 +1708,7 @@ class TestConnectionDeathMidTransfer:
         # session reap and waits for the unbound-store timeout.
         results: list[JobResult] = []
         for _ in range(3):
-            results.extend(list(mgr_a.get_finished_jobs()))
+            results.extend(_drive(mgr_a))
 
         outcomes = {(r.job_id, r.success) for r in results}
         assert (901, False) in outcomes, f"load should fail: {outcomes}"
