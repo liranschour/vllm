@@ -34,6 +34,7 @@ from vllm.v1.kv_offload.tiering.base import (
     TransferJob,
 )
 from vllm.v1.kv_offload.tiering.p2p.control import ControlTransport, ZmqTransport
+from vllm.v1.kv_offload.tiering.p2p.control_thread import P2PControlThread
 from vllm.v1.kv_offload.tiering.p2p.data import DataTransport, NixlTransport
 from vllm.v1.kv_offload.tiering.p2p.session import P2PSession
 
@@ -60,6 +61,20 @@ _SHUTDOWN_DRAIN_TIMEOUT_S = 3.0
 # _drain_inflight_for_shutdown(). Short enough to keep latency low, long
 # enough to avoid busy-spinning the scheduler thread.
 _DRAIN_SLEEP_S = 0.001
+
+# Wait between control sweeps while at least one peer session exists. This is
+# the latency a peer's message waits before being noticed, so it replaces the
+# whole scheduler step it used to wait for.
+_ACTIVE_SWEEP_S = 0.001
+
+# Wait between control sweeps with no sessions at all, where the only thing a
+# sweep can find is a brand-new inbound connection.
+_IDLE_SWEEP_S = 0.02
+
+# Floor between re-polls of parked HIT_PENDING / RETRY lookups. Those only
+# change when another tier completes a transfer, so re-asking at sweep rate
+# would burn lock time to learn nothing.
+_REPOLL_INTERVAL_S = 0.005
 
 
 def _remote_prefiller_params(kv_params: dict | None) -> dict | None:
@@ -193,10 +208,17 @@ class P2PSecondaryTierManager(SecondaryTierManager):
     blocks from the peer) and server-role (serving blocks to the peer)
     over the same control connection.
 
-    Single-threaded: every public method runs on the scheduler thread, and
-    the engine drives polling via ``get_finished_jobs()`` once per step.
-    ``has_pending_work()`` keeps the engine ticking so the control transport
-    and existing sessions are polled even when no requests are scheduled.
+    Threading: a dedicated control thread (``P2PControlThread``) drives the
+    control plane, so an inbound message is served as soon as the scheduler
+    frees the tiering manager's executor lock rather than at the next step
+    boundary. That lock — not thread affinity — is what serializes this tier:
+    the scheduler-facing methods below and the thread's sweep never run at the
+    same time, but they do run on different threads. Anything either does holds
+    the lock, so keep it bounded and off blocking I/O.
+
+    ``has_pending_work()`` still keeps the engine ticking, because the engine
+    remains the only thing that reaps finished jobs back into the tiering
+    manager.
     """
 
     def __init__(
@@ -310,16 +332,49 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         # kv_request_ids that hit a transport/session failure; On load lookup()
         # rejects them so the request falls back to local prefill.
         self._failed_req_ids: set[str] = set()
-        # Synthetic lookup ctxs from reaped sessions still owing a
-        # ``parent.on_request_finished`` (the session's failed_serves). The
-        # dead session had no parent handle at teardown; these are flushed
-        # at the top of the next ``serve_external_requests`` where the
-        # handle is valid.
-        self._failed_serve_ctxs: list[ReqContext] = []
+
+        # Handle for calling back into the tiering manager, bound for this
+        # tier's lifetime by bind_parent(). Sessions get it at construction.
+        self._parent: ParentManager | None = None
+        # Drives the control plane. Started lazily on the first call the
+        # manager makes, not at bind time: the KV cache is not configured when
+        # tiers are constructed, so a thread started there would also run
+        # through the profile run.
+        self._control_thread: P2PControlThread | None = None
+        # Set while drain_jobs() sweeps on the scheduler thread, so inbound
+        # lookups are answered without calling a manager that is mid-reset.
+        self._draining: bool = False
+        self._last_repoll: float = 0.0
 
     # ------------------------------------------------------------------
     # SecondaryTierManager interface
     # ------------------------------------------------------------------
+
+    @override
+    def bind_parent(self, parent: ParentManager) -> None:
+        self._parent = parent
+
+    @override
+    def stop_executor(self) -> None:
+        if self._control_thread is not None:
+            self._control_thread.stop()
+            self._control_thread = None
+
+    def _ensure_control_thread(self) -> None:
+        """Start the control thread on first use.
+
+        Called from the manager-driven entry points rather than from
+        bind_parent(), so the thread does not exist during model profiling.
+        """
+        if self._control_thread is not None or self._parent is None:
+            return
+        self._control_thread = P2PControlThread(
+            sweep=self._control_sweep,
+            parent=self._parent,
+            name=f"vllm_p2p_control_{self._local_id}",
+        )
+        self._control_thread.start()
+        logger.info("P2P %s: started control thread", self._local_id)
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -533,20 +588,21 @@ class P2PSecondaryTierManager(SecondaryTierManager):
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
-        # Drive one polling sweep on the scheduler thread, then hand off
-        # whatever has accumulated. The engine calls this once per step
-        # (and keeps stepping while has_pending_work() is True).
-        self._poll_once()
+        # Pure handoff: the control thread does the polling that fills this.
+        self._ensure_control_thread()
         result = self._finished_jobs
         self._finished_jobs = []
         return result
 
     @override
     def has_pending_work(self) -> bool:
-        # The engine tick is the only driver of _control.poll() and
-        # session.poll(); without it we miss new peer connects and
-        # inbound fetch messages on existing sessions. Keep the engine
-        # ticking for the lifetime of this manager.
+        # Keeps the engine ticking for the lifetime of this manager. The control
+        # thread now drives polling, so this is no longer needed to see peer
+        # connects and inbound messages — but the engine is still the only thing
+        # that reaps finished jobs back into the tiering manager, and the thread
+        # has no way to wake an engine parked in input_queue.get(). Returning
+        # False when idle needs that wake path first.
+        self._ensure_control_thread()
         return True
 
     @override
@@ -562,36 +618,64 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         """
         start = time.monotonic()
         warned = False
-        while True:
-            self._poll_once()
-            pending = any(s.has_pending_work for s in self._sessions.values())
-            if not pending:
-                return
-            if not warned and time.monotonic() - start > 5.0:
-                logger.warning(
-                    "P2PSecondaryTierManager.drain_jobs: still draining "
-                    "after 5s; a stuck transfer will block the engine.",
-                )
-                warned = True
-            time.sleep(_DRAIN_SLEEP_S)
+        # Sweep here rather than waiting for the control thread: the caller holds
+        # the executor lock, so the thread cannot get a turn until we return.
+        # _draining keeps inbound lookups off a manager that is mid-reset.
+        self._draining = True
+        try:
+            while True:
+                self._poll_once()
+                pending = any(s.has_pending_work for s in self._sessions.values())
+                if not pending:
+                    return
+                if not warned and time.monotonic() - start > 5.0:
+                    logger.warning(
+                        "P2PSecondaryTierManager.drain_jobs: still draining "
+                        "after 5s; a stuck transfer will block the engine.",
+                    )
+                    warned = True
+                time.sleep(_DRAIN_SLEEP_S)
+        finally:
+            self._draining = False
 
-    @override
-    def serve_external_requests(self, parent: ParentManager) -> None:
-        """Serve inbound peer lookups against the tiering manager.
+    def _control_sweep(self) -> float:
+        """One sweep of the control plane. Runs inside a turn.
 
-        Called once per scheduler step (before this tier's
-        ``on_schedule_end``) with a ``parent`` handle valid only for the
-        duration of the call — the sole window in which the P2P server
-        role may query the tiering manager. First release bookkeeping for
-        the failed serves left by a reaped session, then let every live
-        session resolve its enqueued inbound LookupMsgs.
+        Returns:
+            How long the control thread should wait before sweeping again.
         """
-        if self._failed_serve_ctxs:
-            for ctx in self._failed_serve_ctxs:
-                parent.on_request_finished(ctx)
-            self._failed_serve_ctxs = []
+        self._poll_once()
+        self._maybe_repoll_lookups()
+        return self._next_sweep_wait()
+
+    def _maybe_repoll_lookups(self) -> None:
+        """Re-ask the tiering manager about parked HIT_PENDING / RETRY keys.
+
+        Deliberately slower than the sweep. A parked key only resolves when some
+        other tier finishes a transfer, so re-asking on every sweep would issue
+        hundreds of times more parent.lookup() calls than at the old once-per-step
+        rate, all of them under the lock, to learn nothing.
+        """
+        now = time.monotonic()
+        if now - self._last_repoll < _REPOLL_INTERVAL_S:
+            return
+        self._last_repoll = now
         for session in self._sessions.values():
-            session.serve_external_requests(parent)
+            session.repoll_lookups()
+
+    def _next_sweep_wait(self) -> float:
+        """Sweep often while peers are connected, rarely when there are none."""
+        return _ACTIVE_SWEEP_S if self._sessions else _IDLE_SWEEP_S
+
+    def _is_draining(self) -> bool:
+        """Whether the tiering manager is mid-reset and must not be queried.
+
+        Passed to each session so an inbound lookup arriving while drain_jobs()
+        sweeps is answered as a miss instead of reaching a manager whose caches
+        are being torn down. A miss is also the honest answer: the blocks the
+        peer is asking about are going away.
+        """
+        return self._draining
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
@@ -632,6 +716,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             local_block_len=self._data.block_len,
             local_hash_seed=self._get_hash_seed(),
             conn=conn,
+            parent=self._parent,
+            is_draining=self._is_draining,
         )
         self._sessions[peer_id] = session
         return session
@@ -654,6 +740,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                     local_block_len=self._data.block_len,
                     local_hash_seed=self._get_hash_seed(),
                     conn=conn,
+                    parent=self._parent,
+                    is_draining=self._is_draining,
                 )
                 logger.info(
                     "P2P %s: created connected session for %s",
@@ -697,9 +785,13 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             # MISS (local prefill) instead of RETRY forever — even if a fresh
             # session to the same peer is later opened by another request.
             self._failed_req_ids.update(close_result.failed_req_ids)
-            # Release the TieringManager's per-request bookkeeping for the
-            # dead session's synthetic lookups on the next serve_external_requests.
-            self._failed_serve_ctxs.extend(close_result.failed_serves)
+            # Release the TieringManager's per-request bookkeeping for the dead
+            # session's synthetic lookups. Reaping runs inside a turn, so the
+            # parent is callable right here; this used to be parked for the next
+            # serve_external_requests, which was the only window that had it.
+            if self._parent is not None:
+                for ctx in close_result.failed_serves:
+                    self._parent.on_request_finished(ctx)
             self._data.remove_remote_peer(pid)
             logger.warning("P2P %s: peer %s down", self._local_id, pid)
 
@@ -796,9 +888,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
     def shutdown(self) -> None:
         self._drain_inflight_for_shutdown()
         for session in self._sessions.values():
-            # Orphan ctxs from close() are intentionally dropped: the manager
-            # is being torn down, so there is no next serve_external_requests
-            # to flush them and no TieringManager left to release.
+            # Orphan ctxs from close() are intentionally dropped: the manager is
+            # being torn down, so there is no TieringManager state left to
+            # release them against.
             session.close()
         self._sessions.clear()
         self._kv_to_session.clear()

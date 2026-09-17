@@ -19,7 +19,7 @@ received our ConnectMsg, after which queued outgoing messages are flushed.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 from vllm.logger import init_logger
@@ -65,8 +65,13 @@ class SessionPollResult(NamedTuple):
     consumed. `new_fetch_ids` reports kv_request_ids whose FetchMsg
     arrived this tick — the manager uses them to bind kv_request_id →
     session and replay any submit_store batches parked while no peer had
-    asked yet. Reporting (rather than calling back into the manager
+    asked yet. Reporting these (rather than calling the P2P manager back
     mid-dispatch) keeps the dependency strictly top-down.
+
+    Note this is about the *P2P manager*, not the tiering manager: the server
+    role does hold a ParentManager and calls it during dispatch. That is
+    dependency inversion rather than an upward call — ParentManager is an
+    interface owned by tiering/base.py, not a handle on P2PSecondaryTierManager.
     """
 
     loads: list[LoadResult]
@@ -114,6 +119,8 @@ class P2PSession:
         local_block_len: int,
         local_hash_seed: str,
         conn: ControlConnection | None = None,
+        parent: ParentManager | None = None,
+        is_draining: Callable[[], bool] | None = None,
     ) -> None:
         self.peer_id = peer_id
         self._local_id = local_id
@@ -140,6 +147,8 @@ class P2PSession:
             peer_id=peer_id,
             transport=transport,
             send=self._send,
+            parent=parent,
+            is_draining=is_draining,
         )
 
         if conn is not None:
@@ -239,13 +248,9 @@ class P2PSession:
         """
         self._client.flush_pending_lookups()
 
-    def serve_external_requests(self, parent: ParentManager) -> None:
-        """Resolve inbound peer lookups against the tiering manager.
-
-        Delegates to the server role; the ``parent`` handle is valid
-        only for the duration of this call.
-        """
-        self._server.serve_external_requests(parent)
+    def repoll_lookups(self) -> None:
+        """Re-ask the tiering manager about parked HIT_PENDING / RETRY keys."""
+        self._server.repoll_lookups()
 
     def poll(self) -> SessionPollResult:
         """Process incoming messages, drive transfers, apply timeouts."""
@@ -282,8 +287,8 @@ class P2PSession:
             answer that can never arrive.
         failed_stores: server store job_ids to fail.
         failed_serves: synthetic lookup ctxs still owing
-            ``parent.on_request_finished`` (the manager flushes these on
-            its next ``serve_external_requests``).
+            ``parent.on_request_finished``, which the manager releases as it
+            reaps the session.
         """
         client_result = self._client.close()
         failed_stores, failed_serves = self._server.close()

@@ -11,6 +11,7 @@ These tests verify:
 5. Eviction coordination between tiers
 """
 
+import inspect
 from collections.abc import Iterable
 from unittest.mock import MagicMock
 
@@ -22,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    OffloadingConnectorScheduler,
     _parse_tier_filter,
 )
 from vllm.v1.kv_offload.base import (
@@ -1454,6 +1456,226 @@ def test_parse_tier_filter_skips_bad_entries():
         TierMatcher(medium=Medium.STORAGE),
         TierMatcher(medium=Medium.CPU),
     )
+
+
+# ---------------------------------------------------------------------------
+# Executor lock: the guarantees a threaded secondary tier depends on
+# ---------------------------------------------------------------------------
+
+
+class TestExecutorLockIntegration:
+    """The tiering manager must never return with its executor lock held.
+
+    A tier driving its own thread can only work while the scheduler is not
+    holding the lock, and the scheduler's long hold is released by
+    on_schedule_end(). These tests pin down that the hold really does end, on
+    every path a step can take.
+    """
+
+    @pytest.fixture
+    def manager_setup(self):
+        mock_region = _mock_mmap_region(5)
+        self.primary_tier = CPUPrimaryTierOffloadingManager(
+            num_chunks=5, mmap_region=mock_region
+        )
+        mock_view = mock_region.create_kv_memoryview()
+        self.tier = ExampleSecondaryTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=mock_view,
+            tier_type="example",
+        )
+        self.manager = TieringOffloadingManager(
+            primary_tier=self.primary_tier, secondary_tiers=[self.tier]
+        )
+        yield
+        self.manager.shutdown()
+
+    def _end_step(self):
+        self.manager.on_schedule_end(
+            ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
+        )
+
+    def test_lookup_opens_a_turn_that_on_schedule_end_closes(self, manager_setup):
+        """lookup() takes the long hold; on_schedule_end() is what gives it back.
+
+        This is the window a tier thread runs in: from here until the next
+        lookup(), the engine is executing the model and the lock is free.
+        """
+        ctx = ReqContext(req_id="req-turn")
+        self.manager.on_new_request(ctx)
+
+        self.manager.lookup(b"absent", ctx)
+        assert self.manager._executor.owns_turn()
+
+        self._end_step()
+        assert not self.manager._executor.owns_turn()
+
+    def test_scoped_methods_leave_no_turn_open(self, manager_setup):
+        """Methods reached outside a step must not start a hold they never end.
+
+        has_pending_work() is the one that matters: the engine calls it before
+        schedule(), and on an idle step it returns without schedule() ever
+        running, so a hold taken here would never be released and the engine
+        would block in input_queue.get() still owning it.
+        """
+        assert not self.manager.has_pending_work()
+        assert not self.manager._executor.owns_turn()
+
+        list(self.manager.take_events())
+        assert not self.manager._executor.owns_turn()
+
+        self.manager.get_stats()
+        assert not self.manager._executor.owns_turn()
+
+        self.manager.on_new_request(ReqContext(req_id="req-scoped"))
+        assert not self.manager._executor.owns_turn()
+
+    def test_exception_in_a_manager_method_leaves_the_lock_free(self, manager_setup):
+        """A raising method must not strand the lock.
+
+        Nothing in the engine loop times out, so a stranded lock would be an
+        unrecoverable hang rather than a reported failure.
+        """
+        ctx = ReqContext(req_id="req-raise")
+        self.manager.on_new_request(ctx)
+
+        with pytest.raises(AssertionError):
+            # prepare_load asserts the chunk is present; nothing was stored.
+            self.manager.prepare_load([b"never-stored"], ctx)
+
+        self._end_step()
+        assert not self.manager._executor.owns_turn()
+        _assert_lock_free(self.manager)
+
+    def test_end_executor_turn_resets_the_step_gate(self, manager_setup):
+        """step_done() must clear the per-step job-sweep gate.
+
+        A tier turn that set the gate and released without clearing it would
+        make the scheduler skip its next sweep of finished jobs.
+        """
+        parent = self.manager._tier_parents[self.tier]
+        ctx = ReqContext(req_id="req-gate")
+
+        parent.step_begin()
+        self.manager.lookup(b"absent", ctx)
+        assert self.manager._processed_jobs_this_step
+
+        parent.step_done()
+        assert not self.manager._processed_jobs_this_step
+        assert not self.manager._executor.owns_turn()
+        _assert_lock_free(self.manager)
+
+    def test_end_executor_turn_flushes_promotions(self, manager_setup):
+        """A promotion queued by a tier turn is submitted when that turn ends.
+
+        Leaving it for the next on_schedule_end() would cost a full engine step
+        — the latency this whole mechanism exists to remove.
+        """
+        key = b"promote-me"
+        self.tier.chunks[key] = True
+
+        parent = self.manager._tier_parents[self.tier]
+        ctx = ReqContext(req_id="req-peer")
+        parent.step_begin()
+        self.manager.on_new_request(ctx)
+        assert self.manager.lookup(key, ctx) is LookupResult.HIT_PENDING
+        assert self.manager._pending_load_submissions, "promotion was not queued"
+
+        parent.step_done()
+        assert not self.manager._pending_load_submissions, "promotion was not flushed"
+
+
+class TestFinalizationGate:
+    """Finalization must wait for queued promotions.
+
+    on_schedule_end() now runs after the connector has signalled finished
+    requests, so _flush_pending_promotions() can submit_load() for a request
+    that was finalized moments earlier in the same call — telling the tiers a
+    request is over and then handing them more work for it.
+    """
+
+    @pytest.fixture
+    def manager_setup(self):
+        mock_region = _mock_mmap_region(5)
+        self.primary_tier = CPUPrimaryTierOffloadingManager(
+            num_chunks=5, mmap_region=mock_region
+        )
+        mock_view = mock_region.create_kv_memoryview()
+        self.tier = ExampleSecondaryTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=mock_view,
+            tier_type="example",
+        )
+        self.manager = TieringOffloadingManager(
+            primary_tier=self.primary_tier, secondary_tiers=[self.tier]
+        )
+        yield
+        self.manager.shutdown()
+
+    def test_request_with_queued_promotion_is_not_finalized(self, manager_setup):
+        key = b"pending-promotion"
+        self.tier.chunks[key] = True
+
+        ctx = ReqContext(req_id="req-finishing")
+        self.manager.on_new_request(ctx)
+        assert self.manager.lookup(key, ctx) is LookupResult.HIT_PENDING
+        assert "req-finishing" in self.manager._pending_load_submissions.get(0, {})
+
+        # The request finishes while its promotion is still only queued.
+        self.manager.on_request_finished(ctx)
+        assert "req-finishing" in self.manager._req_state, (
+            "finalized while a promotion was still queued for it"
+        )
+
+        # Flushing the promotion unblocks finalization.
+        self.manager.on_schedule_end(
+            ScheduleEndContext(new_req_ids=[], preempted_req_ids=())
+        )
+        assert not self.manager._pending_load_submissions
+
+
+def test_on_schedule_end_is_the_last_manager_call_in_build_connector_meta():
+    """No manager call may follow on_schedule_end() in build_connector_meta.
+
+    on_schedule_end() releases the executor lock, so a manager call after it
+    re-takes the lock and then holds it across the model-execution wait — the
+    exact window a threaded secondary tier needs. That made an earlier version
+    of this change a no-op on every step that offloaded a chunk or finished a
+    request, i.e. precisely the busy steps it was meant to help.
+
+    Checked structurally because the failure is silent: the code still works,
+    it just stops delivering the latency win, so no behavioural test would go
+    red. Ordering here is the contract.
+    """
+    src = inspect.getsource(OffloadingConnectorScheduler.build_connector_meta)
+    calls = [
+        (i, line.strip())
+        for i, line in enumerate(src.split("\n"))
+        if "self.manager." in line
+    ]
+    assert calls, "expected build_connector_meta to call the manager"
+    last_idx, last_call = calls[-1]
+    assert "on_schedule_end" in last_call, (
+        f"{last_call!r} runs after on_schedule_end(), which releases the "
+        f"executor lock; move it before that call"
+    )
+
+
+def _assert_lock_free(manager) -> None:
+    """Assert another thread can take a turn, i.e. nothing is still held."""
+    import threading
+
+    got = threading.Event()
+
+    def probe():
+        manager._executor.open_turn()
+        got.set()
+        manager._executor.close_turn()
+
+    t = threading.Thread(target=probe)
+    t.start()
+    t.join(timeout=5.0)
+    assert got.is_set(), "executor lock is still held"
 
 
 if __name__ == "__main__":

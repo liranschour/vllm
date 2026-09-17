@@ -66,7 +66,11 @@ Implementor contracts
 - close() releases all resources (memory registrations, handles).
   After close(), no other methods may be called.
 
-Threading model: no background threads. All I/O driven by poll().
+Threading model: no background threads of its own, and no internal locking.
+All I/O is driven by the caller invoking poll(). Callers must serialize their
+own access — the P2P tier does so with the tiering manager's executor lock, so
+one transport instance shared by every session is only ever entered by one
+executor at a time.
 """
 
 from __future__ import annotations

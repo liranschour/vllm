@@ -84,8 +84,8 @@ class JobResult:
 class ParentManager(ABC):
     """Interface for secondary tiers to call back into the tiering manager.
 
-    Passed to secondary tiers via serve_external_requests() each step.
-    The _SecondaryTierFacingParent wrapper implements this, automatically
+    Bound once via bind_parent(), and valid for the tier's lifetime. The
+    _SecondaryTierFacingParent wrapper implements this, automatically
     excluding the calling tier from fan-out operations.
 
     Required call sequence for each remote request:
@@ -99,6 +99,12 @@ class ParentManager(ABC):
     Steps 2-3 may be interleaved. Step 4 must be called even if no
     chunks were found, to avoid leaking async lookup state (e.g. in
     the fs tier's AsyncLookupManager).
+
+    Threading: the first call from a tier's own thread claims the tiering
+    manager's executor lock, and step_done() releases it. A tier calling
+    from a thread of its own MUST bracket its work with step_done(), or the
+    scheduler blocks forever. Calls made from within a tier method that the
+    manager itself invoked are already under the lock and need no bracket.
     """
 
     @abstractmethod
@@ -117,6 +123,28 @@ class ParentManager(ABC):
     @abstractmethod
     def on_request_finished(self, req_context: ReqContext) -> None: ...
 
+    def step_begin(self) -> None:
+        """Begin this executor's turn, blocking until no one else holds one.
+
+        Called by a tier that drives its own thread, before it touches any of
+        its own state — not just before its first parent call, since the tier's
+        own state is shared with the scheduler too. Idempotent per thread.
+
+        Raises:
+            ExecutorLockClosed: the manager is shutting down; the caller should
+                stop its thread rather than retry.
+        """
+        return
+
+    def step_done(self) -> None:
+        """End this executor's turn: flush deferred work and release the lock.
+
+        Must pair with step_begin(); a tier that fails to call it blocks the
+        scheduler. A no-op when this thread does not own the turn, so it is also
+        safe on a sweep the manager itself drove.
+        """
+        return
+
 
 class SecondaryTierManager(ABC):
     """
@@ -130,6 +158,14 @@ class SecondaryTierManager(ABC):
     IMPORTANT: All methods run in the Scheduler process and must be
     lightweight and non-blocking. submit_load() and submit_store() submit
     async jobs; get_finished_jobs() polls for completion.
+
+    Threading: the tiering manager guarantees a single executor inside itself
+    and its tiers at any moment, so these methods never run concurrently with
+    each other. They are called on the scheduler thread; a tier that runs its
+    own thread (see bind_parent() and stop_executor()) also executes under that
+    same guarantee, which means "not concurrent" rather than "always the
+    scheduler thread". Anything a tier does under it delays the scheduler, so
+    keep it bounded and never block on I/O.
     """
 
     medium: ClassVar[Medium | None] = None
@@ -286,12 +322,28 @@ class SecondaryTierManager(ABC):
         """
         return
 
-    def serve_external_requests(self, parent: ParentManager) -> None:
-        """Process remotely-originated requests using the parent manager.
+    def bind_parent(self, parent: ParentManager) -> None:
+        """Receive a handle for calling back into the tiering manager.
 
-        Called once per scheduler step, BEFORE _flush_pending_promotions().
-        The parent handle is valid only for the duration of this call.
-        Tiers that don't serve external requests leave this as a no-op.
+        Called once during manager construction. The handle is valid for the
+        tier's lifetime, so a tier that serves remotely-originated requests may
+        use it from its own thread, bracketing each sweep with
+        ``parent.step_done()``.
+
+        Bind only — do not start threads here. This runs before the KV cache is
+        configured, so anything started would also run through the profile run;
+        start lazily on the first call the manager makes instead.
+
+        Tiers that never call back into the manager leave this as a no-op.
+        """
+        return
+
+    def stop_executor(self) -> None:
+        """Stop any thread this tier started, and join it.
+
+        Called by the manager before it takes its executor lock for shutdown,
+        because a tier thread parked waiting for that lock could never be
+        joined from inside it. Must be idempotent.
         """
         return
 

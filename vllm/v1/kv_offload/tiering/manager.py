@@ -20,10 +20,11 @@ Key Design Principles:
    protecting chunks from eviction until complete_read() is called
 """
 
+import functools
 import time
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import Concatenate, NamedTuple, ParamSpec, TypeVar
 
 import numpy as np
 from typing_extensions import override
@@ -54,9 +55,52 @@ from vllm.v1.kv_offload.tiering.base import (
     SecondaryTierManager,
     TransferJob,
 )
+from vllm.v1.kv_offload.tiering.executor_lock import ExecutorLock
 from vllm.v1.kv_offload.tiering.metrics import TieringMetricsTracker
 
 logger = init_logger(__name__)
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _serialized(
+    method: Callable[Concatenate["TieringOffloadingManager", _P], _R],
+) -> Callable[Concatenate["TieringOffloadingManager", _P], _R]:
+    """Hold the executor lock for the duration of one call.
+
+    Re-entrant, so it is also correct when reached from inside a turn, and
+    lexical, so it cannot leak the lock on an exception.
+    """
+
+    @functools.wraps(method)
+    def wrapper(
+        self: "TieringOffloadingManager", *args: _P.args, **kwargs: _P.kwargs
+    ) -> _R:
+        with self._executor:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+def _starts_turn(
+    method: Callable[Concatenate["TieringOffloadingManager", _P], _R],
+) -> Callable[Concatenate["TieringOffloadingManager", _P], _R]:
+    """Open a hold that spans the rest of the schedule phase.
+
+    Released by on_schedule_end(), or by end_executor_turn() for a tier that
+    drives its own thread. Idempotent, so after the first call in a phase this
+    costs one thread-id comparison.
+    """
+
+    @functools.wraps(method)
+    def wrapper(
+        self: "TieringOffloadingManager", *args: _P.args, **kwargs: _P.kwargs
+    ) -> _R:
+        self._executor.open_turn()
+        return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 @dataclass
@@ -163,6 +207,12 @@ class _SecondaryTierFacingParent(ParentManager):
             req_context, exclude_tier_idx=self._origin_idx
         )
 
+    def step_begin(self) -> None:
+        return self._m.begin_executor_turn()
+
+    def step_done(self) -> None:
+        return self._m.end_executor_turn()
+
 
 class TieringOffloadingManager(OffloadingManager):
     """
@@ -230,6 +280,16 @@ class TieringOffloadingManager(OffloadingManager):
             tier: _SecondaryTierFacingParent(self, tier_idx)
             for tier_idx, tier in enumerate(self.secondary_tiers)
         }
+
+        # Serializes this manager and every tier under it, so a tier may drive
+        # its own thread. See executor_lock.ExecutorLock.
+        self._executor = ExecutorLock()
+
+        # Hand each tier its parent handle for the tier's lifetime. Binding only:
+        # tiers must not start threads here, since the KV cache is not configured
+        # yet and anything started would also run through the profile run.
+        for tier, parent in self._tier_parents.items():
+            tier.bind_parent(parent)
 
     @property
     def _transfer_jobs(self) -> dict[JobId, JobMetadata]:
@@ -334,6 +394,7 @@ class TieringOffloadingManager(OffloadingManager):
                     )
 
     @override
+    @_starts_turn
     def lookup(
         self,
         key: OffloadKey,
@@ -493,6 +554,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._pending_load_submissions.clear()
 
     @override
+    @_starts_turn
     def prepare_load(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> LoadStoreSpec:
@@ -515,6 +577,7 @@ class TieringOffloadingManager(OffloadingManager):
         return self.primary_tier.prepare_load(keys, req_context)
 
     @override
+    @_starts_turn
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
         Mark chunks as recently used in all tiers.
@@ -528,6 +591,7 @@ class TieringOffloadingManager(OffloadingManager):
             tier.touch(keys, req_context)
 
     @override
+    @_serialized
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):
         """
         Mark chunks as done loading from primary tier to GPU.
@@ -542,6 +606,7 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.complete_load(keys, req_context)
 
     @override
+    @_starts_turn
     def prepare_store(
         self, keys: Collection[OffloadKey], req_context: ReqContext
     ) -> PrepareStoreOutput | None:
@@ -659,6 +724,7 @@ class TieringOffloadingManager(OffloadingManager):
             self._maybe_finalize_request(req_id)
 
     @override
+    @_serialized
     def complete_store(
         self,
         keys: Collection[OffloadKey],
@@ -704,6 +770,7 @@ class TieringOffloadingManager(OffloadingManager):
         state.pending_primary_stores -= 1
         self._maybe_finalize_request(req_id)
 
+    @_starts_turn
     def create_store_job(
         self,
         keys: Collection[OffloadKey],
@@ -733,6 +800,7 @@ class TieringOffloadingManager(OffloadingManager):
         return job_metadata
 
     @override
+    @_serialized
     def on_new_request(
         self,
         req_context: ReqContext,
@@ -765,6 +833,7 @@ class TieringOffloadingManager(OffloadingManager):
         return RequestOffloadingContext(policy=policy)
 
     @override
+    @_serialized
     def on_request_finished(
         self,
         req_context: ReqContext,
@@ -781,11 +850,14 @@ class TieringOffloadingManager(OffloadingManager):
         req_id: str,
         exclude_tier_idx: int | None = None,
     ) -> None:
-        """Finalize secondary tiers once no more store cascades can be submitted.
+        """Finalize secondary tiers once no more work can be submitted for it.
 
         Finalization means forwarding on_request_finished() to secondary tiers.
         It is delayed until pending GPU->primary stores finish, since their
-        complete_store() callbacks may still submit primary->secondary stores.
+        complete_store() callbacks may still submit primary->secondary stores,
+        and until queued promotions have been flushed, since _flush_pending_
+        promotions() would otherwise submit_load() for a request the tiers have
+        already been told is over.
         """
         state = self._req_state[req_id]
         if not state.is_finished:
@@ -793,6 +865,10 @@ class TieringOffloadingManager(OffloadingManager):
         if state.pending_primary_stores != 0:
             return
         if state.pending_cascade_keys:
+            return
+        if any(
+            req_id in pending for pending in self._pending_load_submissions.values()
+        ):
             return
 
         for tier_idx, tier in enumerate(self.secondary_tiers):
@@ -807,33 +883,65 @@ class TieringOffloadingManager(OffloadingManager):
         """End-of-schedule hook: process finished jobs, flush deferred
         promotions, and reset the per-step gate.
 
-        Called once per scheduler step from
-        OffloadingConnectorScheduler.build_connector_meta().
+        Called as the last manager call of each scheduler step, from the end of
+        OffloadingConnectorScheduler.build_connector_meta(). Being last is what
+        lets it release the executor lock for the whole model-execution wait; if
+        a manager call followed it, the lock would be re-taken immediately and
+        held across that wait.
         """
-        # Catch-all poll: guarantees jobs are processed even on steps where
-        # lookup()/prepare_store() were never called (e.g. no requests
-        # scheduled but a tier still has_pending_work()).
-        self._maybe_process_finished_jobs()
+        try:
+            with self._executor:
+                # Catch-all poll: guarantees jobs are processed even on steps
+                # where lookup()/prepare_store() were never called (e.g. no
+                # requests scheduled but a tier still has_pending_work()).
+                self._maybe_process_finished_jobs()
 
-        for tier in self.secondary_tiers:
-            tier.serve_external_requests(self._tier_parents[tier])
+                self._processed_jobs_this_step = False
 
-        # Reset the per-step gate AFTER serve_external_requests so that
-        # lookup() calls within it skip redundant _process_finished_jobs().
-        self._processed_jobs_this_step = False
+                self._flush_pending_promotions()
+                self._flush_pending_cascades()
+                for tier in self.secondary_tiers:
+                    tier.on_schedule_end(context)
 
-        self._flush_pending_promotions()
-        self._flush_pending_cascades()
-        for tier in self.secondary_tiers:
-            tier.on_schedule_end(context)
+                for req_id in context.new_req_ids:
+                    state = self._req_state.get(req_id)
+                    if state is None:
+                        continue
+                    self._metrics.on_request_allocated(state.req_context)
+        finally:
+            self._executor.close_turn()
 
-        for req_id in context.new_req_ids:
-            state = self._req_state.get(req_id)
-            if state is None:
-                continue
-            self._metrics.on_request_allocated(state.req_context)
+    def begin_executor_turn(self) -> None:
+        """Open a turn for a tier running its own thread.
+
+        Reached through ParentManager.step_begin(). Blocks until the scheduler's
+        own turn, if any, has closed.
+        """
+        self._executor.open_turn()
+
+    def end_executor_turn(self) -> None:
+        """Close a turn opened by a tier running its own thread.
+
+        Reached through ParentManager.step_done(). Mirrors the tail of
+        on_schedule_end(): a turn that set the per-step gate without clearing it
+        would make the scheduler skip its next job sweep, and a promotion the
+        tier queued via parent.lookup() would otherwise wait for the next
+        on_schedule_end() — a whole step of the latency this exists to remove.
+
+        Does not drive tier.on_schedule_end(): that needs a ScheduleEndContext
+        and is the scheduler's per-step notion, not this executor's.
+        """
+        if not self._executor.owns_turn():
+            return
+        try:
+            self._processed_jobs_this_step = False
+            self._flush_pending_promotions()
+            self._flush_pending_cascades()
+        finally:
+            self._executor.close_turn()
 
     @override
+    @_serialized
     def has_pending_work(self) -> bool:
         # In-flight primary<->secondary transfers (pending promotions are
         # translated to transfer jobs in on_schedule_end), plus any work the
@@ -845,17 +953,24 @@ class TieringOffloadingManager(OffloadingManager):
         )
 
     @override
+    @_serialized
     def take_events(self) -> Iterable[OffloadingEvent]:
-        """Yield events owned by the primary and secondary tiers.
+        """Collect events owned by the primary and secondary tiers.
 
-        Yields:
+        Materialized rather than generated: a generator would run its body — and
+        so take the executor lock — only when the consumer first iterated, and
+        would never release it if the consumer abandoned the iterator.
+
+        Returns:
             New OffloadingEvents collected by each tier since the last call.
         """
-        yield from self.primary_tier.take_events()
+        events: list[OffloadingEvent] = list(self.primary_tier.take_events())
         for tier in self.secondary_tiers:
-            yield from tier.take_events()
+            events.extend(tier.take_events())
+        return events
 
     @override
+    @_serialized
     def reset_cache(self) -> None:
         """Reset transfer bookkeeping and primary-tier cache.
 
@@ -901,6 +1016,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._processed_jobs_this_step = False
 
     @override
+    @_serialized
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats = self.primary_tier.get_stats()
 
@@ -932,6 +1048,25 @@ class TieringOffloadingManager(OffloadingManager):
         Every secondary tier is given a shutdown attempt. If any shutdown
         fails, preserve the primary mmap because a failed tier may still use it.
         """
+        # Stop and join tier threads BEFORE taking the executor lock. A tier
+        # thread parked in open_turn() waiting for this lock could never be
+        # joined from inside it, and tearing its transports down without joining
+        # it would free sockets it is still using.
+        for tier_idx, tier in enumerate(self.secondary_tiers):
+            try:
+                tier.stop_executor()
+            except Exception:
+                logger.exception(
+                    "Failed to stop the executor of secondary tier #%d "
+                    "(tier_type=%s); continuing with shutdown",
+                    tier_idx,
+                    tier.tier_type,
+                )
+        self._executor.close()
+        with self._executor:
+            self._shutdown_locked()
+
+    def _shutdown_locked(self) -> None:
         shutdown_error: Exception | None = None
         for tier_idx, tier in enumerate(self.secondary_tiers):
             try:
