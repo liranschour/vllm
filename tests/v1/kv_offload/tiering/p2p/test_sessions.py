@@ -738,7 +738,16 @@ class TestClientFlows:
 class TestLookupFlow:
     """Consumer-side state machine for do_p2p_fetch lookups."""
 
-    def test_lookup_deadline_starts_after_handshake(self, lookup_clock):
+    def test_lookup_deadline_starts_after_handshake(self, lookup_clock, monkeypatch):
+        # Keep the handshake deadline out of the way so the pre-handshake
+        # wait isolates lookup-deadline behavior.
+        monkeypatch.setenv(
+            "VLLM_P2P_HANDSHAKE_TIMEOUT_S", str(int(4 * _LOOKUP_TIMEOUT_S))
+        )
+        import vllm.envs
+
+        vllm.envs.__dict__.pop("VLLM_P2P_HANDSHAKE_TIMEOUT_S", None)
+
         session, conn, _ = _make_session()
         session.register_lookup("req-1", b"hA")
         session.flush_pending_lookups()
