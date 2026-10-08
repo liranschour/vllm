@@ -27,18 +27,17 @@ Any instance can match block hashes on a peer and pull the KV from that peer's
 CPU memory instead of recomputing the prefill. Peers are symmetric: no fixed
 prefill and decode roles, no shared filesystem, no central cache store.
 
-This session reports what that enables, measured on multi-node H200 clusters under
-both document-heavy and agentic workloads. Two placement strategies are
+This session reports what that enables, measured on multi-node H200 clusters
+under both document-heavy and agentic workloads. Two placement strategies are
 examined: hot-spot spill-over, where a saturated pod's prefix is pulled by a
 cold one so load can be balanced without paying for prefill twice, and a split
 between long-prefill and short-prefill pools, where the short pool pulls shared
 context rather than recomputing it.
 
 The session closes with a heuristic for when pulling beats recomputing. A
-transfer can only win where the interconnect moves KV bytes faster than prefill
-produces them, and the break-even prefix length is then roughly the pull
-latency floor multiplied by prefill throughput — two figures an operator
-measures once and routes against.
+transfer only wins when the interconnect moves KV bytes faster than prefill
+produces them. The break-even prefix length itself can be measured dynamically
+and used to set the router's pull threshold.
 
 ---
 
