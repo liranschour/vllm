@@ -13,6 +13,7 @@
 ## Title
 
 Stop Recomputing Prefixes: Peer-to-Peer CPU KV Cache Sharing in vLLM
+
 ---
 
 ## Description
@@ -38,6 +39,7 @@ transfer can only win where the interconnect moves KV bytes faster than prefill
 produces them, and the break-even prefix length is then roughly the pull
 latency floor multiplied by prefill throughput — two figures an operator
 measures once and routes against.
+
 ---
 
 ## Benefits to the Ecosystem
@@ -54,4 +56,5 @@ API Inference Extension endpoint picker, and the deployment uses stock
 Kubernetes primitives. The pattern needs no shared filesystem, no central cache
 store, and no proprietary component, which keeps it reachable for teams running
 modest clusters rather than only the largest ones.
+
 ---
