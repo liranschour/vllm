@@ -4,15 +4,35 @@
 
 ### Offloading to CPU memory
 
-Two distinct paths exist, and which one a deployment uses is decided purely by
-whether a KVCR-owned pool is configured:
+Two **mechanisms**, not two deployment modes. Index-and-pin always exists; the
+config only decides whether deposit exists *alongside* it:
 
 | | **index-and-pin** | **deposit** |
 | --- | --- | --- |
-| Config | `secondary_g2_slots = 0`, no `g3`, no Guard (the default, and what KVCR's own quick-start uses) | `secondary_g2_slots > 0`, or `g3`, or Guard mode |
+| Exists when | always — the fallback in every configuration, and the only mechanism in the default one (`secondary_g2_slots = 0`, no `g3`, no Guard — what KVCR's quick-start uses) | only when `secondary_g2_slots > 0`, or `g3`, or Guard mode |
 | Extra CPU copy | **none** — peers RDMA straight out of vLLM's own host tier | **yes** — one copy into a KVCR-owned pool |
 | Who owns residency | vLLM's LRU; block disappears when vLLM evicts it | KVCR policy (admission + eviction + tiering) |
 | Survives engine crash | no | only with Guard (pool owned by the sidecar) |
+
+**They coexist, and the choice is per block, not per deployment or per request.**
+Configuring a pool does not switch index-and-pin off — it adds a second,
+cheaper source of bytes that KVCR prefers when it happens to have them. At serve
+time (producer side, `remote_fw_dram.py`):
+
+- `_try_local_source_write` tries the pool first, all-or-nothing: it bails on the
+  first key that is not `READY`, whose layout indices do not line up, or if
+  `_state_lock` cannot be taken non-blocking.
+- On any bail, `_resume_source_pin` (`:1503-1532`) claims whatever KVCR-owned
+  residencies exist, computes `unresolved_keys`, pins **only the remainder** out
+  of vLLM's host tier, and submits **one** write whose `src_descriptors` mix both
+  kinds. A 16-block transfer can be 11 blocks from KVCR DRAM and 5 from pinned
+  vLLM memory.
+
+So with a pool configured, a block is served from the pool only if it is
+currently resident there — anything the policy dropped, evicted, or never
+ingested still goes out via a pin, exactly as in the pool-less configuration.
+The consumer side is per-block in the same way: `core.deliver` splits one call
+across `LOCAL_G2` / `G3` / `REMOTE_G2` (`core.py:525-553`).
 
 The adapter always registers vLLM's *existing* primary host pool with KVCR's
 NIXL agent as one `RegionDescriptor(addr, size=block_size_bytes, count=n_chunks)`
