@@ -78,6 +78,120 @@ SSD tiering underneath it, and (with Guard) survival of the engine process.
 On the default path KVCR stores nothing of its own; it indexes vLLM's host tier
 and pins chunks in place for peer reads.
 
+### KV sharing and remote peers
+
+Two planes, and they run in opposite directions: the **control** plane is ZMQ and
+flows consumer → producer (a request), while the **data** plane is NIXL and flows
+producer → consumer (an RDMA `WRITE` push). There is no remote *read*; the
+consumer never pulls, it asks to be written into.
+
+(KVCR line numbers below are `ai-dynamo/kvcr @ main`; vLLM CI pins `v0.1.1`, so
+they may drift slightly.)
+
+#### 1. Local registration — each process registers only its own memory
+
+At startup, on the progress thread (`progress.py:630`):
+
+- One NIXL agent per KVCR process:
+  `nixl_agent(name, nixl_agent_config(num_threads=4, capture_telemetry=True,
+  enable_listen_thread=True, listen_port=..., backends=...))`. The name is
+  `KVCR-{uuid4}` and the listen port is an ephemeral port the adapter grabs by
+  binding `:0` (`manager.py:353-356`, `:402`) — so the agent identity is
+  decoupled from host:port.
+- `_register_memory_regions()` (`progress.py:641`) walks every region — vLLM's
+  framework regions, KVCR-owned DRAM pools, G3 — and calls
+  `register_memory([(addr, extent, device_Id, "")], mem_type=...)` with
+  `extent = size + (count - 1) * (stride or size)`. **One registration covers the
+  whole strided pool**, not one per block; this is why a 50 GiB CPU tier costs a
+  single `ibv_reg_mr`-class call rather than millions.
+- Then `prepare_memory("", regions)` *and* `prepare_memory(agent_name, regions)`
+  build the local prepped descriptor grids, and `get_agent_metadata()` is cached
+  as `_nixl_agent_metadata` (`progress.py:659-661`) — the blob a peer needs.
+
+#### 2. Mapping a remote peer — the consumer advertises itself
+
+The peer handshake is carried by `ZmqPeerControlChannel` (msgpack frames,
+`control_host` / `control_ports[dp_local_rank]` / `control_advertise_host`,
+built at `manager.py:345-350`). Message types: `target_metadata`,
+`target_metadata_ack`, `start_write`, `write_refused`, plus the `write_done`
+NIXL notification.
+
+Counter-intuitively it is the **target (consumer) that pushes its metadata to the
+source**, because the source is the side that will issue the transfer.
+`_send_control` (`remote_fw_dram.py:954-987`) attaches to any outbound message:
+
+- `target_agent` — the consumer's NIXL agent name
+- `target_agent_metadata` — its `get_agent_metadata()` blob
+- `target_regions` — the label → `RegionDescriptor` catalogs (framework + KVCR)
+
+attached only while the source hasn't acked, rate-limited by
+`metadata_retry_interval_ms`. With `eager_ctrl_connect` the consumer sends a bare
+`target_metadata` up front (`:861`) so the handshake isn't on the first request's
+critical path.
+
+The source then does, in `_remote_agent()` (`remote_fw_dram.py:1810-1900`):
+
+1. validate that registration names match region labels,
+2. `agent.add_remote_agent(target_metadata)` → remote agent name,
+3. `progress.prepare_memory(remote_agent, regions, owner_name=target_agent)`,
+4. cache it in `_remote_agents_by_target[target_agent]`, reused by later ops
+   (telemetry reports `peer_setup … reused` vs `connected`).
+
+`prepare_memory` (`progress.py:330-378`) is the **pool-and-index** machinery:
+regions are grouped by `mem_type`, each label gets an offset in a per-mem-type
+grid, and `prep_xfer_dlist(agent_name, rows, mem_type, backends)` is called with
+`rows = (addr, size, device_Id, stride or size, count)`. A peer therefore resolves
+a `MemoryRef(agent, label, index)` to `(prepped handle, offset[label] + index)`
+locally — **block addresses are never sent per transfer**, only pool label plus
+element index.
+
+Invalidation: after a disconnect, `check_remote_metadata(remote_agent)` decides
+whether NIXL actually dropped the native metadata; if so `release_prepared()`,
+drop the cache entry, and bump `_route_generation[target]`. Changed metadata
+means `_unload_remote_agent()` then re-add. The code's own TODO notes that a peer
+*restart* is not distinguished from an additive metadata update — matching the
+observed fragility when a peer is restarted under load.
+
+#### 3. The transfer — `start_write` then one RDMA WRITE
+
+Consumer side (`submit_load` → `kvcr.deliver` → non-resident keys →
+`_remote_fw_dram.deliver` → `_TargetPullOp`, state `START_WRITE`):
+
+1. Target sends `start_write` (`remote_fw_dram.py:128-140`) carrying `op_handle`,
+   `remaining_timeout_ms`, `source_incarnation`, `keys`, **`dst_descriptors`**
+   (its own `MemoryRef`s — where the bytes should land) and
+   `allow_layout_subset`; state → `WAITING_WRITE_DONE`.
+2. Source resolves the keys to sources. If they live in vLLM-owned memory it
+   first acquires a framework pin (`_SourcePinOp`; the adapter's `_resolve_pin`
+   takes a hold via `parent.create_store_job`), then builds a `_SourceWriteOp`
+   in `READY_TO_WRITE`. The module header states the flow outright:
+   `start_write -> local claim/framework pin -> write -> write_done`.
+3. Before submitting, the route generation is re-checked **on the submitting
+   thread** (`remote_fw_dram.py:334-343`) — NIXL reuses handles for a reused
+   agent name, so a stale route must produce a refusal rather than bytes from a
+   dead generation.
+4. `progress.submit_transfer("WRITE", src_descriptors, dst_descriptors,
+   remote_side_agent=..., backend=..., notif_msg=_write_done_notif(...))`
+   (`:357`) → `_prepared_indices` on both sides →
+   `agent.make_prepped_xfer("WRITE", local, local_idx, remote, remote_idx,
+   notif_msg, backends)` → `agent.transfer(handle)`, whose post state is
+   `DONE` / `PROC` / `PEND` / `ERR` (`progress.py:242-300`). G3 (`mem_type
+   == "FILE"`) bypasses the prepped grids and uses `initialize_xfer` instead.
+5. Completion rides the transfer: the notification is delivered to the target,
+   whose `_poll_notifications` (`:1908`) decodes `write_done`, matches
+   `op_handle`, and honors `completed_indices` / `terminal` for partial success.
+   The source can also send `write_done(success=False)` over the control channel
+   on deadline or cancel, or `write_refused` (`:1401`) when it won't serve.
+
+Net effect: one RDMA WRITE straight from the producer's registered DRAM into the
+consumer's registered DRAM, no staging copy at either end, with both engine
+threads only enqueueing work. Default transport is UCX on both legs
+(`local_dram_backend`, `remote_fw_dram_backend`); G3 defaults to `GDS_MT`.
+
+## KVCR Guard
+
+Resilience against failures. Based on shared memory.
+
 ## llm-d support
 
 No support yet.
