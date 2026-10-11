@@ -214,4 +214,74 @@ Resilience against failures. Based on shared memory.
 
 ## llm-d support
 
-No support yet.
+No support yet. Searched the whole `llm-d` org — code, all repos, every
+versioned docs tree (0.7 → 0.10), PRs and issues: **zero** occurrences of
+`kvcr` / "KV Cache Runner", and zero of `kv_hints` / `kvHints`. llm-d's KV
+offloading docs name LMCache, Mooncake and NVIDIA **KVBM** as the out-of-tree
+options, never KVCR. The asymmetry is notable: KVCR's own README lists
+`llmd-router` under "Routers", but only the Dynamo KV Router is marked
+*supported*, so treat that listing as aspirational.
+
+Worth knowing that llm-d's founding architecture doc takes the opposite
+position by design: it "prioritizes a strong operational boundary between
+in-memory prefix cache tiers and local or remote storage tiers **rather than a
+unified memory API like the KV Block Manager**" — an objection that transfers
+directly to KVCR, KVBM's successor in this role.
+
+### What it would take for llm-d's router to replace Dynamo's KV router
+
+KVCR needs a KV-aware router to be useful at all: the quick-start states that
+vLLM's own router or `consistent_hash` "does not produce those hints". Nothing
+ties it to Dynamo though — the envelope is deliberately orchestrator-agnostic
+(RFC #53421 is titled "First-Class, **Orchestrator-Agnostic** KV Hint
+Envelope").
+
+**llm-d already has the hard half.** The KV-Cache Indexer (moved into
+`llm-d-router`, llm-d/llm-d-router#1886) keeps "a global, near-real-time view of
+KV-Cache block locality across a fleet of vLLM pods" from vLLM KVEvents,
+tracking which blocks sit on which node and which tier, and exposes
+`Score(prompt, pods)`. That is functionally the inventory Dynamo's KV router
+maintains. What is missing is not the index but the *emission*.
+
+Four pieces of work, in dependency order:
+
+1. **Expose `kv_hints` over HTTP — upstream vLLM, and the actual blocker.**
+   Today the envelope is plumbed only on the Python path
+   (`AsyncLLM.generate(kv_hints=...)` → `input_processor` → `EngineCoreRequest`
+   → `Request` → `ReqContext`) and there are **zero** references to it anywhere
+   under `vllm/entrypoints/`. That is why the quick-start runs
+   `python3 -m dynamo.vllm` rather than `vllm serve` — Dynamo's worker wraps
+   `AsyncLLM` in-process. An external HTTP gateway like llm-d's router cannot
+   attach a hint at all. The fix has a clean precedent in the same files:
+   `kv_transfer_params: dict[str, Any] | None`
+   (`vllm/entrypoints/openai/completion/protocol.py:226`, plus chat, responses,
+   anthropic), which is how NixlConnector P/D proxies pass params over HTTP.
+   A `kv_hints` field would be the same shape, and the typed envelope already
+   exists in `vllm/v1/kv_hints/protocol.py`. Note `vllm_xargs` is **not** a
+   shortcut: the adapter reads the typed `req_context.kv_hints`, not
+   `extra_args`. The only alternative is llm-d running its own Python frontend
+   around `AsyncLLM`, which is heavier and against its gateway architecture.
+2. **Map pod → KVCR control endpoint (llm-d-router).** The hint's
+   `source_control_endpoint` is
+   `tcp://<control_advertise_host>:<control_ports[dp_local_rank]>` — the ZMQ
+   control endpoint, *not* the HTTP one, and indexed by local DP rank. KVCR's
+   inventory events do not carry it, so the router must derive it from
+   deployment config (the `POD_IP` + base-port convention), DP-rank aware.
+3. **Block-hash and tier agreement — mostly free.** `block_hashes` are uint64
+   block keys the indexer already ingests from KVEvents. Needs
+   `self_describing_kv_events: true` (which KVCR requires for local G2/G3
+   inventory anyway), and the router should also consume KVCR's own inventory
+   events — they arrive tagged `ownership="kvcr"` with medium CPU/STORAGE — so
+   it can price "in that pod's vLLM CPU tier" differently from "in that pod's
+   KVCR DRAM/SSD".
+4. **Emission policy and envelope conformance.** Decide when a remote fetch
+   beats local recompute and emit only then; hints are advisory and a useless
+   one merely degrades to `MISS`. The parser is strict: `protocol_version
+   "0.1"`, `action_type "kv.fetch"`, `action_version "1.0"`, `mode` must be
+   `"copy"`, `no_retain` absent, `block_hashes` non-empty. Each pod's tier
+   config must also carry `"router_capabilities": ["router_hint"]` or the tier
+   refuses to construct.
+
+No NATS, etcd, or Dynamo runtime is needed. Item 1 is the only upstream change,
+it is small and mechanical, and it would unblock *any* orchestrator — which
+makes it the natural thing to propose first.
