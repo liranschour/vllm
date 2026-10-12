@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import ClassVar, Generic, TypeVar
 
+import msgspec
 from fastapi import Request
 from pydantic import ConfigDict
 
@@ -25,13 +26,14 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.serve.engine.serving import BaseServing
 from vllm.entrypoints.serve.engine.typing import AnyRequest
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
-from vllm.exceptions import GenerationError
+from vllm.exceptions import GenerationError, VLLMValidationError
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.detokenizer_utils import convert_ids_list_to_tokens
+from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.metrics.stats import RequestStateStats
 
 logger = init_logger(__name__)
@@ -267,6 +269,31 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
                 except ValueError:
                     pass
         return request.priority
+
+    @staticmethod
+    def _get_kv_hints(
+        request: ChatCompletionRequest | CompletionRequest | ResponsesRequest,
+    ) -> KvHintsEnvelope | None:
+        """Validate the request's KV hint envelope for the engine.
+
+        Args:
+            request: The incoming generate request.
+
+        Returns:
+            The parsed envelope, or None when the request carries no hints.
+
+        Raises:
+            VLLMValidationError: If the envelope does not match the schema.
+
+        """
+        if not request.kv_hints:
+            return None
+        try:
+            return msgspec.convert(request.kv_hints, type=KvHintsEnvelope)
+        except msgspec.ValidationError as exc:
+            raise VLLMValidationError(
+                f"Invalid kv_hints envelope: {exc}", parameter="kv_hints"
+            ) from exc
 
     async def _with_kv_transfer_rejection_cleanup(
         self,

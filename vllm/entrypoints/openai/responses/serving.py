@@ -95,6 +95,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import as_list
+from vllm.v1.kv_hints import KvHintsEnvelope
 
 logger = init_logger(__name__)
 
@@ -524,6 +525,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 trace_headers=trace_headers,
                 session_id=session_id,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                kv_hints=self._get_kv_hints(request),
             )
             generators.append(generator)
 
@@ -645,6 +647,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         trace_headers: Mapping[str, str] | None = None,
         session_id: str | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        kv_hints: KvHintsEnvelope | None = None,
     ):
         max_model_len = self.model_config.max_model_len
         cache_salt = cast(str | None, engine_input.get("cache_salt"))
@@ -671,6 +674,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 priority=priority,
                 session_id=session_id,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                kv_hints=kv_hints,
             )
 
             async for res in generator:

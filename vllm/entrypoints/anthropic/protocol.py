@@ -269,6 +269,16 @@ class AnthropicMessagesRequest(BaseModel):
             "ECTransfer parameters used for encoder-cache disaggregated serving."
         ),
     )
+    kv_hints: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Orchestrator-provided KV hint envelope forwarded to the KV "
+            "connector. Must match the KvHintsEnvelope schema: "
+            "`protocol_version`, `message_id`, and `actions`, each action "
+            "carrying `action_id`, `action_type`, `action_version`, and "
+            "`payload`. Malformed envelopes are rejected with 400."
+        ),
+    )
     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
         default=None,
         description=(

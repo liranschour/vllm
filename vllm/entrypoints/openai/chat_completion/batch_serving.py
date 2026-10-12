@@ -185,6 +185,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                     priority=request.priority,
                     data_parallel_rank=data_parallel_rank,
                     session_id=session_id,
+                    kv_hints=self._get_kv_hints(single_request),
                     **self._engine_reasoning_kwargs(
                         single_request,
                         parser,
