@@ -285,3 +285,11 @@ Four pieces of work, in dependency order:
 No NATS, etcd, or Dynamo runtime is needed. Item 1 is the only upstream change,
 it is small and mechanical, and it would unblock *any* orchestrator — which
 makes it the natural thing to propose first.
+
+The concrete, file-level change plan for items 1-4 — mirroring the router's
+existing P2P-tier path rather than replacing it — is in
+[`llm-d-router-kvcr-plan.md`](llm-d-router-kvcr-plan.md). Two findings there
+reduce the scope considerably: KVCR's `opportunistic_query` default removes the
+block-hash requirement for a first version, and the EPP's existing
+`x-llm-d-kv-cache-source-host-port` header already carries everything a
+`kv.fetch` hint needs — so a working v1 is sidecar-only.
