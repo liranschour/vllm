@@ -212,6 +212,184 @@ threads only enqueueing work. Default transport is UCX on both legs
 
 Resilience against failures. Based on shared memory.
 
+## Verification — two-pod PD tests
+
+Everything in the Design sections above was confirmed on real pods on
+2026-10-12: `llmd-prefiller` (10.0.1.136) and `llmd-decoder` (10.0.3.38),
+`meta-llama/Llama-3.2-1B`, TP 1, `--block-size 16`. That model and block size
+give **512 KiB per block**, so every byte count below should divide exactly by
+524288 — a useful sanity check that a transfer was real.
+
+### Environment
+
+| Piece | Value |
+| --- | --- |
+| vLLM | editable `/vllm-workspace/vllm` @ `d61c102f51`, plus the `kv_hints` HTTP patch (`9e1d6f2d75`) |
+| KVCR | `kvcr` 0.1.1 (`pip3 install "kvcr @ git+https://github.com/ai-dynamo/kvcr.git@v0.1.1"`) |
+| Env on both engines | `PYTHONHASHSEED=42`, `HF_HUB_OFFLINE=1`, `VLLM_LOGGING_LEVEL=DEBUG`, `UCX_NET_DEVICES=all` |
+| Drivers | `kvcr_connector_proxy.py` (prefill + hinted decode), `hint_only_decode.py` (hinted decode with **no** prefill) |
+
+The patch applies with `git apply` straight into the pods' editable checkout —
+pure Python, no rebuild. Verify the pieces landed before launching anything:
+
+```bash
+python3 -c "
+from vllm.v1.kv_offload.tiering.factory import SecondaryTierFactory
+print(SecondaryTierFactory.get_tier_class({'type':'kvcr'}).__name__)"
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8200/v1/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"M","prompt":"x","max_tokens":1,"kv_hints":{"bogus":true}}'
+# expect KVCRSecondaryTierManager, then 400 "Invalid kv_hints envelope"
+```
+
+### Tier configs used
+
+All three are the `secondary_tiers` entry of an `OffloadingConnector` /
+`TieringOffloadingSpec` `--kv-transfer-config`, with
+`"router_capabilities": ["router_hint"]`, `"control_host": "0.0.0.0"`,
+`"control_ports": [17771]`, `"control_advertise_host": "<own pod IP>"`,
+`"enable_telemetry": true`:
+
+- **arm A** — nothing else. Pin-only: `deposit` fails every key by design.
+- **arm B** — `"secondary_g2_slots": 4096` (2 GiB pool at 512 KiB/slot).
+- **strict** — `"opportunistic_query": false`, so a hint's `block_hashes` must
+  actually match. Used on the decoder to make hits hash-gated.
+- **pressure** — `cpu_bytes_to_use: 67108864` on the prefiller, i.e. a primary
+  tier of only **128 chunks**, to force vLLM's LRU to evict.
+
+**Restart order matters: producer first, consumer last.** Restarting one peer
+while the other lives leaves a stale NIXL route — the symptom is the consumer
+logging `remote_deliver result=failed` while the producer never logs
+`control_start_write`. This cost real debugging time; see the gotchas below.
+
+### Tests and results
+
+| # | Test | Config | Result |
+| --- | --- | --- | --- |
+| 1 | Control plane + transfer | arm A, opportunistic | **Pass.** 57 blocks, then 64 more; 121 cumulative, 60.5 MiB. Prefiller `connected_remotes=1` |
+| 2 | Negative control | arm A, **strict**, placeholder hash | **Pass (correctly refuses).** 1 query, **0 hits**, no transfer |
+| 3 | Exact hashes | arm A, **strict**, computed hashes | **Pass.** 64/64 hits, 64 blocks, 33,554,432 B |
+| 4 | Pool / deposit path | **arm B**, strict, exact | **Pass.** 60/60 hits; `local_fill` and `source_write` both 31,457,280 B; **no pin** |
+| 5 | Retention | arm B + pressure | **Pass.** 57/57 hits, 57 blocks served from the pool 5 requests after eviction |
+| 6 | Retention control | arm A + pressure | **Pass (correctly fails).** `framework_pin_wait failed`, `source_write failed`, 0 `remote_deliver` |
+
+Test 1 proves the whole chain end to end: proxy → HTTP `kv_hints` → serving →
+`generate` → `Request.kv_hints` → `ReqContext` → tiering manager → adapter
+`on_new_request` → `submit_hint` → eager ZMQ connect → `start_write` → RDMA
+WRITE. Tests 2 and 3 together prove the hint is genuinely hash-gated rather
+than "any hint fetches anything". Tests 5 and 6 are the pair that justifies the
+extra copy: identical sequence, only `secondary_g2_slots` differs, and only the
+pool can still serve a prefix vLLM's LRU has dropped.
+
+### The two source paths, as measured
+
+Test 4 vs test 1 on the **producer**, same request shape:
+
+| Prefiller scope | arm A (pin) | arm B (pool) |
+| --- | --- | --- |
+| `local_fill` | — | success |
+| `source_acquire` | pending | — |
+| `framework_pin_wait` | success | — |
+| `transfer_submit` / `source_write` | success | success |
+
+So arm B served peers out of its own DRAM via `_try_local_source_write` and
+never pinned vLLM memory, while arm A went
+`source_acquire → framework_pin_wait → write` out of pinned chunks. The
+`local_g2_total_slots` / `local_g2_free_slots` / `local_g2_allocated_slots` /
+`local_g2_evictable_slots` gauges exist **only** when a pool is configured, so
+their presence alone tells you which arm an engine is running.
+
+### Metrics that actually answer "did KV move?"
+
+Scrape `/metrics` on each engine (the periodic `KV Transfer metrics` DEBUG log
+line carries the same values):
+
+| Metric | Side | Meaning |
+| --- | --- | --- |
+| `vllm:kv_offload_tiering_chunk_queries_total{tier="1:kvcr"}` | consumer | lookups that reached the tier |
+| `vllm:kv_offload_tiering_chunk_hits_total{tier="1:kvcr"}` | consumer | lookups the tier claimed it could serve |
+| `vllm:kvcr_transfer_blocks_total{operation="remote_deliver"}` | consumer | blocks actually received |
+| `vllm:kvcr_transfer_bytes_total{operation="source_write"}` | producer | bytes actually sent |
+| `vllm:kvcr_transfer_bytes_total{operation="local_fill"}` | producer | bytes deposited into the KVCR pool |
+| `vllm:kvcr_duration_seconds_count{scope=…}` | both | per-stage trace: `hint_wait`, `control_start_write`, `source_acquire`, `framework_pin_wait`, `transfer_submit`, `remote_deliver` |
+| `vllm:kvcr_state{resource="connected_remotes"}` | both | peers whose NIXL agent is loaded |
+
+**Hits are not proof of transfer.** Test 6 scored 57 hits with zero bytes moved,
+because a router hint makes the tier report `FETCHABLE` without proving the
+source still holds the block — KVCR's design doc says so explicitly ("remote
+hints are request-scoped and advisory, not block residency"). Always read
+`kvcr_transfer_blocks{remote_deliver}` next to the hit count. The `kvcr_state`
+gauges are point-in-time and return to 0 once pins release, so a flat `0` after
+a successful run is expected — use the `_total` counters for history.
+
+### Reproducing
+
+```bash
+export KUBECONFIG=~/CWKubeconfig_waldorf_US-EAST-04A
+# 0. one-time per pod: install kvcr, apply the kv_hints patch
+#    (git diff 9e1d6f2d75^ 9e1d6f2d75 -- vllm/ > kv_hints.patch; oc cp; git apply)
+
+# 1. launch, producer first then consumer (each pod, own launcher script)
+oc exec llmd-prefiller -- bash -lc 'nohup /tmp/start_kvcr_prefiller.sh &'
+oc exec llmd-decoder   -- bash -lc 'nohup /tmp/start_kvcr_decoder.sh &'
+
+# 2. proxy next to the prefiller; exact mode needs the engines' PYTHONHASHSEED
+oc exec llmd-prefiller -- bash -lc 'cd /tmp && PYTHONHASHSEED=42 HF_HUB_OFFLINE=1 \
+  nohup python3 kvcr_connector_proxy.py --port 8195 \
+    --prefiller-hosts 127.0.0.1 --prefiller-ports 8100 \
+    --decoder-hosts 10.0.3.38 --decoder-ports 8200 \
+    --kvcr-control-host 10.0.1.136 --kvcr-control-port 17771 \
+    --hash-mode exact --tokenizer meta-llama/Llama-3.2-1B --block-size 16 &'
+
+# 3. one request with a UNIQUE prompt spanning several whole blocks
+#    (a repeated prompt hits the GPU prefix cache and transfers nothing)
+curl -s localhost:8195/v1/completions -H 'content-type: application/json' \
+  -d '{"model":"meta-llama/Llama-3.2-1B","prompt":"<unique, ~900 tokens>","max_tokens":8}'
+```
+
+For tests 5 and 6, relaunch the prefiller with the **pressure** config, then:
+prefill the target prompt directly on the prefiller (`:8100`, `max_tokens=1`),
+send four filler prefills of similar length to push the primary tier past its
+128 chunks, then replay the target with `hint_only_decode.py`:
+
+```bash
+PYTHONHASHSEED=42 HF_HUB_OFFLINE=1 MODEL=meta-llama/Llama-3.2-1B \
+  PROMPT_FILE=/tmp/promptA.txt DECODER_URL=http://10.0.3.38:8200 \
+  SOURCE_HOST=10.0.1.136 SOURCE_PORT=17771 python3 /tmp/hint_only_decode.py
+```
+
+The proxy cannot be used for that last step: its prefill leg would recompute
+the prefix and repopulate the very tier the test needs empty.
+
+### Gotchas that cost time
+
+1. **`PYTHONHASHSEED` must match the engines'** for exact hashes, for *every*
+   algo including sha256 — `resolve_none_hash_seed` prefers that env var over
+   the fixed default seed, so an unseeded proxy chains from a different
+   `NONE_HASH`. Measured: 0 hits unseeded, 64/64 seeded.
+2. **Restart both peers, consumer last.** A one-sided restart leaves a stale
+   NIXL route; the survivor fails in `transfer_submit` or never receives
+   `start_write`.
+3. **A failed remote load degrades gracefully** — the request still returns 200
+   and recomputes locally, even with `kv_load_failure_policy=fail`. So a "200 OK"
+   says nothing about whether KV moved; only the counters do.
+4. **Prompts must be unique per run.** A repeat hits the GPU prefix cache and
+   never consults the tier.
+5. **A pool plus KV events needs `self_describing_kv_events: true`** or the tier
+   refuses to construct. With events off entirely it only warns: *"KVCR local
+   DRAM is enabled, but KV cache events are disabled; local DRAM inventory will
+   not be published"*.
+6. **`pkill -f <pattern>` inside `oc exec` kills its own shell** when the
+   pattern appears in the command line. Use a bracket class: `pkill -f "VLLM[:]:"`.
+
+### Not covered
+
+Guard mode (`kvcr_service_socket_path` + `compatibility_digest`), G3/SSD
+(`g3`), DP > 1 on either role (the proxy supports it via
+`--prefiller-dp-size` and control-port arithmetic, but it was not exercised),
+TP > 1, multi-block-size layouts, and hint-driven prefetch — which the adapter
+cannot do at all today, since it only ever calls `deliver` and never `fetch`.
+
 ## llm-d support
 
 No support yet. Searched the whole `llm-d` org — code, all repos, every
