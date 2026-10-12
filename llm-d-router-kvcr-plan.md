@@ -96,9 +96,21 @@ implementation: `tests/v1/kv_offload/tiering/kvcr/kvcr_connector_proxy.py`,
 }
 ```
 
-The parser is strict: `protocol_version "0.1"`, `action_type "kv.fetch"`,
-`action_version "1.0"`, `mode` must be `"copy"`, `no_retain` absent,
-`block_hashes` non-empty.
+What the parser actually enforces (`kvcr/src/kvcr/hint_parser.py:55-123`) —
+worth separating, because only half of it is a hard requirement:
+
+- **Rejected** (`ValueError`, the whole envelope is dropped): a non-list
+  `actions`; no action whose `action_type` is exactly `"kv.fetch"` carrying a
+  mapping `payload`; `no_retain` present at all; `mode` present with any value
+  other than `"copy"`; a missing or non-string or empty
+  `source_control_endpoint`; `block_hashes` not a list, or containing a
+  non-`int`, a `bool`, or a value outside `[0, 2**64)`; and — importantly —
+  **`block_hashes` resolving to an empty set**.
+- **Warned only** (processed anyway with the supported schema):
+  `protocol_version` and `action_version` mismatches, via
+  `_warn_version_mismatch`. So sending `"0.1"` / `"1.0"` is correct but not
+  load-bearing.
+- `mode` is **optional** and defaults to `"copy"`.
 
 ---
 
@@ -106,12 +118,40 @@ The parser is strict: `protocol_version "0.1"`, `action_type "kv.fetch"`,
 
 These came out of reading both trees and are why the plan is small.
 
-1. **`opportunistic_query` defaults to `True`** in the vLLM adapter
-   (`vllm/v1/kv_offload/tiering/kvcr/manager.py:287`). It drops the
-   hash-membership test, so the decoder queries the named peer for *every* key
-   in the request. **A v1 router does not need real block hashes** — a
-   single-element placeholder list satisfies the non-empty rule and the real
-   transfer path still runs. This is what makes a sidecar-only v1 possible.
+1. **`block_hashes` is a filter, not the work list — and opportunistic mode
+   switches the filter off.** This is the finding the whole plan rests on, so
+   the mechanics in full:
+
+   - The hint is stored **per request**, `_request_hints[request_id] =
+     _RequestHint(source, block_hashes, ...)`
+     (`kvcr/src/kvcr/remote_fw_dram.py:547-560`).
+   - The engine's lookup is per key and request-scoped:
+     `lookup(key, req_context)` → `kvcr.query((block_key,), req_id)`
+     (`manager.py:460-467`) → `remote_fw_dram.query(key, request_id)`
+     (`remote_fw_dram.py:568`).
+   - That `query` returns `False` when there is no hint, no source, the hint
+     has `failed`, or the key is in `missing_keys`. Only **then** does it
+     consult the hashes, and only if the flag is off:
+     `if not self._options.opportunistic_query and adapter.decode(key) not in
+     request_hint.block_hashes: return False` (`:580-583`).
+   - **`block_hashes` appears nowhere else in the functional path.** It never
+     scopes the fetch: `_start_target_pull` takes the keys of the engine's own
+     load job minus the negative cache — `keys = tuple(key for key in blocks
+     if key not in current_hint.missing_keys)` (`:611`) — and `missing_keys`
+     grows by whatever an op asked for and did not get (`:811`), so
+     over-asking self-corrects within a request.
+
+   With `opportunistic_query=True` — the vLLM adapter's default
+   (`manager.py:287`; note kvcr's own default is `False`, `config.py:49`) —
+   the hint therefore degenerates to exactly the P2P tier's semantics:
+   *this request may pull from this peer*, and KVCR runs its own per-key
+   lookup and `submit_load` against it. **A v1 router does not need real block
+   hashes**; a one-element placeholder satisfies the non-empty rule.
+
+   Caveat that belongs in the deployment contract: `opportunistic_query` is a
+   **per-pod engine setting, not a per-request hint field**, so the router
+   cannot choose per request. A deployment that turns it off makes exact
+   hashes (Phase 2) mandatory rather than optional.
 2. **The EPP needs no change for v1.** `x-llm-d-kv-cache-source-host-port`
    already carries exactly what the hint needs — which peer holds the prefix.
    Selection, sampling, the `minCachedTokenDelta` gate and the
@@ -288,9 +328,13 @@ Then branch on `--kv-cache-pull-protocol` at both call sites
 
 ## 6. Phase 2 — exact block hashes (`--kvcr-hint-mode=exact`)
 
-Needed only to exercise real hash matching, or to run with
-`opportunistic_query: false`. Opportunistic mode is correct but queries the
-peer for every key, so exact mode is the efficiency play, not a correctness fix.
+Needed to exercise real hash matching, and **mandatory** for any pod that sets
+`opportunistic_query: false` (finding 1 — it is a pod setting the router cannot
+override per request). Otherwise opportunistic mode is already correct: exact
+mode is the efficiency play, not a correctness fix. What it buys is a shorter
+lookup leg — opportunistic mode makes the decoder ask the peer about every key
+in the request, including keys the peer never held, and only the `missing_keys`
+negative cache trims that, after the first miss.
 
 The sidecar has no tokenizer, so the hashes must come from the EPP, which
 already has them (finding 4).
