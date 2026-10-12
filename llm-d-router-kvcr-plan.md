@@ -9,6 +9,13 @@ Scope: the router only. The KVCR tier itself and the vLLM `kv_hints` plumbing
 are prerequisites, tracked in [`KVCR.md`](KVCR.md). The P2P tier is **not**
 being migrated or removed — the two mechanisms coexist behind one selector.
 
+**Core design choice: the router names a peer, never a block list.** It always
+targets KVCR's `opportunistic_query=True`, so the hint's required
+`block_hashes` is a fixed placeholder and the engine does its own per-key
+lookup — the same request-scoped semantics the P2P tier already has. There is
+deliberately no exact-hash mode; §6 is the argument for that, and §3.1 the
+mechanism that allows it.
+
 Router baseline for every line reference below:
 `llm-d/llm-d-router @ 46f3635` ("Keep IPv6 addresses intact in endpoint
 subsets", #3305).
@@ -70,7 +77,7 @@ The peer's tier port is derived locally, never trusted from the wire:
 | Port meaning | P2P tier listener | KVCR **ZMQ control** port, `control_ports[dp_local_rank]` |
 | Correlation | `kv_request_id` UUID per leg | none — fetch is keyed by block hashes; `message_id`/`action_id` are advisory |
 | Prefill-side injection (PD) | required (`remote_decoder.kv_request_id`) | **none**: a KVCR producer is passive, it answers `start_write` by pinning its own host-tier chunks |
-| Keys named | implicit, tier does its own lookup | **`block_hashes` explicit and non-empty** |
+| Keys named | implicit, tier does its own lookup | same — `block_hashes` is a filter switched off by `opportunistic_query`, so it carries a **placeholder** (§3.1, §6) |
 | Direction | consumer pulls | consumer asks, **producer RDMA-WRITEs** (destination-initiated) |
 | Ordering | prefill-first already enforced | prefill-first **mandatory** — there is no push-to-waiting-decoder mode |
 | Engine gate | `p2p` secondary tier | KVCR tier + `router_capabilities: ["router_hint"]` |
@@ -148,41 +155,43 @@ These came out of reading both trees and are why the plan is small.
    lookup and `submit_load` against it. **A v1 router does not need real block
    hashes**; a one-element placeholder satisfies the non-empty rule.
 
-   Caveat that belongs in the deployment contract: `opportunistic_query` is a
-   **per-pod engine setting, not a per-request hint field**, so the router
-   cannot choose per request. A deployment that turns it off makes exact
-   hashes (Phase 2) mandatory rather than optional.
+   **Design decision: the router always targets `opportunistic_query=True`,
+   and there is no exact-hash mode** — rationale in §6. Because
+   `opportunistic_query` is a per-pod engine setting and not a per-request
+   hint field, this is a *deployment contract* rather than a runtime choice:
+   a pod that disables it silently stops matching the router's hints.
+   `block_hashes` is therefore always the placeholder constant.
 2. **The EPP needs no change for v1.** `x-llm-d-kv-cache-source-host-port`
    already carries exactly what the hint needs — which peer holds the prefix.
    Selection, sampling, the `minCachedTokenDelta` gate and the
    `ReusablePrefixTokens` floor are all protocol-agnostic. **All v1 work is
    sidecar-side.**
-3. **`PrefixCacheMatchInfo` carries counts only** — `matchBlocks`,
-   `cachedBlockCount`, `confirmedCachedBlockCount`, `cachedBlocksByTier`
-   (`pkg/epp/framework/plugins/datalayer/attribute/prefix/data_types.go:46-77`)
-   — and no hashes. So exact-hash mode cannot read them from the attribute.
-4. **But the keys are already in plugin state.** The precise producer stashes
+3. **Where real hashes would live, if they were ever needed.** Recorded as an
+   escape hatch only, since §6 rules them out. `PrefixCacheMatchInfo` exposes
+   counts and no hashes
+   (`pkg/epp/framework/plugins/datalayer/attribute/prefix/data_types.go:46-77`),
+   but the precise producer already stashes
    `perPromptKeys [][]kvblock.BlockHash` under `blockKeysStateKey`
    (`preciseprefixcache/producer.go:436`, `prerequest.go:60`), and
    **`kvblock.BlockHash` is `uint64`** (`pkg/kvcache/kvblock/index.go:164`) —
-   the exact type `block_hashes` wants. Exact mode is a *serialization* job,
-   not a recomputation job.
-5. **`ownership` is ignored but harmless.** The router's vLLM event adapter
+   the exact type `block_hashes` wants. It would be a serialization job, not
+   a recomputation job.
+4. **`ownership` is ignored but harmless.** The router's vLLM event adapter
    decodes a fixed 11-field prefix and skips the remainder
    (`pkg/kvevents/engineadapter/vllm_msgpack.go:161-183`, `:201`). vLLM's
    `locality`/`ownership`/`session_id` trail that prefix
    (`vllm/distributed/kv_events.py:88` and `:123`), so KVCR-tagged events decode
    without misalignment — the router just cannot tell a KVCR-owned block from
    a vLLM-owned one.
-6. **The CPU-tier gate works for KVCR events.** `medium` becomes `DeviceTier`
+5. **The CPU-tier gate works for KVCR events.** `medium` becomes `DeviceTier`
    and is lowercased (`pkg/kvevents/pool.go:52`), so vLLM's `Medium.CPU`
    (`"CPU"`) lands as `"cpu"` and matches p2psource's
    `cpuDeviceTier = "cpu"` (`producer.go:327`). KVCR's `medium=STORAGE` (G3)
    becomes `"storage"` and is correctly *excluded* from the CPU floor.
-7. **Rank derivation is reusable verbatim.** KVCR indexes `control_ports` by
+6. **Rank derivation is reusable verbatim.** KVCR indexes `control_ports` by
    `dp_local_rank`, the same pod-local rank `p2pPortFor` already recovers from
    the routed HTTP port. One shared helper serves both.
-8. **`control_advertise_host` defaults to `socket.gethostname()`**
+7. **`control_advertise_host` defaults to `socket.gethostname()`**
    (`manager.py:332`), i.e. the pod name — resolvable only via a headless
    service. Deployments must set it to `POD_IP` so the host the router names
    and the host KVCR advertises agree.
@@ -203,7 +212,17 @@ Not router work, but the plan is blocked without them.
 - **Engine config per pod**: KVCR secondary tier with
   `router_capabilities: ["router_hint"]` (the tier refuses to construct
   without it, `manager.py:310`), `self_describing_kv_events: true`,
-  `control_advertise_host: $POD_IP`, and a known `control_ports` base.
+  `control_advertise_host: $POD_IP`, a known `control_ports` base, and
+  **`opportunistic_query` left at its adapter default of `True`** — disabling
+  it makes every router hint stop matching (§6).
+- **Pod-to-pod block-key agreement**, unchanged from the P2P tier's existing
+  deployment requirements and *not* removed by dropping exact-hash mode: every
+  peer needs the same `--block-size`, the same
+  `--prefix-caching-hash-algo`, and — for the non-crypto `xxhash*` algos,
+  which seed `NONE_HASH` per process — a shared `PYTHONHASHSEED`. The keys the
+  decoder asks its peer for are vLLM's own block hashes, computed
+  independently on each pod; if they disagree, nothing matches no matter what
+  the hint says.
 - **kvcr `v0.1.1`** (what vLLM CI pins).
 
 ---
@@ -226,8 +245,9 @@ New file `pkg/sidecar/proxy/connector_kvcr.go`, mirroring `connector_p2p.go`.
 - `--enable-kvcr-pull` — compose a KVCR pull alongside a NIXL PD connector,
   mirroring `--enable-p2p-pull`.
 - Add `kvcr` to `supportedKVConnectors` (`options.go:175`) for the PD path.
-- `--kvcr-hint-mode={opportunistic|exact}`, default `opportunistic` (see
-  Phase 2).
+
+No hint-mode flag: `block_hashes` is always the placeholder (§6), so there is
+nothing to configure.
 
 **Recommendation:** a single `--kv-cache-pull-protocol` selector plus a `kvcr`
 connector value. It keeps one source-selection path and one validation path,
@@ -266,13 +286,20 @@ const (
     kvFetchActionType     = "kv.fetch"
     kvFetchActionVersion  = "1.0"
     kvFetchModeCopy       = "copy"
+
+    // placeholderBlockHash satisfies the parser's non-empty block_hashes rule.
+    // KVCR never compares it: opportunistic_query (the vLLM adapter default)
+    // skips the membership test, so the hint means "this request may pull from
+    // this peer" and KVCR runs its own per-key lookup. Any uint64 works.
+    placeholderBlockHash = uint64(1)
 )
 
-func (s *Server) kvcrFetchHints(sourceHostPort string, blockHashes []uint64) map[string]any
+func (s *Server) kvcrFetchHints(sourceHostPort string) map[string]any
 ```
 
-Emits the §2 shape. `mode: "copy"`, no `no_retain`. In `opportunistic` mode
-`blockHashes` is the one-element placeholder.
+Emits the §2 shape with `block_hashes: [placeholderBlockHash]`, `mode: "copy"`,
+no `no_retain`. The signature takes no hash list — there is deliberately no way
+to pass one.
 
 ### 5.4 Decode-only pull
 
@@ -326,54 +353,48 @@ Then branch on `--kv-cache-pull-protocol` at both call sites
 
 ---
 
-## 6. Phase 2 — exact block hashes (`--kvcr-hint-mode=exact`)
+## 6. Why there is no exact-hash mode
 
-Needed to exercise real hash matching, and **mandatory** for any pod that sets
-`opportunistic_query: false` (finding 1 — it is a pod setting the router cannot
-override per request). Otherwise opportunistic mode is already correct: exact
-mode is the efficiency play, not a correctness fix. What it buys is a shorter
-lookup leg — opportunistic mode makes the decoder ask the peer about every key
-in the request, including keys the peer never held, and only the `missing_keys`
-negative cache trims that, after the first miss.
+**Decision: always `opportunistic_query=True`, always a placeholder
+`block_hashes`.** The router names a *peer*, never a block list. Recorded here
+because the alternative looks tempting and is a trap.
 
-The sidecar has no tokenizer, so the hashes must come from the EPP, which
-already has them (finding 4).
+What ruling it out buys:
 
-1. **EPP — publish the keys.** In `p2psource`'s `PreRequest`, read
-   `blockKeysState.perPromptKeys` and emit the matched prefix keys for the
-   *selected source* on a new header, e.g.
-   `x-llm-d-kv-cache-source-block-hashes`. Register it in
-   `pkg/common/routing/common.go` so it inherits `SetRoutingHeader` /
-   `TakeRoutingHeaderValues` and the ingress strip.
-   - The EPP must publish only the blocks the source *confirmably holds in a
-     pull-servable tier* — `BlocksByTier["cpu"]`, the same prefix the
-     `ReusablePrefixTokens` floor is computed from — not the whole prompt.
-   - Cross-plugin state access (precise-cache state read from p2psource) may
-     warrant promoting the keys into a declared data-layer attribute instead of
-     reaching into another plugin's state key.
-2. **Encoding.** A 10k-token prompt at `blockSizeTokens: 64` is ~156 hashes;
-   decimal would be ~3 KB of header. Use base64 of little-endian `uint64`s
-   (~1.4 KB) and cap the count, dropping to opportunistic mode past the cap.
-3. **Sidecar.** Decode the header into `[]uint64` and pass it to
-   `kvcrFetchHints`. Treat a malformed value as absent and fall back to the
-   placeholder — never fail the request over an advisory hint.
-4. **Agreement requirements** (silent-miss traps, all confirmed in `KVCR.md`
-   and the PoC proxy docstring; a mismatch degrades to `MISS`, it does not
-   error):
-   - `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1` (the default) — at `0` the
-     decoder's keys decode to raw bytes and can never match a uint64 list.
-   - the EPP token processor's hash algo must equal the engine's
-     `--prefix-caching-hash-algo`.
-   - `xxhash*` seeds `NONE_HASH` per process, so exact mode needs `sha256*` or
-     a **shared `PYTHONHASHSEED`** across every pod *and* the EPP.
-   - exact mode assumes no per-block extra keys: `cache_salt`, multimodal
-     inputs and LoRA requests fall outside it — force opportunistic there.
-     `extra_keys` is already decoded by the EPP adapter, so the producer can
-     detect and downgrade.
+- **No hash plumbing in the EPP.** No new header, no ~1.4 KB of base64
+  per request, no reaching across plugin state for `perPromptKeys`, no
+  decision about which prefix of the match to publish.
+- **No EPP↔engine hash agreement.** Exact mode would have required the EPP's
+  token processor to reproduce the engine's hashes bit for bit — same
+  `--prefix-caching-hash-algo`, `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1`, and a
+  `PYTHONHASHSEED` shared between the *EPP* and every pod. Every one of those
+  is a silent-miss trap: a mismatch degrades to `MISS` with no error anywhere.
+- **No correctness cliff on hard inputs.** Exact hashing has no answer for
+  per-block `extra_keys` — `cache_salt`, multimodal inputs, LoRA — or for chat
+  requests, where the engine hashes the *templated* prompt. Each would have
+  needed a detect-and-downgrade path back to opportunistic anyway.
+
+What it costs, stated plainly: a longer **lookup leg**. The decoder asks the
+named peer about every key in the request, including keys that peer never
+held, and only the `missing_keys` negative cache (§3.1) trims the set — after
+the first miss. That is control-plane traffic, not data-plane: it does not move
+KV, and it is bounded per request. Given the measured lookup-leg behaviour
+under concurrency, this is the number to watch after the first deployment, and
+the reason §5.7 logs the hash count and §8 asserts hit counters.
+
+**What this does *not* remove:** pod-to-pod block-key agreement. The decoder
+still asks its peer for vLLM's own block hashes, computed independently on each
+pod, so matching `--block-size`, `--prefix-caching-hash-algo` and (for
+`xxhash*`) `PYTHONHASHSEED` across peers remain hard requirements — see §4.
+Dropping exact mode removes the EPP from that contract, not the pods.
+
+If a deployment ever genuinely needs `opportunistic_query: false`, finding 3
+records where the real hashes live; it is a serialization job, and this section
+is the argument against doing it.
 
 ---
 
-## 7. Phase 3 — optional refinements
+## 7. Phase 2 — optional refinements
 
 - **Price KVCR-owned blocks separately.** Add `ownership` to the vLLM event
   decoder (`vllm_msgpack.go`; it is trailing, so appending a 12th decoder is
@@ -386,18 +407,23 @@ already has them (finding 4).
 - **Docs**: a `kvcrsource` section in the `dataproducer` README, deployment
   requirements mirroring the p2psource list (block sizes equal,
   `offload_prompt_only: false` for decode-phase blocks, shared
-  `PYTHONHASHSEED` where exact mode is used), and a `docs/disaggregation.md`
-  entry for the control-port convention.
+  `PYTHONHASHSEED` across peers, `opportunistic_query` left on), and a
+  `docs/disaggregation.md` entry for the control-port convention.
 
 ---
 
 ## 8. Testing
 
 - **Sidecar unit** (`connector_kvcr_test.go`, mirroring
-  `connector_p2p_test.go`): envelope shape and strict-parser conformance;
+  `connector_p2p_test.go`): envelope shape against every hard rule in §2,
+  including a non-empty `block_hashes` and an absent `no_retain`;
   `tcp://` formatting incl. IPv6; rank derivation and every fallback;
   self-source skip; `kv_transfer_params` left untouched; client-supplied
-  `kv_hints` dropped; malformed hash header ignored.
+  `kv_hints` dropped.
+    - Worth a dedicated case: the placeholder is a plain `uint64` and must not
+      serialize as a float, a string, or a JSON `true` — the parser rejects
+      bools and non-ints outright (`hint_parser.py:112-118`), so a marshalling
+      slip here silently disables every hint.
 - **Dispatch** (`dispatch_test.go`): protocol selector routes to the right
   injector; `kvCachePullAvailable` gating; SSRF rejection still blanks the
   source.
@@ -409,7 +435,9 @@ already has them (finding 4).
   one-sided peer restart or an unmatched `PYTHONHASHSEED` shows up as a
   silent miss rather than an error.
 - **Negative**: no `router_capabilities` → tier refuses to construct;
-  hint naming an unreachable endpoint → request still succeeds by recompute.
+  hint naming an unreachable endpoint → request still succeeds by recompute;
+  a pod with `opportunistic_query: false` → hints stop matching, which is the
+  regression this contract exists to catch.
 
 ---
 
@@ -432,7 +460,8 @@ already has them (finding 4).
    selector is a deployment-wide choice. If mixed fleets are ever needed, the
    source's protocol has to become a per-endpoint property in the index rather
    than sidecar config.
-5. **Chat-template hashing.** Exact hashes over chat requests depend on the EPP
-   tokenizing exactly as the engine templates. The precise producer already
-   owns this contract; exact mode inherits it, and `/v1/completions` or
-   token-id prompts are the safe path.
+5. **`opportunistic_query` is an unenforceable contract.** The router cannot
+   read it, and a pod that disables it degrades to recompute silently (§6).
+   The only defence is a pinned deployment manifest plus the decoder-side
+   hit-rate metric in risk 2 — worth stating explicitly in the runbook rather
+   than discovering as a performance mystery.

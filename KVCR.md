@@ -466,8 +466,12 @@ makes it the natural thing to propose first.
 
 The concrete, file-level change plan for items 1-4 — mirroring the router's
 existing P2P-tier path rather than replacing it — is in
-[`llm-d-router-kvcr-plan.md`](llm-d-router-kvcr-plan.md). Two findings there
-reduce the scope considerably: KVCR's `opportunistic_query` default removes the
-block-hash requirement for a first version, and the EPP's existing
-`x-llm-d-kv-cache-source-host-port` header already carries everything a
-`kv.fetch` hint needs — so a working v1 is sidecar-only.
+[`llm-d-router-kvcr-plan.md`](llm-d-router-kvcr-plan.md). Item 3 above turns
+out to be nearly free, which collapses most of the work: `block_hashes` is
+consulted in exactly one place, a per-key membership test that
+`opportunistic_query` (the vLLM adapter's default) switches off, and it never
+scopes the fetch. So the plan commits to always running opportunistic, sends a
+placeholder hash list, and has **no exact-hash mode** — which keeps the EPP out
+of the engine's hashing contract entirely. Combined with the fact that the
+existing `x-llm-d-kv-cache-source-host-port` header already carries everything
+a `kv.fetch` hint needs, a working v1 is sidecar-only.
