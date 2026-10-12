@@ -30,9 +30,13 @@ Block hashes (``--hash-mode``):
   miss: ``VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES`` must stay at its default of 1
   (at 0 the decoder's keys decode to raw bytes, which can never match the
   envelope's uint64 list), and ``--hash-algo`` here must match the engine's
-  ``--prefix-caching-hash-algo``. The non-crypto algos (``xxhash*``) seed
-  NONE_HASH per process unless ``PYTHONHASHSEED`` is shared, so exact mode
-  needs ``sha256*`` or a pinned PYTHONHASHSEED everywhere. Exact mode also
+  ``--prefix-caching-hash-algo``. ``PYTHONHASHSEED`` must match the engines'
+  too, for *every* algo and not just the non-crypto ones:
+  ``resolve_none_hash_seed`` prefers it over the fixed default seed, so a proxy
+  started without it chains from a different NONE_HASH and every hash misses.
+  Measured on a two-pod run with ``opportunistic_query: false``: unseeded exact
+  hints scored 0 hits, and the same setup with PYTHONHASHSEED matched scored
+  64/64 and transferred 64 blocks. Exact mode also
   assumes no per-block extra keys, so ``cache_salt``, multimodal inputs and
   LoRA requests fall outside it — use ``opportunistic`` for those.
 
