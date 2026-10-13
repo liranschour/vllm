@@ -17,8 +17,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/router_env.sh"
 
 : "${ROUTER_SRC:=$HOME/llm-d-router}"
-: "${GO_BIN:=$HOME/.local/go-sdk/go/bin/go}"
 BUILD_OUT="${BUILD_OUT:-${TMPDIR:-/tmp}/pd-sidecar}"
+
+# go.mod requires a Go newer than most distros ship, so this prefers a
+# user-local SDK and falls back to whatever is on PATH.
+if [[ -z "${GO_BIN:-}" ]]; then
+    if [[ -x "$HOME/.local/go-sdk/go/bin/go" ]]; then
+        GO_BIN="$HOME/.local/go-sdk/go/bin/go"
+    else
+        GO_BIN="$(command -v go || true)"
+    fi
+fi
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 die() {
@@ -27,7 +36,11 @@ die() {
 }
 
 [[ -d "$ROUTER_SRC" ]] || die "router source not found at $ROUTER_SRC (set ROUTER_SRC)"
-[[ -x "$GO_BIN" ]] || die "go not found at $GO_BIN (set GO_BIN)"
+[[ -n "$GO_BIN" && -x "$GO_BIN" ]] || die "no Go toolchain found. Install the version
+go.mod requires and set GO_BIN, e.g.:
+  curl -fsSL https://go.dev/dl/go1.27.2.linux-amd64.tar.gz -o /tmp/go.tar.gz
+  mkdir -p ~/.local/go-sdk && tar -C ~/.local/go-sdk -xzf /tmp/go.tar.gz"
+log "go: $("$GO_BIN" version)"
 
 log "building $ROUTER_SRC/cmd/pd-sidecar -> $BUILD_OUT"
 (

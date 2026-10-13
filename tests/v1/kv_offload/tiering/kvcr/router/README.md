@@ -36,12 +36,20 @@ does not exercise the real EPP's source selection.**
 ## Prerequisites
 
 - Both pods running, with a vLLM checkout that has the KVCR tier and accepts
-  `kv_hints` on the HTTP APIs, and the `kvcr` package installed.
-- A Go toolchain locally to build the sidecar (see `stage_sidecar.sh`).
+  `kv_hints` on the HTTP APIs, and the `kvcr` package installed. Verified
+  against engines at `d61c102f51`.
+- A checkout of `llm-d-router` with the KVCR sidecar support, at `~/llm-d-router`
+  or wherever `ROUTER_SRC` points.
+- A Go toolchain matching `go.mod` (1.27.2), which is newer than most distros
+  ship. `stage_sidecar.sh` looks in `~/.local/go-sdk/go/bin/go`, then `PATH`,
+  and prints the install commands if it finds neither. Override with `GO_BIN`.
 - `KUBECONFIG` pointing at the cluster; defaults to
   `~/CWKubeconfig_waldorf_US-EAST-04A`.
 
-Everything else — ports, model, tier sizes, pod names — is in
+Nothing needs to be installed on the pods: the sidecar is built statically and
+copied in with `oc cp`, and the test harness is stdlib-only Python.
+
+Everything else — ports, model, tier sizes, pod names, `PYTHONHASHSEED` — is in
 `router_env.sh` and overridable from the environment.
 
 ## Running it
