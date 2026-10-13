@@ -16,9 +16,16 @@ lookup — the same request-scoped semantics the P2P tier already has. There is
 deliberately no exact-hash mode; §6 is the argument for that, and §3.1 the
 mechanism that allows it.
 
-Router baseline for every line reference below:
+Router baseline for the line references below:
 `llm-d/llm-d-router @ 46f3635` ("Keep IPv6 addresses intact in endpoint
-subsets", #3305).
+subsets", #3305). The implementation landed against `f45f48b5`; the anchors
+cited here were re-checked against that commit.
+
+**Status.** Phase 0 (§4) is in place: the vLLM `kv_hints` HTTP change is
+committed as `9e1d6f2d75` with its entrypoint tests passing, though **not yet
+upstream**. Phase 1 (§5) is implemented and pushed — commit `522fa0c5` on
+`feat/kvcr-kv-hints` in `liranschour/llm-d-router`. Phase 2 (§7) is explicitly
+**not** being implemented.
 
 ---
 
@@ -229,6 +236,16 @@ Not router work, but the plan is blocked without them.
 
 ## 5. Phase 1 — sidecar: `kv_hints` injection (the v1 deliverable)
 
+**Status: implemented.** `feat(sidecar): drive KVCR cached-prefix pulls with a
+kv_hints envelope`, commit `522fa0c5` on `feat/kvcr-kv-hints`
+(`liranschour/llm-d-router`), against upstream `f45f48b5`. Build, `go vet`,
+`gofmt` and `golangci-lint` (v2.14.0, the version `Dockerfile.builder` pins)
+are clean, and the whole `./pkg/...` suite passes.
+
+This section describes the code as it landed. Where it diverges from the design
+as first written, the divergence is called out — §5.1 dropped a flag and §5.6 is
+new.
+
 New file `pkg/sidecar/proxy/connector_kvcr.go`, mirroring `connector_p2p.go`.
 
 ### 5.1 Configuration
@@ -236,47 +253,68 @@ New file `pkg/sidecar/proxy/connector_kvcr.go`, mirroring `connector_p2p.go`.
 `pkg/sidecar/proxy/options.go`, mirroring `p2p-connector-port` /
 `enable-p2p-pull`:
 
-- `--kvcr-control-port` (env `KVCR_CONTROL_PORT`, default e.g. `17771`) — the
-  rank-0 ZMQ control port; rank *r* is `base + r`. Same validation as
-  `P2PConnectorPort`: 1-65535, and `base + DataParallelSize - 1 <= 65535`
-  (`options.go:722-729`).
-- `--kv-cache-pull-protocol={p2p|kvcr}`, default `p2p` — which request field
-  the sidecar injects for a named source.
+- `--kvcr-control-port` (env `KVCR_CONTROL_PORT`, default `17771`) — the
+  rank-0 ZMQ control port; rank *r* is `base + r`. Validated like
+  `P2PConnectorPort`: 1-65535, and `base + DataParallelSize - 1 <= 65535`.
 - `--enable-kvcr-pull` — compose a KVCR pull alongside a NIXL PD connector,
-  mirroring `--enable-p2p-pull`.
-- Add `kvcr` to `supportedKVConnectors` (`options.go:175`) for the PD path.
+  mirroring `--enable-p2p-pull`. Rejected unless `--kv-connector=nixlv2`, and
+  **rejected together with `--enable-p2p-pull`**.
+- `kvcr` added to `supportedKVConnectors` for the PD path, so it also appears
+  in the `--kv-connector` help text automatically.
+- `KVCRControlPort` / `EnableKVCRPull` on `Config`, plus `yamlConfiguration`
+  entries and merge arms so both are settable from the config file.
 
 No hint-mode flag: `block_hashes` is always the placeholder (§6), so there is
 nothing to configure.
 
-**Recommendation:** a single `--kv-cache-pull-protocol` selector plus a `kvcr`
-connector value. It keeps one source-selection path and one validation path,
-and makes the two tiers mutually exclusive per deployment — which they must be,
-since a given pod runs one secondary tier. The alternative (a second,
-independent `kvcrCacheSource` header and parallel plumbing) doubles the EPP
-surface for no gain, because the header's content is identical.
+**Dropped during implementation: `--kv-cache-pull-protocol={p2p|kvcr}`.** The
+design called for an explicit selector. It turned out to be redundant and
+unsafe: the protocol is already a total function of
+`(kv-connector, enable-p2p-pull, enable-kvcr-pull)`, so a third knob could only
+ever contradict the other two — `--kv-connector=kvcr
+--kv-cache-pull-protocol=p2p` has no meaningful behaviour. Two predicates
+derive it instead (§5.7), and the mutual-exclusion check above makes the
+ambiguous combination unrepresentable rather than merely discouraged.
+
+The rejected alternative is unchanged: a second, independent `kvcrCacheSource`
+header with parallel EPP plumbing would double the EPP surface for no gain,
+because the header's content is identical.
 
 ### 5.2 Endpoint derivation
 
-Refactor `p2pPortFor` (`connector_p2p.go:305`) into a shared rank helper, then:
+`p2pPortFor`'s rank derivation was extracted into a shared helper, so both
+tiers resolve a peer's rank through one implementation:
 
 ```go
-// rankFor recovers the pod-local DP rank from the routed HTTP port.
-func (s *Server) rankFor(targetHostPort string) int
+// rankFor recovers the target's pod-local DP rank from its routed port,
+// returning 0 whenever the rank cannot be trusted. kind names the caller for
+// the debug logs ("P2P" / "KVCR").
+func (s *Server) rankFor(targetHostPort, kind string) int
+
+// p2pPortFor is now just the base plus that rank.
+func (s *Server) p2pPortFor(targetHostPort string) int {
+    return s.config.P2PConnectorPort + s.rankFor(targetHostPort, "P2P")
+}
 
 // kvcrControlEndpoint returns the peer's KVCR ZMQ control endpoint as the
 // kv.fetch payload names it. Host comes from the validated routing header;
 // the port is derived locally from config, so this adds no SSRF surface.
 func (s *Server) kvcrControlEndpoint(targetHostPort string) string {
     host := extractHost(targetHostPort)
-    port := s.config.KVCRControlPort + s.rankFor(targetHostPort)
+    port := s.config.KVCRControlPort + s.rankFor(targetHostPort, "KVCR")
     return "tcp://" + net.JoinHostPort(host, strconv.Itoa(port))
 }
 ```
 
-`net.JoinHostPort` keeps IPv6 literals bracketed — the concern behind #3305.
-Keep `p2pPortFor`'s conservative fallbacks (unparsable port, or rank outside
-`[0, DataParallelSize)`, falls back to rank 0).
+`rankFor` keeps every one of `p2pPortFor`'s conservative fallbacks — no data
+parallelism, zero `dpBasePort`, an unparsable or non-numeric port, or a rank
+outside `[0, DataParallelSize)` all yield rank 0, i.e. the caller's base port.
+The refactor is behaviour-preserving for P2P; the existing `p2pPortFor` table
+test still passes unchanged.
+
+`net.JoinHostPort` keeps IPv6 literals bracketed — the concern behind #3305 —
+and two test entries pin that, since an unbracketed `fd00::5:17771` cannot be
+parsed back into host and port.
 
 ### 5.3 Envelope construction
 
@@ -301,6 +339,13 @@ Emits the §2 shape with `block_hashes: [placeholderBlockHash]`, `mode: "copy"`,
 no `no_retain`. The signature takes no hash list — there is deliberately no way
 to pass one.
 
+The envelope's own key names are constants too (`hintFieldProtocolVersion`,
+`hintFieldActions`, `hintFieldSourceControlEndpoint`, …) rather than inline
+strings, so the parser's vocabulary lives in one place and the tests assert
+against the same symbols the builder uses. `action_id` is derived as
+`message_id + "-fetch"`, which keeps a request's envelope and its single action
+correlatable in logs without a second UUID.
+
 ### 5.4 Decode-only pull
 
 `decodeWithKVCRSource(w, r, sourceHostPort)`, mirroring `decodeWithP2PSource`
@@ -318,38 +363,95 @@ to pass one.
 `handleKVCR(w, r, prefillPodHostPort, kvCacheSource, apiType)`:
 
 - **prefill request**: body unchanged apart from `reqcommon.CapSingleToken`.
-  No `kv_transfer_params`, no `kv_hints` — a KVCR producer needs no priming.
-  *Optionally* (symmetry with `addP2PPullToPrefill`) inject a `kv_hints` fetch
-  on the **prefill** request when `kvCacheSource` names a third peer that
-  out-caches the prefiller, so the prefiller itself pulls cached prefix.
+  No `kv_transfer_params`, no `kv_hints` of its own — a KVCR producer needs no
+  priming. The optional symmetry with `addP2PPullToPrefill` was implemented:
+  `addKVCRPullToPrefill` injects a `kv_hints` fetch on the **prefill** request
+  when `kvCacheSource` names a peer other than the prefiller, so the prefiller
+  itself pulls cached prefix. It no-ops on an empty source or a source equal to
+  the prefiller (compared through `normalizeEndpoint`, so a scheme-prefixed
+  value still matches).
 - **decode request**: original body plus `kv_hints` naming the prefiller's
   control endpoint.
-- **reuse `handleP2PSequentialRequests` unchanged** (rename to
-  `handleSequentialPD`). Prefill-to-completion is not merely preferable here;
+- **`handleP2PSequentialRequests` became `handleSequentialPD`**, now taking a
+  `connector string` so its two spans report `kvcr` rather than hard-coding
+  `offloading`. That was the one change needed to share it; the body is
+  otherwise untouched. Prefill-to-completion is not merely preferable here —
   KVCR transfers are destination-initiated, so a decode fetch that arrives
   first finds nothing and burns its deadline.
 
-Wire it at `proxy.go:520` alongside the existing `handleP2P` /
-`handleNIXLV2` selection.
+Wired into `setKVConnector` (`proxy.go`) as a new `case
+constants.KVConnectorKVCR`, alongside the existing `handleP2P` /
+`handleNIXLV2` arms.
 
-### 5.6 Dispatch and validation
+### 5.6 The NIXLv2 compose path — a bug this design missed
 
-`dispatch.go:130-148`: generalize `p2pPullAvailable()` to
-`kvCachePullAvailable()` covering `KVConnector == kvcr`,
-`EnableKVCRPull && KVConnector == nixlv2`, and the existing P2P cases. The
-`isHostPort` and `allowlistValidator` checks are unchanged and still apply —
-the header still carries an HTTP `host:port`, and only the port is re-derived.
+Not in the original plan, and the one genuine defect implementation turned up.
 
-Then branch on `--kv-cache-pull-protocol` at both call sites
-(`dispatch.go:204` and `:222`).
+`handleNIXLV2` composes a cached-prefix pull onto its prefill request, and it
+did so by calling `addP2PPullToPrefill` **unconditionally**, at two sites (the
+sequential and parallel-WRITE paths). That is correct only because
+`dispatch.go` blanks `kvCacheSource` when no pull is available. Once
+`--enable-kvcr-pull` makes a source available under `nixlv2`, those call sites
+would have injected a P2P `remote_kv_source` block into a deployment whose
+secondary tier is KVCR — the wrong protocol, silently, with the hint the engine
+actually reads never sent at all.
 
-### 5.7 Observability
+The fix is a protocol-aware wrapper both sites now call:
 
-- `pkg/sidecar/constants`: add `KVConnectorKVCR = "kvcr"`.
-- Reuse `semconv.LLMDPDProxyKVCacheSource`; pass the new connector value to
-  `semconv.LLMDPDProxyConnector`.
-- Log the resolved control endpoint and hash count at `Info`, as
+```go
+// addCachedPrefixPullToPrefill injects the prefill-side pull in whichever
+// protocol this deployment's secondary tier speaks. Takes the whole request
+// body, since kv_hints is top-level while remote_kv_source nests under
+// kv_transfer_params.
+func (s *Server) addCachedPrefixPullToPrefill(prefillRequest map[string]any, kvCacheSource, prefillPodHostPort string)
+```
+
+It routes on `kvcrPullAvailable()`, and its P2P branch uses a checked type
+assertion on `kv_transfer_params` so a caller that has not built that field
+gets a no-op instead of a panic. `handleP2P` keeps calling
+`addP2PPullToPrefill` directly: it only runs under `--kv-connector=offloading`,
+where `kvcrPullAvailable()` is false by construction.
+
+The general lesson for the rest of this work: a second tier makes every
+*unconditional* protocol choice in the existing code a latent wrong-protocol
+bug, and those call sites are not where the new code is.
+
+### 5.7 Dispatch and validation
+
+`dispatch.go` gates the source header on `!s.p2pPullAvailable() &&
+!s.kvcrPullAvailable()` and branches on `s.kvcrPullAvailable()` at the
+decode-only call site. The `isHostPort` and `allowlistValidator` checks are
+unchanged and still apply — the header still carries an HTTP `host:port`, and
+only the port is re-derived locally.
+
+**Divergence from the design:** there is no single `kvCachePullAvailable()`.
+Two predicates read better than one that answers "some tier is available" and
+then needs a second question to say which:
+
+```go
+func (s *Server) kvcrPullAvailable() bool {
+    return s.config.KVConnector == constants.KVConnectorKVCR ||
+        (s.config.EnableKVCRPull && s.config.KVConnector == constants.KVConnectorNIXLV2)
+}
+```
+
+`p2pPullAvailable()` is untouched and stays correct, since `kvcr` is not
+`offloading`. Validation (§5.1) keeps the two from being true at once.
+
+### 5.8 Observability
+
+- `pkg/sidecar/constants`: added `KVConnectorKVCR = "kvcr"`.
+- `semconv.LLMDPDProxyKVCacheSource` reused as-is;
+  `semconv.LLMDPDProxyConnector` now receives the connector from
+  `handleSequentialPD`'s new parameter, so KVCR spans are attributed to `kvcr`.
+- Both entry points log the resolved control endpoint at `Info`, where
   `decodeWithP2PSource` logs `kv_request_id` / `p2p_connector_port`.
+
+Deliberately **not** logged: a hash count. The design asked for one, but with
+`block_hashes` always a one-element placeholder it would be a constant, and
+printing it would imply the router had chosen those hashes. The endpoint is the
+only part of the hint the router actually decides, so it is the only part worth
+logging.
 
 ---
 
@@ -379,8 +481,9 @@ named peer about every key in the request, including keys that peer never
 held, and only the `missing_keys` negative cache (§3.1) trims the set — after
 the first miss. That is control-plane traffic, not data-plane: it does not move
 KV, and it is bounded per request. Given the measured lookup-leg behaviour
-under concurrency, this is the number to watch after the first deployment, and
-the reason §5.7 logs the hash count and §8 asserts hit counters.
+under concurrency, this is the number to watch after the first deployment —
+hence the decoder-side hit-rate assertion in §8, which is the signal that
+actually distinguishes "hints working, lookups chatty" from "hints ignored".
 
 **What this does *not* remove:** pod-to-pod block-key agreement. The decoder
 still asks its peer for vLLM's own block hashes, computed independently on each
@@ -394,7 +497,11 @@ is the argument against doing it.
 
 ---
 
-## 7. Phase 2 — optional refinements
+## 7. Phase 2 — optional refinements (not being implemented)
+
+Kept as a record of what was consciously left out, not as queued work. Note
+that the docs bullet is the one with a user-visible cost: `--kv-connector=kvcr`
+and `--enable-kvcr-pull` currently exist only in their flag help text.
 
 - **Price KVCR-owned blocks separately.** Add `ownership` to the vLLM event
   decoder (`vllm_msgpack.go`; it is trailing, so appending a 12th decoder is
@@ -414,30 +521,59 @@ is the argument against doing it.
 
 ## 8. Testing
 
-- **Sidecar unit** (`connector_kvcr_test.go`, mirroring
-  `connector_p2p_test.go`): envelope shape against every hard rule in §2,
-  including a non-empty `block_hashes` and an absent `no_retain`;
-  `tcp://` formatting incl. IPv6; rank derivation and every fallback;
-  self-source skip; `kv_transfer_params` left untouched; client-supplied
-  `kv_hints` dropped.
-    - Worth a dedicated case: the placeholder is a plain `uint64` and must not
-      serialize as a float, a string, or a JSON `true` — the parser rejects
-      bools and non-ints outright (`hint_parser.py:112-118`), so a marshalling
-      slip here silently disables every hint.
-- **Dispatch** (`dispatch_test.go`): protocol selector routes to the right
-  injector; `kvCachePullAvailable` gating; SSRF rejection still blanks the
-  source.
-- **PD ordering**: prefill completes before decode dispatch; prefill error is
-  returned verbatim and decode is never dispatched.
-- **End-to-end**: the two-pod KVCR PD setup already verified by hand
-  (64/64 hits, 32 MiB transferred) with the PoC proxy replaced by the sidecar.
-  Assert `vllm:kv_offload_*` hit counters on the decoder, and confirm a
-  one-sided peer restart or an unmatched `PYTHONHASHSEED` shows up as a
-  silent miss rather than an error.
-- **Negative**: no `router_capabilities` → tier refuses to construct;
-  hint naming an unreachable endpoint → request still succeeds by recompute;
-  a pod with `opportunistic_query: false` → hints stop matching, which is the
-  regression this contract exists to catch.
+### Written, in `connector_kvcr_test.go` (Ginkgo, mirroring `connector_p2p_test.go`)
+
+- **`kvcrPullAvailable`** table: `kvcr` always on; `nixlv2` on only with the
+  flag; `offloading` off (it is the P2P tier); the flag inert on `sglang`.
+- **`kvcrControlEndpoint`** table, 12 entries: rank 0 / mid / last-rank
+  offsets, single-DP, and every fallback (port below base, beyond the rank
+  range, missing, non-numeric, zero `dpBasePort`), plus a scheme-prefixed
+  target and two IPv6 literals asserting the brackets survive.
+- **`kvcrFetchHints`**: the endpoint is offset by the source's rank; `mode` is
+  `copy` and `no_retain` absent; `block_hashes` is a non-empty `[]uint64`;
+  `message_id` is fresh per envelope and `action_id` derives from it; rank
+  derivation survives `Clone()`, which rank servers depend on.
+    - One case earns its place on its own: the placeholder must serialize as a
+      JSON **integer**, asserted as `"block_hashes":[1]` on the marshalled
+      body. The parser rejects bools and non-ints outright
+      (`hint_parser.py:112-118`), so a float or string here would disable every
+      hint silently rather than fail loudly.
+- **`addKVCRPullToPrefill`**: injects across ranks on one pod; no-ops when the
+  source is the prefiller, when the source is the same endpoint spelled with a
+  scheme, and when no source is named.
+- **`addCachedPrefixPullToPrefill`** (§5.6): emits `kv_hints` under
+  `nixlv2 + --enable-kvcr-pull` **and leaves `kv_transfer_params` untouched**;
+  emits `remote_kv_source` under `nixlv2` without it; does not panic when
+  there are no `kv_transfer_params` to nest under.
+
+A note on method, because the suite hides it: `go test` prints no Ginkgo spec
+names, so a new spec that never runs looks exactly like one that passes. These
+were confirmed to execute by breaking an assertion and watching it fail — which
+also printed the real marshalled envelope,
+`{"actions":[{"action_id":"…-fetch","action_type":"kv.fetch","action_version":"1.0","payload":{"block_hashes":[1],"mode":"copy","source_control_endpoint":"tcp://10.0.0.9:17773"}}],"message_id":"…","protocol_version":"0.1"}`,
+checked by eye against §2.
+
+### Not written, and worth knowing
+
+- **Dispatch-level** (`dispatch_test.go`): that the gate admits a source under
+  each tier and that the decode branch picks the matching injector. Covered
+  indirectly — the predicates and both injectors are tested in isolation — but
+  not the wiring between them.
+- **PD ordering** for `handleKVCR`: that prefill completes before decode is
+  dispatched, and that a prefill error returns verbatim with decode never
+  dispatched. The existing P2P suite covers `handleSequentialPD`'s body, which
+  is now shared and unchanged, so the risk is the `handleKVCR` call site only.
+- **End-to-end**: the two-pod KVCR PD setup already verified by hand (64/64
+  hits, 32 MiB transferred) with the PoC proxy replaced by the sidecar. Assert
+  `vllm:kv_offload_*` hit counters on the decoder, and confirm a one-sided peer
+  restart or an unmatched `PYTHONHASHSEED` shows up as a silent miss rather
+  than an error. **This is the only test that would prove the feature works at
+  all** — everything above proves only that the router emits a well-formed
+  envelope, never that an engine acts on it.
+- **Negative**: no `router_capabilities` → tier refuses to construct; hint
+  naming an unreachable endpoint → request still succeeds by recompute; a pod
+  with `opportunistic_query: false` → hints stop matching, which is the
+  regression that contract exists to catch.
 
 ---
 
@@ -448,9 +584,11 @@ is the argument against doing it.
    the single highest-value action and benefits every orchestrator, not just
    llm-d.
 2. **Silent degradation is the dominant failure mode.** Every hint mismatch
-   degrades to `MISS` with no error. Mitigation: a decoder-side hit-rate metric
-   and a sidecar log of the emitted endpoint and hash count, so "hints are
-   being ignored" is observable rather than invisible.
+   degrades to `MISS` with no error. The sidecar side of the mitigation is in
+   place — both entry points log the emitted control endpoint (§5.8) — but the
+   half that would actually detect the failure is not: a decoder-side hit-rate
+   metric. Until that exists, "hints are being ignored" and "hints are working"
+   look identical from the router.
 3. **Peer restart.** KVCR does not distinguish a peer *restart* from an
    additive metadata update (its own TODO in `remote_fw_dram.py`), matching the
    observed fragility when a peer restarts under load. The router cannot fix
