@@ -1,0 +1,42 @@
+{
+  "mode": "control",
+  "model": "meta-llama/Llama-3.2-1B",
+  "results": [
+    {
+      "trial": 0,
+      "seeded_on": 0,
+      "pulled_on": 1,
+      "tier_hits": 0.0,
+      "tier_queries": 2.0,
+      "external_hits": 0.0,
+      "external_queries": 870.0
+    },
+    {
+      "trial": 1,
+      "seeded_on": 1,
+      "pulled_on": 0,
+      "tier_hits": 0.0,
+      "tier_queries": 2.0,
+      "external_hits": 0.0,
+      "external_queries": 869.0
+    },
+    {
+      "trial": 2,
+      "seeded_on": 0,
+      "pulled_on": 1,
+      "tier_hits": 0.0,
+      "tier_queries": 2.0,
+      "external_hits": 0.0,
+      "external_queries": 871.0
+    },
+    {
+      "trial": 3,
+      "seeded_on": 1,
+      "pulled_on": 0,
+      "tier_hits": 0.0,
+      "tier_queries": 2.0,
+      "external_hits": 0.0,
+      "external_queries": 868.0
+    }
+  ]
+}

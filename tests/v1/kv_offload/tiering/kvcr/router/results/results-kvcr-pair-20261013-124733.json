@@ -1,0 +1,94 @@
+{
+  "mode": "pair",
+  "model": "meta-llama/Llama-3.2-1B",
+  "results": [
+    {
+      "trial": 0,
+      "seeded_on": 0,
+      "pulled_on": 1,
+      "routed_to": "10.0.3.38:8201",
+      "routed_source": "10.0.1.136:8101",
+      "tier_hits": 54.0,
+      "tier_queries": 108.0,
+      "external_hits": 864.0,
+      "external_queries": 869.0
+    },
+    {
+      "trial": 1,
+      "seeded_on": 1,
+      "pulled_on": 0,
+      "routed_to": "10.0.1.136:8101",
+      "routed_source": "10.0.3.38:8201",
+      "tier_hits": 54.0,
+      "tier_queries": 108.0,
+      "external_hits": 864.0,
+      "external_queries": 871.0
+    },
+    {
+      "trial": 2,
+      "seeded_on": 0,
+      "pulled_on": 1,
+      "routed_to": "10.0.3.38:8201",
+      "routed_source": "10.0.1.136:8101",
+      "tier_hits": 54.0,
+      "tier_queries": 108.0,
+      "external_hits": 864.0,
+      "external_queries": 872.0
+    },
+    {
+      "trial": 3,
+      "seeded_on": 1,
+      "pulled_on": 0,
+      "routed_to": "10.0.1.136:8101",
+      "routed_source": "10.0.3.38:8201",
+      "tier_hits": 54.0,
+      "tier_queries": 108.0,
+      "external_hits": 864.0,
+      "external_queries": 869.0
+    },
+    {
+      "trial": 4,
+      "seeded_on": 0,
+      "pulled_on": 1,
+      "routed_to": "10.0.3.38:8201",
+      "routed_source": "10.0.1.136:8101",
+      "tier_hits": 54.0,
+      "tier_queries": 108.0,
+      "external_hits": 864.0,
+      "external_queries": 870.0
+    },
+    {
+      "trial": 5,
+      "seeded_on": 1,
+      "pulled_on": 0,
+      "routed_to": "10.0.1.136:8101",
+      "routed_source": "10.0.3.38:8201",
+      "tier_hits": 54.0,
+      "tier_queries": 108.0,
+      "external_hits": 864.0,
+      "external_queries": 869.0
+    },
+    {
+      "trial": 6,
+      "seeded_on": 0,
+      "pulled_on": 1,
+      "routed_to": "10.0.3.38:8201",
+      "routed_source": "10.0.1.136:8101",
+      "tier_hits": 54.0,
+      "tier_queries": 108.0,
+      "external_hits": 864.0,
+      "external_queries": 870.0
+    },
+    {
+      "trial": 7,
+      "seeded_on": 1,
+      "pulled_on": 0,
+      "routed_to": "10.0.1.136:8101",
+      "routed_source": "10.0.3.38:8201",
+      "tier_hits": 54.0,
+      "tier_queries": 108.0,
+      "external_hits": 864.0,
+      "external_queries": 872.0
+    }
+  ]
+}
