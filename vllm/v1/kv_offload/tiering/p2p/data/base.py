@@ -51,6 +51,34 @@ Transfer lifecycle
    - mode="wait" returns ids still in PROC/PEND so the caller can poll
      them to completion
 
+Failure model
+-------------
+
+A data-plane failure has one of two scopes, and the transport decides
+which:
+
+- Transfer scope: one transfer failed — write_blocks() returned None or
+  poll() listed the id in ``failed``. The caller fails the round that
+  owned it; the peer recomputes. Nothing else changes.
+- Peer scope: the transport concluded that its registration for a peer
+  is unusable, so later transfers to that peer would fail the same way.
+  Either one failure already says so (the remote endpoint disconnected,
+  or the remote agent / descriptor is unknown), or transfer-scope
+  failures to that peer kept coming with no success between them.
+  poll(peer_id) then reports the cause in ``PollResult.peer_fault`` on
+  every call until remove_remote_peer() clears it.
+
+The transport only reports a peer fault; it never recovers the peer
+itself (no in-place re-registration). The session turns a peer fault
+into the same connection death the control plane uses for a missed
+heartbeat or a protocol error, so there is a single teardown path:
+session.close() sends DisconnectMsg (the peer tears down its side too),
+remove_remote_peer() drops the registration, and the next connection
+builds a fresh one on both sides through the normal handshake.
+
+write_blocks() and poll() must not raise for transfer or peer failures;
+they report them through the return values above.
+
 Implementor contracts
 ---------------------
 
@@ -88,11 +116,15 @@ class PollResult(NamedTuple):
     Attributes:
         done: Transfer IDs that completed successfully.
         failed: Transfer IDs that failed (error, timeout, etc.).
+        peer_fault: Set only on a peer-scoped poll() once the transport
+            has judged the peer unusable (see "Failure model"); a short
+            human-readable cause. None while the peer is healthy.
 
     """
 
     done: Sequence[int]
     failed: Sequence[int]
+    peer_fault: str | None = None
 
 
 class DataTransport(ABC):
