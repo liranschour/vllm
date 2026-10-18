@@ -78,6 +78,70 @@ prefills: lookup per block, then `prepare_store` for 1k-token prompts in `build_
    Splitting `build_connector_meta` / `get_num_new_matched_tokens` holds is
    the lever if that tail matters.
 
+## H200 + Llama-3.1-8B re-measurement (results_h200/, h200/)
+
+Pod `lock-hold-h200` (1×H200, image `vllm/vllm-openai:nightly` at 49cb2bbf7,
+which already contains the lock API). The instrumented `scheduler.py` is that
+file plus this branch's instrumentation patch. Tiering = 60 GiB CPU + FS
+tier; random 1024 in / 128 out. Driver/serve/sweep variants are in `h200/`.
+
+Baseline (scheduler only):
+
+| conc | steps/s | hold p50 / p90 / p99 / max (ms) | lock duty | free gap p50 / p10 (ms) | tok/step | out tok/s |
+|---:|---:|---|---:|---|---:|---:|
+| 1   | 139 | 0.03 / 0.04 / 0.33 / 0.97 | 1.1%  | 4.9 / 4.8  | 9    | 196  |
+| 4   | 71  | 0.05 / 0.16 / 0.79 / 1.8  | 1.0%  | 5.0 / 4.6  | 35   | 689  |
+| 16  | 37  | 0.35 / 0.69 / 2.7 / 4.4   | 1.9%  | 5.8 / 5.4  | 138  | 1649 |
+| 64  | 25  | 1.3 / 4.1 / 20 / 35       | 6.9%  | 9.8 / 6.9  | 536  | 2726 |
+| 128 | 21  | 2.8 / 10 / 42 / 121       | 12.6% | 13.1 / 3.0 | 852  | 2992 |
+| 256 | 17  | 5.2 / 17 / 131 / 342      | 17.1% | 20.0 / 4.4 | 1253 | 3022 |
+
+Composition at c256: `build_connector_meta` 55%, `get_num_new_matched_tokens`
+35% (lookups grow with the waiting queue), between-hooks 9%.
+
+With N mirror contenders (scheduler wait = time the real scheduler thread
+blocks on the lock; total duty = scheduler + contenders):
+
+| N | GIL | conc | sched wait p99 / max (ms) | sched wait % wall | contender wait p99 / max (ms) | total duty | out tok/s vs base |
+|---:|---|---:|---|---:|---|---:|---|
+| 1 | spin  | 64  | 0.04 / 3.1   | 0.07% | 2.2 / 4.0    | ~10% | 2598 vs 2726 (−5%) |
+| 1 | spin  | 256 | 0.79 / 38    | 0.56% | 13 / 280     | ~26% | 2946 vs 3022 (−3%) |
+| 1 | sleep | 256 | 6.3 / 319    | 3.5%  | 17 / 135     | ~27% | 3037 vs 3022 |
+| 3 | spin  | 64  | 0.04 / 2.8   | 0.06% | 3.7 / 49     | ~14% | 2507 (−8%) |
+| 3 | spin  | 256 | 12 / 116     | 2.4%  | 68 / 691     | ~37% | 2787 (−8%) |
+| 3 | sleep | 256 | 56 / 438     | 14.8% | 71 / 276     | ~48% | 2937 (−3%) |
+| 7 | spin  | 16  | 0.03 / 0.04  | 0.04% | 0.01 / 0.04  | ~8%  | 1393 vs 1649 (−16%) |
+| 7 | spin  | 64  | 0.04 / 51    | 0.73% | 17 / 277     | ~22% | 2340 (−14%) |
+| 7 | spin  | 256 | 18 / 447     | 3.4%  | 124 / 389    | ~51% | 2454 (−19%) |
+| 7 | sleep | 256 | 131 / 847    | 30%   | 230 / 880    | ~58% | 2495 (−17%) |
+
+H200 conclusions:
+
+1. With faster steps the lock's share of time grows. At low load (c ≤ 16) it
+   is busy 1-2% and the free gap is about 5 ms per step, a wide window. From
+   c64 on the scheduler alone holds it 7% (c64), 13% (c128) and 17% (c256),
+   because work under the lock grows with tokens and waiting requests while
+   GPU step time grows more slowly.
+2. The tail is the problem, not the median. At c256 the p99 hold is 131 ms and
+   the max 342 ms, all from prefill-admitting steps. Any other thread that
+   arrives during one waits that long: with N=1 the contender's max wait is
+   280 ms at c256.
+3. The lock scales to N=1, and to N=3 at moderate load (c ≤ 64): the
+   scheduler's p99 wait stays under 0.05 ms in spin mode and throughput is
+   within 5-8%. At c256 with N ≥ 3 equal-weight sharers the lock saturates
+   (37-58% total duty): the scheduler waits p99 12-131 ms and up to 30% of
+   wall time (N=7, sleep). That is real contention.
+4. As on the laptop GPU, the throughput cost at N=7 (−14 to −19%) appears even
+   where the lock is idle (c16: lock wait 0.04 ms, tok/s −16%), so with
+   in-process threads the GIL bites first. The lock becomes the limiter only
+   at high load, where it adds to the GIL cost.
+5. Levers if more sharers are planned: (a) shorten prefill-step holds, i.e.
+   per-block `lookup()` in `get_num_new_matched_tokens` (35% at c256) and
+   `prepare_store` in `build_connector_meta`; (b) release the region between
+   requests rather than holding one step-long region (the HIT→pin invariant
+   holds per request); (c) for sharers that do real work, use a process
+   rather than a thread, since the GIL caps in-process sharers anyway.
+
 Caveats: a single small GPU (1B model: fast steps, so the lock-free gap is
 small in absolute terms; a larger model widens the gap and lowers duty).
 The probes mirror hold durations but do no real manager work, so cache-line,

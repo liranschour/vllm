@@ -1,0 +1,26 @@
+== mirror_s0_n1   (times in ms unless noted)
+ phase  steps/s  step p50      p90      p99      max  duty%  gap p50  gap p10  short/s  sh p99 probe wait p50      p99      max tok/step
+  idle      0.0       nan      nan      nan     0.00   0.00      nan      nan      0.0     nan            nan      nan     0.00        0
+   c16     37.4     0.333    0.487    2.975     5.45   1.80     5.89     5.42    116.7   0.278         0.0012    0.014     0.02      139
+       sched-wait p50=0.0010 p99=0.236 max=4.37 total=0.31% of wall | probes/s=34.1 probe duty=1.97%
+   c64     24.6     1.293    3.168   21.547    44.30   6.56    10.34     7.01     85.4   4.685         0.0020    0.718     4.86      543
+       sched-wait p50=0.0018 p99=0.795 max=13.10 total=0.44% of wall | probes/s=17.4 probe duty=4.38%
+  c256     14.9     5.418   18.703   46.949   370.54  14.80    22.39     4.87     63.0   8.870         0.0031   16.925   135.36     1407
+       sched-wait p50=0.0013 p99=6.313 max=319.23 total=3.49% of wall | probes/s=13.6 probe duty=12.56%
+  step-region composition (% of step-region hold, mean ms/step):
+      c16: _build_connector_meta=80%(0.294)  get_num_new_matched_tokens=11%(0.039)  update_state_after_alloc=0%(0.001)  between-hooks=9%(0.031)
+      c64: _build_connector_meta=69%(1.518)  get_num_new_matched_tokens=21%(0.465)  update_state_after_alloc=0%(0.006)  between-hooks=9%(0.200)
+     c256: _build_connector_meta=65%(5.620)  get_num_new_matched_tokens=25%(2.193)  update_state_after_alloc=0%(0.022)  between-hooks=10%(0.848)
+  hook breakdown (all phases):
+    short get_stats                        n=  1903 p50=0.064 p99=0.236 max=8.75
+    short take_events                      n=  1903 p50=0.007 p99=0.039 max=0.10
+    short update_connector_output          n=  1888 p50=0.031 p99=11.583 max=38.32
+    step  build_connector_meta             n=  1636 p50=1.172 p99=12.476 max=56.13
+    short on_new_request                   n=  1344 p50=0.005 p99=0.070 max=5.58
+    step  get_num_new_matched_tokens       n=   267 p50=10.478 p99=194.440 max=370.54
+    short has_pending_push_work            n=    24 p50=0.002 p99=0.011 max=0.01
+== mirror_s0_n1
+ phase   wall_s  bench_s  out_tok/s  req/s  ttft_p50  itl_p50
+ c16       14.2      5.1       1613  12.60       268      5.7
+ c64       22.1     12.1       2716  21.22       768     13.2
+ c256      55.8     43.2       3037  23.73      3677     41.7
