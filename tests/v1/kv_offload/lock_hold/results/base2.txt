@@ -1,0 +1,29 @@
+== base2   (times in ms unless noted)
+ phase  steps/s  step p50      p90      p99      max  duty%  gap p50  gap p10  short/s  sh p99 probe wait p50      p99      max tok/step
+  idle      0.0       nan      nan      nan     0.00   0.00      nan      nan      0.0     nan            nan      nan     0.00        0
+    c1     62.3     0.112    0.143    0.927     2.03   1.41    12.22     9.20    188.1   0.092            nan      nan     0.00        9
+    c4     30.6     0.156    0.202    1.873     4.35   1.04    14.77     9.54     92.8   0.156            nan      nan     0.00       35
+   c16     16.0     0.293    0.869    4.447    11.14   1.19    17.36    16.88     50.1   1.087            nan      nan     0.00      137
+   c64      6.7     0.930    5.750   13.499    19.77   1.85    29.03    26.50     23.0   1.251            nan      nan     0.00      510
+  c128      3.6     2.523    8.809   25.442    42.29   1.97   139.04    43.39     13.7   1.258            nan      nan     0.00      952
+  step-region composition (% of step-region hold, mean ms/step):
+       c1: _build_connector_meta=78%(0.100)  get_num_new_matched_tokens=5%(0.007)  update_state_after_alloc=0%(0.000)  between-hooks=16%(0.021)
+       c4: _build_connector_meta=75%(0.165)  get_num_new_matched_tokens=11%(0.025)  update_state_after_alloc=0%(0.001)  between-hooks=13%(0.028)
+      c16: _build_connector_meta=67%(0.378)  get_num_new_matched_tokens=21%(0.121)  update_state_after_alloc=0%(0.002)  between-hooks=11%(0.063)
+      c64: _build_connector_meta=66%(1.584)  get_num_new_matched_tokens=23%(0.542)  update_state_after_alloc=0%(0.010)  between-hooks=10%(0.246)
+     c128: _build_connector_meta=62%(3.013)  get_num_new_matched_tokens=25%(1.239)  update_state_after_alloc=0%(0.021)  between-hooks=12%(0.593)
+  hook breakdown (all phases):
+    short get_stats                        n=  6986 p50=0.058 p99=0.124 max=0.96
+    short take_events                      n=  6986 p50=0.009 p99=0.026 max=0.18
+    short update_connector_output          n=  6872 p50=0.033 p99=1.238 max=8.62
+    step  build_connector_meta             n=  6333 p50=0.119 p99=1.837 max=19.87
+    short on_new_request                   n=   896 p50=0.018 p99=0.071 max=0.26
+    step  get_num_new_matched_tokens       n=   653 p50=5.397 p99=25.234 max=42.29
+    short has_pending_push_work            n=   184 p50=0.006 p99=0.018 max=0.03
+== base2
+ phase   wall_s  bench_s  out_tok/s  req/s  ttft_p50  itl_p50
+ c1        67.4     56.0         73   0.57       238     12.3
+ c4        34.6     22.7        180   1.41       661     14.9
+ c16       33.6     21.7        378   2.96      1496     17.6
+ c64       86.3     72.9        450   3.51      2713     30.2
+ c128     172.1    157.5        416   3.25      4200     87.1

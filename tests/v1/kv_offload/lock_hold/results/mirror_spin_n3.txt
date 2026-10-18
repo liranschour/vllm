@@ -1,0 +1,22 @@
+== mirror_spin_n3   (times in ms unless noted)
+ phase  steps/s  step p50      p90      p99      max  duty%  gap p50  gap p10  short/s  sh p99 probe wait p50      p99      max tok/step
+  idle      0.0       nan      nan      nan     0.00   0.00      nan      nan      0.0     nan            nan      nan     0.00        0
+   c16     16.8     0.296    0.736    4.212     8.18   1.14    17.12    11.02     52.3   0.796         0.0063    0.017     0.23      137
+       sched-wait p50=0.0020 p99=0.025 max=0.14 total=0.04% of wall | probes/s=47.4 probe duty=2.38%
+   c64      6.7     0.945    5.781   15.145    25.82   1.88    28.99    26.37     23.0   1.256         0.0083    0.870    16.38      512
+       sched-wait p50=0.0031 p99=0.044 max=1.74 total=0.02% of wall | probes/s=17.7 probe duty=4.16%
+  step-region composition (% of step-region hold, mean ms/step):
+      c16: _build_connector_meta=67%(0.347)  get_num_new_matched_tokens=21%(0.109)  update_state_after_alloc=0%(0.002)  between-hooks=11%(0.059)
+      c64: _build_connector_meta=64%(1.543)  get_num_new_matched_tokens=25%(0.609)  update_state_after_alloc=0%(0.010)  between-hooks=10%(0.253)
+  hook breakdown (all phases):
+    short get_stats                        n=  1114 p50=0.062 p99=0.153 max=0.58
+    short take_events                      n=  1114 p50=0.009 p99=0.016 max=0.07
+    short update_connector_output          n=  1108 p50=0.038 p99=1.313 max=1.64
+    step  build_connector_meta             n=   895 p50=0.399 p99=1.551 max=11.26
+    short on_new_request                   n=   320 p50=0.017 p99=0.071 max=0.18
+    step  get_num_new_matched_tokens       n=   219 p50=4.565 p99=21.442 max=25.82
+    short has_pending_push_work            n=    14 p50=0.008 p99=0.023 max=0.02
+== mirror_spin_n3
+ phase   wall_s  bench_s  out_tok/s  req/s  ttft_p50  itl_p50
+ c16       32.2     20.2        406   3.17      1426     17.3
+ c64       86.1     72.5        452   3.53      2935     30.3

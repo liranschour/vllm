@@ -64,6 +64,43 @@ from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
+# --- lock-hold measurement (temporary instrumentation) ---------------------
+import atexit as _atexit
+import os as _os
+import sys as _sys
+import threading as _threading
+
+_LOCK_TRACE_FILE = _os.environ.get("VLLM_LOCK_TRACE_FILE")
+_lock_trace: list[str] = []
+_lock_trace_last_flush = 0.0
+# Last step-region hold/release/gap (ns), published for mirror probes.
+_probe_state = {"seq": 0, "hold": 0, "rel": 0, "gap": 0}
+
+
+def _lock_trace_flush() -> None:
+    if _LOCK_TRACE_FILE and _lock_trace:
+        with open(f"{_LOCK_TRACE_FILE}.{_os.getpid()}", "a") as f:
+            f.write("".join(_lock_trace))
+        _lock_trace.clear()
+
+
+def _lock_trace_add(kind, hook, t_req, t_acq, t_rel, extra="") -> None:
+    # kind,hook,thread,t_request_ns,t_acquired_ns,t_released_ns,extra
+    _lock_trace.append(
+        f"{kind},{hook},{_threading.current_thread().name},"
+        f"{t_req},{t_acq},{t_rel},{extra}\n"
+    )
+    global _lock_trace_last_flush
+    now = time.monotonic()
+    if len(_lock_trace) >= 4096 or now - _lock_trace_last_flush > 1.0:
+        _lock_trace_last_flush = now
+        _lock_trace_flush()
+
+
+if _LOCK_TRACE_FILE:
+    _atexit.register(_lock_trace_flush)
+# ---------------------------------------------------------------------------
+
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
@@ -641,6 +678,56 @@ class OffloadingConnectorScheduler:
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
 
+        # Probe contenders emulating extra threads sharing manager.lock.
+        #   fixed:  acquire every INTERVAL_S, hold HOLD_S (sleep, GIL released)
+        #   mirror: after each real step, wait a random offset inside the
+        #           scheduler's free gap, then hold for that step's hold time
+        probe_mode = _os.environ.get("VLLM_LOCK_PROBE_MODE", "")
+        probe_threads = int(_os.environ.get("VLLM_LOCK_PROBE_THREADS", "1"))
+        probe_interval = float(_os.environ.get("VLLM_LOCK_PROBE_INTERVAL_S", "0.001"))
+        probe_hold = float(_os.environ.get("VLLM_LOCK_PROBE_HOLD_S", "0"))
+        probe_spin = _os.environ.get("VLLM_LOCK_PROBE_SPIN", "0") == "1"
+        if _LOCK_TRACE_FILE and probe_mode:
+            import random
+
+            lock = self.manager.lock
+
+            def _probe(idx: int) -> None:
+                seen = 0
+                while True:
+                    if probe_mode == "mirror":
+                        st = _probe_state
+                        if st["seq"] == seen or (
+                            time.perf_counter_ns() - st["rel"] > 100_000_000
+                        ):
+                            time.sleep(0.0002)
+                            continue
+                        seen = st["seq"]
+                        time.sleep(random.uniform(0, st["gap"]) / 1e9)
+                        hold = st["hold"] / 1e9
+                    else:
+                        hold = probe_hold
+                    t_req = time.perf_counter_ns()
+                    with lock:
+                        t_acq = time.perf_counter_ns()
+                        if hold > 0 and probe_spin:
+                            end = t_acq + int(hold * 1e9)
+                            while time.perf_counter_ns() < end:
+                                pass
+                        elif hold > 0:
+                            time.sleep(hold)
+                        t_rel = time.perf_counter_ns()
+                    _lock_trace.append(
+                        f"probe,probe{idx},probe,{t_req},{t_acq},{t_rel},\n"
+                    )
+                    if probe_mode != "mirror":
+                        time.sleep(probe_interval)
+
+            for i in range(probe_threads):
+                _threading.Thread(
+                    target=_probe, args=(i,), name=f"lock_probe{i}", daemon=True
+                ).start()
+
     # Holds the manager lock for the current schedule(), or None between steps.
     # Read and written only by the scheduler thread, so it needs no
     # synchronization of its own. Declared on the class so an instance built
@@ -675,7 +762,13 @@ class OffloadingConnectorScheduler:
         if self._step_region is not None:
             return
         region = ExitStack()
+        t_req = time.perf_counter_ns()
         region.enter_context(self.manager.lock)
+        self._step_trace = (
+            _sys._getframe(1).f_code.co_name.lstrip("_"),
+            t_req,
+            time.perf_counter_ns(),
+        )
         self._step_region = region
 
     def _release_step(self) -> None:
@@ -685,6 +778,27 @@ class OffloadingConnectorScheduler:
             return
         self._step_region = None
         region.close()
+        if _LOCK_TRACE_FILE:
+            hook, t_req, t_acq = self._step_trace
+            t_rel = time.perf_counter_ns()
+            prev = _probe_state["rel"]
+            _probe_state.update(
+                hold=t_rel - t_acq,
+                gap=max(0, t_req - prev) if prev else 0,
+                rel=t_rel,
+                seq=_probe_state["seq"] + 1,
+            )
+            acc = self.__dict__.pop("_hook_acc", {})
+            hooks = "|".join(f"{k}:{n}:{t}" for k, (n, t) in sorted(acc.items()))
+            _lock_trace_add(
+                "step",
+                hook,
+                t_req,
+                t_acq,
+                t_rel,
+                getattr(self, "_step_trace_extra", "") + ";" + hooks,
+            )
+            self._step_trace_extra = ""
 
     @contextmanager
     def _manager_locked(self) -> Iterator[None]:
@@ -703,8 +817,18 @@ class OffloadingConnectorScheduler:
                 "schedule(); releasing it before continuing."
             )
             self._release_step()
+        t_req = time.perf_counter_ns()
         with self.manager.lock:
+            t_acq = time.perf_counter_ns()
             yield
+        if _LOCK_TRACE_FILE:
+            _lock_trace_add(
+                "short",
+                _sys._getframe(2).f_code.co_name,
+                t_req,
+                t_acq,
+                time.perf_counter_ns(),
+            )
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -1932,6 +2056,13 @@ class OffloadingConnectorScheduler:
         # A step that scheduled nothing reaches build_connector_meta without
         # any earlier manager touch, so open the region here too.
         self._acquire_step()
+        if _LOCK_TRACE_FILE:
+            so = scheduler_output
+            self._step_trace_extra = (
+                f"{so.total_num_scheduled_tokens}|"
+                f"{len(so.scheduled_new_reqs)}|"
+                f"{len(so.num_scheduled_tokens)}|{len(self._req_status)}"
+            )
         try:
             return self._build_connector_meta(scheduler_output)
         finally:
@@ -2238,3 +2369,29 @@ class OffloadingConnectorScheduler:
 
     def shutdown(self) -> None:
         self.manager.shutdown()
+
+
+# --- lock-hold measurement: per-hook time inside the step region ----------
+def _wrap_hook(name):
+    fn = getattr(OffloadingConnectorScheduler, name)
+
+    def wrapper(self, *a, **kw):
+        t0 = time.perf_counter_ns()
+        try:
+            return fn(self, *a, **kw)
+        finally:
+            acc = self.__dict__.setdefault("_hook_acc", {})
+            n, t = acc.get(name, (0, 0))
+            acc[name] = (n + 1, t + time.perf_counter_ns() - t0)
+
+    wrapper.__name__ = fn.__name__
+    setattr(OffloadingConnectorScheduler, name, wrapper)
+
+
+if _LOCK_TRACE_FILE:
+    for _h in (
+        "get_num_new_matched_tokens",
+        "update_state_after_alloc",
+        "_build_connector_meta",
+    ):
+        _wrap_hook(_h)
