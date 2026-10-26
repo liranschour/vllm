@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -764,6 +765,167 @@ class TestNixlPeerFaults:
         transport.add_remote_peer("peer:1", b"meta", 0x1000, 8, 1024)
         assert transport.poll(peer_id="peer:1").peer_fault is None
         assert self._fail_one(transport).peer_fault is None
+
+
+class TestNixlStallDetection:
+    """A WRITE still PROC/PEND past its deadline is logged as stalled.
+
+    Observe-only: the transfer stays inflight and its peer is not faulted.
+    """
+
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        clock = SimpleNamespace(now=1000.0)
+        monkeypatch.setattr(nixl_module.time, "monotonic", lambda: clock.now)
+        return clock
+
+    @pytest.fixture
+    def warnings(self, monkeypatch):
+        warnings: list[str] = []
+        monkeypatch.setattr(
+            nixl_module.logger,
+            "warning",
+            lambda msg, *a, **k: warnings.append(msg % a),
+        )
+        return warnings
+
+    def _make_transport(self) -> NixlTransport:
+        return TestNixlPeerFaults()._make_transport()
+
+    @staticmethod
+    def _post(transport: NixlTransport, peer_id: str, local, remote) -> int:
+        tid = transport.write_blocks(peer_id, local, remote)
+        assert tid is not None
+        return tid
+
+    @staticmethod
+    def _advance(transport: NixlTransport, clock, seconds: float) -> None:
+        """Advance the clock by *seconds* while polling, as the tier-poll
+        thread does, so the next poll follows a short gap."""
+        clock.now += seconds
+        transport._last_poll_at = clock.now
+
+    @staticmethod
+    def _stalls(warnings: list[str]) -> list[str]:
+        return [w for w in warnings if "stalled" in w]
+
+    def test_deadline_is_size_aware_and_bounded(self):
+        floor = nixl_module._STALL_FLOOR_S
+        cap = nixl_module._STALL_CAP_S
+        bps = nixl_module._STALL_MIN_BANDWIDTH_BPS
+        assert nixl_module._stall_deadline_s(0) == floor
+        assert nixl_module._stall_deadline_s(int(bps * (floor + 5))) == floor + 5
+        assert nixl_module._stall_deadline_s(int(bps * cap * 10)) == cap
+
+    def test_records_post_time_and_size(self, clock):
+        transport = self._make_transport()
+        tid = self._post(transport, "peer:1", [0, 1, 2], [3, 4, 5])
+        entry = transport._inflight[tid]
+        assert entry.posted_at == clock.now
+        assert entry.nbytes == 3 * transport.block_len
+
+    @pytest.mark.parametrize("state", ["PROC", "PEND"])
+    def test_no_stall_within_the_deadline(self, clock, warnings, state):
+        transport = self._make_transport()
+        tid = self._post(transport, "peer:1", [0], [1])
+        transport._agent.check_xfer_state.return_value = state
+        self._advance(transport, clock, nixl_module._STALL_FLOOR_S)
+        assert transport.poll(peer_id="peer:1") is nixl_module._EMPTY_POLL_RESULT
+        assert not transport._inflight[tid].stalled
+        assert self._stalls(warnings) == []
+
+    @pytest.mark.parametrize("state", ["PROC", "PEND"])
+    def test_stall_warns_once_and_keeps_the_transfer(self, clock, warnings, state):
+        transport = self._make_transport()
+        tid = self._post(transport, "peer:1", [0], [1])
+        transport._agent.check_xfer_state.return_value = state
+        self._advance(transport, clock, nixl_module._STALL_FLOOR_S + 1)
+        for _ in range(3):
+            result = transport.poll(peer_id="peer:1")
+            assert result.done == () and result.failed == ()
+            assert result.peer_fault is None
+            self._advance(transport, clock, 5)
+        stalls = self._stalls(warnings)
+        assert len(stalls) == 1
+        assert f"transfer_id={tid} to peer=peer:1 stalled: still {state}" in stalls[0]
+        assert transport._inflight[tid].stalled
+        transport._agent.release_xfer_handle.assert_not_called()
+        assert transport._peer_strikes == {}
+
+    def test_large_transfer_gets_a_longer_deadline(self, clock, warnings):
+        transport = self._make_transport()
+        n = 32
+        # 15 s at the minimum bandwidth: between the floor and the cap.
+        block_len = int(nixl_module._STALL_MIN_BANDWIDTH_BPS * 15 / n)
+        transport._block_len = block_len
+        tid = self._post(transport, "peer:1", list(range(n)), list(range(n)))
+        self._advance(transport, clock, nixl_module._STALL_FLOOR_S + 1)
+        transport.poll(peer_id="peer:1")
+        assert not transport._inflight[tid].stalled
+        self._advance(transport, clock, 5)
+        transport.poll(peer_id="peer:1")
+        assert transport._inflight[tid].stalled
+
+    def test_no_stall_judged_after_a_poll_gap(self, clock, warnings):
+        """A starved poller's first look at a transfer is not a stall: it
+        may have finished in the gap and only its DONE is unseen yet."""
+        transport = self._make_transport()
+        tid = self._post(transport, "peer:1", [0], [1])
+        transport.poll(peer_id="peer:1")
+        clock.now += nixl_module._STALL_FLOOR_S + 1
+        transport.poll(peer_id="peer:1")
+        assert not transport._inflight[tid].stalled
+        clock.now += nixl_module._STALL_MAX_POLL_GAP_S
+        transport.poll(peer_id="peer:1")
+        assert transport._inflight[tid].stalled
+        assert len(self._stalls(warnings)) == 1
+
+    def test_stall_is_per_transfer(self, clock):
+        transport = self._make_transport()
+        old = self._post(transport, "peer:1", [0], [1])
+        self._advance(transport, clock, nixl_module._STALL_FLOOR_S)
+        new = self._post(transport, "peer:2", [0], [1])
+        self._advance(transport, clock, 1)
+        transport.poll()
+        assert transport._inflight[old].stalled
+        assert not transport._inflight[new].stalled
+
+    def test_scoped_poll_checks_only_its_peer(self, clock):
+        transport = self._make_transport()
+        tid = self._post(transport, "peer:1", [0], [1])
+        self._advance(transport, clock, nixl_module._STALL_FLOOR_S + 1)
+        transport.poll(peer_id="peer:2")
+        assert not transport._inflight[tid].stalled
+
+    @pytest.mark.parametrize("state", ["DONE", "ERR"])
+    def test_late_completion_is_reported_and_logged(self, clock, warnings, state):
+        transport = self._make_transport()
+        tid = self._post(transport, "peer:1", [0], [1])
+        self._advance(transport, clock, nixl_module._STALL_FLOOR_S + 1)
+        transport.poll(peer_id="peer:1")
+        transport._agent.check_xfer_state.return_value = state
+        self._advance(transport, clock, 4)
+        result = transport.poll(peer_id="peer:1")
+        assert tid in (result.done if state == "DONE" else result.failed)
+        assert tid not in transport._inflight
+        assert any(
+            f"stalled transfer_id={tid} to peer=peer:1 ended {state} after "
+            f"{nixl_module._STALL_FLOOR_S + 5:.1f}s" in w
+            for w in warnings
+        )
+
+    def test_raise_after_stall_is_logged_once(self, clock, warnings):
+        transport = self._make_transport()
+        tid = self._post(transport, "peer:1", [0], [1])
+        self._advance(transport, clock, nixl_module._STALL_FLOOR_S + 1)
+        transport.poll(peer_id="peer:1")
+        transport._agent.check_xfer_state.side_effect = nixlNotFoundError(
+            "NIXL_ERR_NOT_FOUND"
+        )
+        for _ in range(3):
+            assert transport.poll(peer_id="peer:1").peer_fault == "NIXL_ERR_NOT_FOUND"
+        assert sum("ended raised" in w for w in warnings) == 1
+        assert tid in transport._inflight
 
 
 # ---------------------------------------------------------------------------

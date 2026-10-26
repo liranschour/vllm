@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import itertools
 import threading
+import time
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, NamedTuple
@@ -62,6 +63,18 @@ _EMPTY_POLL_RESULT: PollResult = PollResult(done=(), failed=())
 # Consecutive transfer-scope failures, with no success between, that fault
 # a peer (see "Failure model" in data/base.py).
 _MAX_CONSECUTIVE_TRANSFER_FAILURES = 3
+
+# A WRITE still PROC/PEND past max(floor, nbytes / bandwidth), capped, is
+# logged as stalled. Observe-only for now: it doesn't fault the peer. A WRITE
+# the NIC has taken completes or errors within ms, so a long PROC/PEND points
+# at a UCX/NIXL progress problem, not a slow peer. The floor sits far above
+# manager-lock hold times (p99 ~131 ms).
+_STALL_FLOOR_S = 10.0
+_STALL_MIN_BANDWIDTH_BPS = 1e9
+_STALL_CAP_S = 25.0
+# A poll that follows a longer gap since the previous one may be the first
+# look at a transfer that finished meanwhile, so it judges no stalls.
+_STALL_MAX_POLL_GAP_S = 1.0
 
 # NIXL errors that fault the peer's registration at once, even when raised
 # at submission, by exception name → status: the remote endpoint is gone,
@@ -105,11 +118,20 @@ class _Inflight(NamedTuple):
     transport is shared across all peer sessions of the engine.
     ``struck`` is set once the transfer has counted against its peer, so a
     state check that keeps raising charges it once, not once per poll.
+    ``posted_at`` (``time.monotonic``) and ``nbytes`` set its stall deadline;
+    ``stalled`` is set once it has been logged as stalled.
     """
 
     peer_id: str
     handle: object
+    posted_at: float
+    nbytes: int
     struck: bool = False
+    stalled: bool = False
+
+
+def _stall_deadline_s(nbytes: int) -> float:
+    return min(_STALL_CAP_S, max(_STALL_FLOOR_S, nbytes / _STALL_MIN_BANDWIDTH_BPS))
 
 
 class NixlTransport(DataTransport):
@@ -137,9 +159,11 @@ class NixlTransport(DataTransport):
         self._local_dlist: Any = None
         self._remote_dlists: dict[str, object] = {}
         self._peer_nixl_names: dict[str, str] = {}
-        # transfer_id → _Inflight(peer_id, handle).
+        # transfer_id → _Inflight.
         self._inflight: dict[int, _Inflight] = {}
         self._next_id = itertools.count()
+        # time.monotonic() of the last poll(), for _STALL_MAX_POLL_GAP_S.
+        self._last_poll_at: float | None = None
         # peer_id → transfer-scope failures since its last success.
         self._peer_strikes: dict[str, int] = {}
         # peer_id → fault cause; reported by poll(peer_id) until removal.
@@ -411,7 +435,9 @@ class NixlTransport(DataTransport):
             self._record_failure(peer_id, exc)
             return None
         transfer_id = next(self._next_id)
-        self._inflight[transfer_id] = _Inflight(peer_id, handle)
+        self._inflight[transfer_id] = _Inflight(
+            peer_id, handle, time.monotonic(), len(local_idxs) * self.block_len
+        )
         return transfer_id
 
     def poll(self, peer_id: str | None = None) -> PollResult:
@@ -426,6 +452,11 @@ class NixlTransport(DataTransport):
         transfer IDs. Completed handles are released automatically.
         ``peer_fault`` is set on a scoped poll once *peer_id* is faulted.
         """
+        now = time.monotonic()
+        last_poll_at, self._last_poll_at = self._last_poll_at, now
+        judge_stalls = (
+            last_poll_at is not None and now - last_poll_at <= _STALL_MAX_POLL_GAP_S
+        )
         if not self._inflight:
             return self._poll_result(peer_id, None, None)
 
@@ -443,6 +474,9 @@ class NixlTransport(DataTransport):
             try:
                 state = self._agent.check_xfer_state(entry.handle)
             except Exception as exc:
+                if entry.stalled:
+                    self._log_stall_end(transfer_id, entry, f"raised {exc!r}")
+                    entry = self._inflight[transfer_id] = entry._replace(stalled=False)
                 # A check that keeps raising warns once, then at debug.
                 (logger.debug if entry.struck else logger.warning)(
                     "NixlTransport %s: check_xfer_state failed for transfer_id=%d: %s",
@@ -459,6 +493,16 @@ class NixlTransport(DataTransport):
                     # or at its drain cap, and the teardown reclaims it.
                     continue
                 state = "ERR"
+            if state in ("PROC", "PEND"):
+                if (
+                    judge_stalls
+                    and not entry.stalled
+                    and self._check_stall(transfer_id, entry, state, now)
+                ):
+                    self._inflight[transfer_id] = entry._replace(stalled=True)
+                continue
+            if entry.stalled:
+                self._log_stall_end(transfer_id, entry, state)
             if state == "DONE":
                 if done_ids is None:
                     done_ids = []
@@ -466,7 +510,7 @@ class NixlTransport(DataTransport):
                 if succeeded is None:
                     succeeded = set()
                 succeeded.add(entry.peer_id)
-            elif state not in ("PROC", "PEND"):
+            else:
                 if failed_ids is None:
                     failed_ids = []
                 failed_ids.append(transfer_id)
@@ -631,6 +675,35 @@ class NixlTransport(DataTransport):
             self._set_peer_fault(
                 peer_id, f"{strikes} consecutive transfer failures (last: {cause})"
             )
+
+    def _check_stall(
+        self, transfer_id: int, entry: _Inflight, state: str, now: float
+    ) -> bool:
+        """Warn once a PROC/PEND transfer passes its stall deadline."""
+        age = now - entry.posted_at
+        if age <= _stall_deadline_s(entry.nbytes):
+            return False
+        logger.warning(
+            "NixlTransport %s: transfer_id=%d to peer=%s stalled: still %s "
+            "after %.1fs (%d bytes)",
+            self._agent_name,
+            transfer_id,
+            entry.peer_id,
+            state,
+            age,
+            entry.nbytes,
+        )
+        return True
+
+    def _log_stall_end(self, transfer_id: int, entry: _Inflight, outcome: str) -> None:
+        logger.warning(
+            "NixlTransport %s: stalled transfer_id=%d to peer=%s ended %s after %.1fs",
+            self._agent_name,
+            transfer_id,
+            entry.peer_id,
+            outcome,
+            time.monotonic() - entry.posted_at,
+        )
 
     def _set_peer_fault(self, peer_id: str, cause: str) -> None:
         if peer_id in self._peer_faults:
