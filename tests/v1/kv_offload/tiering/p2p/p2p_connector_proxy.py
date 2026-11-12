@@ -98,8 +98,8 @@ async def lifespan(app: FastAPI):
     # which OffloadKeys it stored, and to the decoder's to see them land.
     app.state.proactive = global_args.proactive
     app.state.collector = None  # set to a list while a prefill is capturing
-    app.state.watch = None  # set to a _MigrationWatch while a migration runs
-    app.state.migration_lock = asyncio.Lock()
+    app.state.watch = None  # set to a _FetchWatch while a fetch runs
+    app.state.fetch_lock = asyncio.Lock()
     app.state.kv_sub_tasks = []
     app.state.kv_ctx = None
     if global_args.proactive:
@@ -236,7 +236,7 @@ def parse_args():
         action="store_true",
         help="Proactive P2P mode: (1) prefill on the prefiller and learn the "
         "stored blocks from its KV-cache events, (2) send the decoder a one-token "
-        "warm-up request whose kv_hints carry a p2p.migrate action naming those "
+        "warm-up request whose kv_hints carry a p2p.fetch action naming those "
         "blocks, so it pulls them into its CPU cache, and wait for their CPU "
         "BlockStored events on the decoder's KV-event stream, (3) send a plain "
         "decode request, served from the prefetched cache. Requires KV-cache "
@@ -259,7 +259,7 @@ def parse_args():
         "--warmup-prompt",
         type=str,
         default="Warm-up.",
-        help="Prompt of the one-token request that carries the p2p.migrate "
+        help="Prompt of the one-token request that carries the p2p.fetch "
         "hint to the decoder (proactive mode only).",
     )
     p.add_argument(
@@ -270,15 +270,15 @@ def parse_args():
         "selects the decoder's only served model (proactive mode only).",
     )
     p.add_argument(
-        "--migration-quiet",
+        "--fetch-quiet",
         type=float,
         default=2.0,
-        help="After the first migrated block lands, stop waiting once the "
+        help="After the first fetched block lands, stop waiting once the "
         "decoder's KV events have been quiet this long: a block the source "
         "does not hold emits nothing (proactive mode only).",
     )
     p.add_argument(
-        "--no-migrate-hint",
+        "--no-fetch-hint",
         action="store_true",
         help="Negative control for proactive mode: skip the warm-up request, "
         "so the decode recomputes.",
@@ -298,10 +298,10 @@ def parse_args():
         "--kv-events-config topic; proactive mode only).",
     )
     p.add_argument(
-        "--migration-timeout",
+        "--fetch-timeout",
         type=float,
         default=30.0,
-        help="Seconds to wait for a proactive migration's blocks before giving "
+        help="Seconds to wait for a proactive fetch's blocks before giving "
         "up (proactive mode only).",
     )
     args = p.parse_args()
@@ -356,7 +356,7 @@ async def _prefill(client_info, endpoint, req_data, request_id, dp_rank=None):
     data = req_data.copy()
     if global_args.p2p or global_args.proactive:
         # p2p: decoder pulls reactively. proactive: decoder pulls via a
-        # p2p.migrate kv_hints action. Either way the prefiller just offloads
+        # p2p.fetch kv_hints action. Either way the prefiller just offloads
         # to its own CPU tier — no remote_decoder push target.
         data.pop("kv_transfer_params", None)
     else:
@@ -528,7 +528,7 @@ async def _handle_completions_decoder_first(api: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Proactive P2P migration
+# Proactive P2P fetch
 # ---------------------------------------------------------------------------
 
 
@@ -582,7 +582,7 @@ def _on_prefiller_event(app, ev) -> None:
         collector.append(key)
 
 
-class _MigrationWatch:
+class _FetchWatch:
     """Tracks which requested keys the decoder reported as landed or dropped."""
 
     def __init__(self, keys: list[bytes]):
@@ -613,15 +613,15 @@ def _on_decoder_event(app, ev) -> None:
         watch.on_event(ev)
 
 
-def _migrate_hint(request_id: str, source: dict, keys: list[bytes]) -> dict:
-    """A kv_hints envelope carrying one `p2p.migrate` action."""
+def _fetch_hint(request_id: str, source: dict, keys: list[bytes]) -> dict:
+    """A kv_hints envelope carrying one `p2p.fetch` action."""
     return {
         "protocol_version": "0.1",
         "message_id": request_id,
         "actions": [
             {
-                "action_id": "migrate",
-                "action_type": "p2p.migrate",
+                "action_id": "fetch",
+                "action_type": "p2p.fetch",
                 "action_version": "1.0",
                 "payload": {"source": source, "blocks": [k.hex() for k in keys]},
             }
@@ -632,7 +632,7 @@ def _migrate_hint(request_id: str, source: dict, keys: list[bytes]) -> dict:
 async def _send_warmup_carrier(client_info, request_id, kv_hints, dp_rank=None):
     """Deliver the hint on a throwaway one-token request to the decoder.
 
-    The migration it starts outlives this request, so the response only means
+    The fetch it starts outlives this request, so the response only means
     the hint was delivered, not that the blocks arrived.
     """
     headers = _auth_headers(f"{request_id}-warmup")
@@ -653,20 +653,20 @@ async def _send_warmup_carrier(client_info, request_id, kv_hints, dp_rank=None):
     await resp.aread()
 
 
-async def _await_migration(watch: _MigrationWatch, transfer_id: str) -> bool:
+async def _await_fetch(watch: _FetchWatch, transfer_id: str) -> bool:
     """Wait until every requested key landed or was dropped on the decoder.
 
     A key the source does not hold emits nothing, so after the first event
-    the wait also ends once the stream has been quiet for --migration-quiet.
+    the wait also ends once the stream has been quiet for --fetch-quiet.
     Returns True iff at least one block landed.
     """
     start = time.monotonic()
-    deadline = start + global_args.migration_timeout
+    deadline = start + global_args.fetch_timeout
     while time.monotonic() < deadline and not watch.resolved:
         progressed = watch.stored or watch.removed
         if (
             progressed
-            and time.monotonic() - watch.last_progress > global_args.migration_quiet
+            and time.monotonic() - watch.last_progress > global_args.fetch_quiet
         ):
             break
         await asyncio.sleep(0.02)
@@ -678,9 +678,9 @@ async def _await_migration(watch: _MigrationWatch, transfer_id: str) -> bool:
         state = "timeout"
     # print (not logger): the module logger's INFO records do not reach the
     # proxy's stdout log under uvicorn's logging config, and the e2e test
-    # greps this line for the migration outcome.
+    # greps this line for the fetch outcome.
     print(
-        f"MIGRATION transfer_id={transfer_id} state={state} "
+        f"FETCH transfer_id={transfer_id} state={state} "
         f"blocks_requested={len(watch.want)} blocks_done={len(watch.stored)} "
         f"blocks_failed={len(watch.removed)} "
         f"elapsed_s={time.monotonic() - start:.3f}",
@@ -691,7 +691,7 @@ async def _await_migration(watch: _MigrationWatch, transfer_id: str) -> bool:
 
 async def _handle_completions_proactive(api: str, request: Request):
     """Proactive flow: prefill -> capture the prefiller's CPU block keys from
-    its KV events -> warm-up request to the decoder carrying a p2p.migrate
+    its KV events -> warm-up request to the decoder carrying a p2p.fetch
     kv_hints action -> wait for the decoder's CPU BlockStored events -> plain
     decode (served from the prefetched CPU cache)."""
     try:
@@ -703,8 +703,8 @@ async def _handle_completions_proactive(api: str, request: Request):
         prefill_client = _get_next(request.app, "prefill")
         decode_client = _get_next(request.app, "decode")
 
-        # Serialize the capture+migrate window so KV events map to this request.
-        async with request.app.state.migration_lock:
+        # Serialize the capture+fetch window so KV events map to this request.
+        async with request.app.state.fetch_lock:
             collector: list[bytes] = []
             request.app.state.collector = collector
             try:
@@ -722,12 +722,12 @@ async def _handle_completions_proactive(api: str, request: Request):
                 flush=True,
             )
 
-            if keys and not global_args.no_migrate_hint:
+            if keys and not global_args.no_fetch_hint:
                 source = {
                     "host": global_args.p2p_connector_host,
                     "port": global_args.p2p_connector_port + prefill_rank,
                 }
-                watch = _MigrationWatch(keys)
+                watch = _FetchWatch(keys)
                 # Watch before sending: the first blocks can land before the
                 # carrier's response returns.
                 request.app.state.watch = watch
@@ -735,15 +735,15 @@ async def _handle_completions_proactive(api: str, request: Request):
                     await _send_warmup_carrier(
                         decode_client,
                         request_id,
-                        _migrate_hint(request_id, source, keys),
+                        _fetch_hint(request_id, source, keys),
                         dp_rank=decode_hdr,
                     )
-                    await _await_migration(watch, f"{request_id}:migrate")
+                    await _await_fetch(watch, f"{request_id}:fetch")
                 finally:
                     request.app.state.watch = None
             elif keys:
                 print(
-                    f"proactive {request_id}: --no-migrate-hint; decode will recompute",
+                    f"proactive {request_id}: --no-fetch-hint; decode will recompute",
                     flush=True,
                 )
             else:
@@ -754,7 +754,7 @@ async def _handle_completions_proactive(api: str, request: Request):
                 )
 
         # Plain decode: no kv_transfer_params, so the decoder serves from the
-        # CPU cache the migration just populated (or recomputes on a miss).
+        # CPU cache the fetch just populated (or recomputes on a miss).
         decode_data = req_data.copy()
         decode_data.pop("kv_transfer_params", None)
 

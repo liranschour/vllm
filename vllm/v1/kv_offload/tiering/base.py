@@ -185,10 +185,10 @@ class SecondaryTierManager(ABC):
     tolerates_off_thread_polling: ClassVar[bool] = False
 
     # Whether this tier can pull a named set of blocks from a named remote peer,
-    # which is what a proactive migration (a `p2p.migrate` kv_hints action)
+    # which is what a proactive fetch (a `p2p.fetch` kv_hints action)
     # needs. Only tiers that fetch from a peer addressed per request can; a
     # local or shared store has no peer to pull from.
-    supports_migration: ClassVar[bool] = False
+    supports_proactive_fetch: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -341,20 +341,20 @@ class SecondaryTierManager(ABC):
         """
         pass
 
-    def is_migration_source_ready(self, req_context: ReqContext) -> bool | None:
-        """Whether a migration's source can be probed yet.
+    def is_fetch_source_ready(self, req_context: ReqContext) -> bool | None:
+        """Whether a fetch's source can be probed yet.
 
-        Only called on tiers that set supports_migration, for the synthetic
-        request of a proactive migration. A live request's lookup may treat a
+        Only called on tiers that set supports_proactive_fetch, for the synthetic
+        request of a proactive fetch. A live request's lookup may treat a
         peer that is still connecting as a miss and compute locally; a
-        migration exists only to pull from that peer, so it waits instead.
+        fetch exists only to pull from that peer, so it waits instead.
 
         Args:
-            req_context: The migration's synthetic request context.
+            req_context: The fetch's synthetic request context.
 
         Returns:
             True to probe now, None while the source is still connecting, or
-            False if it is unreachable (the migration then fails).
+            False if it is unreachable (the fetch then fails).
 
         """
         return True

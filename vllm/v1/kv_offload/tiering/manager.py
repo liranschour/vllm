@@ -57,10 +57,10 @@ from vllm.v1.kv_offload.tiering.base import (
     TransferJob,
 )
 from vllm.v1.kv_offload.tiering.metrics import TieringMetricsTracker
-from vllm.v1.kv_offload.tiering.migration import (
-    MigrationHintError,
-    is_migrate_action,
-    parse_migrate_action,
+from vllm.v1.kv_offload.tiering.proactive_fetch import (
+    FetchHintError,
+    is_fetch_action,
+    parse_fetch_action,
 )
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
@@ -92,23 +92,23 @@ _TIER_POLL_ERROR_LOG_INTERVAL_S = 1.0
 # How long shutdown() waits for the thread to finish its round.
 _TIER_POLL_JOIN_TIMEOUT_S = 5.0
 
-# Proactive migration (`p2p.migrate` kv_hints action). A block stuck probing (no
+# Proactive fetch (`p2p.fetch` kv_hints action). A block stuck probing (no
 # lookup answer) or promoting (stuck transfer) past this deadline is failed so
-# the migration terminates.
-_MIGRATION_TIMEOUT_S = 300.0
-# How long a terminal migration is retained, so a repeated hint for the same id
+# the fetch terminates.
+_FETCH_TIMEOUT_S = 300.0
+# How long a terminal fetch is retained, so a repeated hint for the same id
 # is recognised as a duplicate rather than restarted.
-_MIGRATION_REAP_TTL_S = 300.0
-# Max keys advanced per engine step, summed across all active migrations.
-# _drive_migrations() runs inside on_schedule_end(), so every key costs a full
+_FETCH_REAP_TTL_S = 300.0
+# Max keys advanced per engine step, summed across all active fetches.
+# _drive_fetches() runs inside on_schedule_end(), so every key costs a full
 # tier lookup on the scheduler's critical path; bounding it is what keeps a
 # large prefetch from inflating TTFT for live requests.
-_MIGRATION_KEYS_PER_STEP = 256
-# Max concurrent non-terminal migrations. Beyond this a migrate action is
+_FETCH_KEYS_PER_STEP = 256
+# Max concurrent non-terminal fetches. Beyond this a fetch action is
 # rejected rather than growing per-step work and CPU pressure without bound.
-_MAX_ACTIVE_MIGRATIONS = 16
+_MAX_ACTIVE_FETCHES = 16
 
-# Per-key states within a migration.
+# Per-key states within a fetch.
 _KEY_PROBE = "probe"
 _KEY_PROMOTING = "promoting"
 
@@ -144,10 +144,10 @@ class _DeferredRelease(NamedTuple):
 
 
 @dataclass
-class _MigrationState:
-    """A proactive block migration submitted by a `p2p.migrate` kv_hints action.
+class _FetchState:
+    """A proactive block fetch submitted by a `p2p.fetch` kv_hints action.
 
-    Driven request-lessly by `_drive_migrations` through the normal `lookup()`
+    Driven request-lessly by `_drive_fetches` through the normal `lookup()`
     -> promotion machinery: each key is probed against the tiers (the synthetic
     `req_context` carries `remote_kv_source` params, so the P2P tier fetches
     from the named peer), promoted into the CPU primary tier, and committed
@@ -172,7 +172,7 @@ class _MigrationState:
     finalized: bool = False
 
     def resolve_terminal(self) -> str:
-        """Terminal state for a migration whose keys have all resolved.
+        """Terminal state for a fetch whose keys have all resolved.
 
         Only a clean source miss may still complete: a partial or
         capacity-starved result must not look like a warm cache.
@@ -182,7 +182,7 @@ class _MigrationState:
         return "completed"
 
     def error_reason(self) -> str | None:
-        """Short reason string for a failed migration."""
+        """Short reason string for a failed fetch."""
         if self.terminal != "failed":
             return None
         if self.error is not None:
@@ -425,15 +425,15 @@ class TieringOffloadingManager(OffloadingManager):
             tier: i for i, tier in enumerate(self.secondary_tiers)
         }
 
-        # Active and recently terminal proactive migrations, keyed by
+        # Active and recently terminal proactive fetches, keyed by
         # "<message_id>:<action_id>" of the kv_hints action that submitted them.
-        # Driven once per step by _drive_migrations() in on_schedule_end().
-        self._migrations: dict[str, _MigrationState] = {}
-        # Rotating start offset for _drive_migrations, so one large migration
+        # Driven once per step by _drive_fetches() in on_schedule_end().
+        self._fetches: dict[str, _FetchState] = {}
+        # Rotating start offset for _drive_fetches, so one large fetch
         # cannot starve the others when the per-step key budget runs out.
-        self._migration_cursor: int = 0
-        self._supports_migration = any(
-            tier.supports_migration for tier in self.secondary_tiers
+        self._fetch_cursor: int = 0
+        self._supports_proactive_fetch = any(
+            tier.supports_proactive_fetch for tier in self.secondary_tiers
         )
         # Set by _initiate_promotion when it fails for lack of primary-tier room,
         # so a MISS from lookup() can be attributed to capacity rather than to
@@ -1218,7 +1218,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._req_state[req_context.req_id] = state
 
         if req_context.kv_hints is not None:
-            self._submit_migration_hints(req_context)
+            self._submit_fetch_hints(req_context)
 
         policy = (
             OffloadPolicy.REQUEST_LEVEL
@@ -1266,31 +1266,30 @@ class TieringOffloadingManager(OffloadingManager):
         del self._req_state[req_id]
 
     # ------------------------------------------------------------------
-    # Proactive migration (`p2p.migrate` kv_hints action)
+    # Proactive fetch (`p2p.fetch` kv_hints action)
     # ------------------------------------------------------------------
 
-    def _submit_migration_hints(self, req_context: ReqContext) -> None:
-        """Start a migration for each `p2p.migrate` action in the request's hints.
+    def _submit_fetch_hints(self, req_context: ReqContext) -> None:
+        """Start a fetch for each `p2p.fetch` action in the request's hints.
 
-        The blocks need not belong to the carrying request, and the migration
+        The blocks need not belong to the carrying request, and the fetch
         outlives it. A malformed, unsupported, or rejected action is logged and
         skipped; it never fails the carrying request or the other actions.
         """
         hints = req_context.kv_hints
         assert hints is not None
         for action in hints.actions:
-            if not is_migrate_action(action):
+            if not is_fetch_action(action):
                 continue
-            if not self._supports_migration:
+            if not self._supports_proactive_fetch:
                 logger.warning_once(
-                    "Ignoring %s kv_hints action: no secondary tier supports "
-                    "migration.",
+                    "Ignoring %s kv_hints action: no secondary tier supports fetch.",
                     action.action_type,
                 )
                 continue
             try:
-                migration = parse_migrate_action(hints.message_id, action)
-            except MigrationHintError as exc:
+                fetch = parse_fetch_action(hints.message_id, action)
+            except FetchHintError as exc:
                 logger.warning(
                     "Ignoring %s action %r of message %r (request %s): %s",
                     action.action_type,
@@ -1300,23 +1299,23 @@ class TieringOffloadingManager(OffloadingManager):
                     exc,
                 )
                 continue
-            accepted, num_blocks, error = self.submit_migration(
-                migration.transfer_id, migration.host, migration.port, migration.keys
+            accepted, num_blocks, error = self.submit_proactive_fetch(
+                fetch.transfer_id, fetch.host, fetch.port, fetch.keys
             )
             if accepted:
                 logger.info(
-                    "Proactive migration %s accepted: %d block(s) from %s:%d",
-                    migration.transfer_id,
+                    "Proactive fetch %s accepted: %d block(s) from %s:%d",
+                    fetch.transfer_id,
                     num_blocks,
-                    migration.host,
-                    migration.port,
+                    fetch.host,
+                    fetch.port,
                 )
             else:
                 logger.warning(
-                    "Proactive migration %s rejected: %s", migration.transfer_id, error
+                    "Proactive fetch %s rejected: %s", fetch.transfer_id, error
                 )
 
-    def submit_migration(
+    def submit_proactive_fetch(
         self,
         transfer_id: str,
         host: str,
@@ -1327,14 +1326,14 @@ class TieringOffloadingManager(OffloadingManager):
 
         Non-blocking: builds a synthetic `remote_kv_source` request context
         (which opens the P2P session and caches its routing state through
-        on_new_request()), records the migration, and returns. The transfer is
-        advanced request-lessly by _drive_migrations() on later steps.
+        on_new_request()), records the fetch, and returns. The transfer is
+        advanced request-lessly by _drive_fetches() on later steps.
 
         Duplicate keys are collapsed, so `num_blocks` is the number of distinct
         blocks and always reconciles against done/missing/failed.
 
         Args:
-            transfer_id: Migration id, used verbatim as the P2P kv_request_id.
+            transfer_id: Fetch id, used verbatim as the P2P kv_request_id.
             host: Source peer P2P host.
             port: Source peer P2P port.
             keys: OffloadKeys to pull.
@@ -1342,17 +1341,17 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             `(accepted, num_blocks, error)`. On rejection `accepted` is False
             and `error` is `no_blocks`, `duplicate_transfer_id`,
-            `too_many_migrations`, or `insufficient_capacity`.
+            `too_many_fetches`, or `insufficient_capacity`.
 
         """
         if not keys:
             return (False, 0, "no_blocks")
-        if transfer_id in self._migrations:
+        if transfer_id in self._fetches:
             return (False, 0, "duplicate_transfer_id")
 
-        active = sum(1 for mig in self._migrations.values() if mig.terminal is None)
-        if active >= _MAX_ACTIVE_MIGRATIONS:
-            return (False, 0, "too_many_migrations")
+        active = sum(1 for pf in self._fetches.values() if pf.terminal is None)
+        if active >= _MAX_ACTIVE_FETCHES:
+            return (False, 0, "too_many_fetches")
 
         unique_keys = dict.fromkeys(keys)
         num_blocks = len(unique_keys)
@@ -1367,7 +1366,7 @@ class TieringOffloadingManager(OffloadingManager):
             return (False, 0, "insufficient_capacity")
 
         req_context = ReqContext(
-            req_id=f"p2p-migration:{transfer_id}",
+            req_id=f"p2p-fetch:{transfer_id}",
             kv_transfer_params={
                 "remote_kv_source": {
                     "remote_host": host,
@@ -1380,76 +1379,74 @@ class TieringOffloadingManager(OffloadingManager):
         # the context (fanned out to every secondary tier; inert for others).
         self.on_new_request(req_context)
 
-        self._migrations[transfer_id] = _MigrationState(
+        self._fetches[transfer_id] = _FetchState(
             transfer_id=transfer_id,
             req_context=req_context,
             total=num_blocks,
             active=dict.fromkeys(unique_keys, _KEY_PROBE),
-            deadline=time.monotonic() + _MIGRATION_TIMEOUT_S,
+            deadline=time.monotonic() + _FETCH_TIMEOUT_S,
         )
         return (True, num_blocks, None)
 
-    def poll_migration(self, transfer_id: str) -> dict[str, object] | None:
-        """Return a migration's status, or None if the id is unknown or reaped.
+    def poll_proactive_fetch(self, transfer_id: str) -> dict[str, object] | None:
+        """Return a fetch's status, or None if the id is unknown or reaped.
 
         Internal (logging and tests): kv_hints has no reply channel, so the
         orchestrator observes completion through KV cache events instead.
         """
-        mig = self._migrations.get(transfer_id)
-        if mig is None:
+        pf = self._fetches.get(transfer_id)
+        if pf is None:
             return None
         return {
-            "state": mig.terminal if mig.terminal is not None else "running",
-            "blocks_total": mig.total,
-            "blocks_done": len(mig.done),
-            "blocks_missing": len(mig.missing),
-            "blocks_failed": len(mig.failed) + len(mig.no_capacity),
-            "blocks_no_capacity": len(mig.no_capacity),
-            "error": mig.error_reason(),
+            "state": pf.terminal if pf.terminal is not None else "running",
+            "blocks_total": pf.total,
+            "blocks_done": len(pf.done),
+            "blocks_missing": len(pf.missing),
+            "blocks_failed": len(pf.failed) + len(pf.no_capacity),
+            "blocks_no_capacity": len(pf.no_capacity),
+            "error": pf.error_reason(),
         }
 
-    def _finalize_migration(
-        self, mig: _MigrationState, terminal: str, now: float
-    ) -> None:
-        """Release the synthetic request and mark the migration terminal.
+    def _finalize_fetch(self, pf: _FetchState, terminal: str, now: float) -> None:
+        """Release the synthetic request and mark the fetch terminal.
 
         on_request_finished() finalizes immediately (no primary stores were
         issued) and tears down the P2P session state for the id.
         """
-        if not mig.finalized:
-            self.on_request_finished(mig.req_context)
-            mig.finalized = True
-        mig.terminal = terminal
-        mig.terminal_at = now
+        if not pf.finalized:
+            self.on_request_finished(pf.req_context)
+            pf.finalized = True
+        pf.terminal = terminal
+        pf.terminal_at = now
         logger.info(
-            "Proactive migration %s %s: done=%d missing=%d failed=%d "
+            "Proactive fetch %s %s: done=%d missing=%d failed=%d "
             "no_capacity=%d of %d%s",
-            mig.transfer_id,
+            pf.transfer_id,
             terminal,
-            len(mig.done),
-            len(mig.missing),
-            len(mig.failed),
-            len(mig.no_capacity),
-            mig.total,
-            f" ({mig.error_reason()})" if terminal == "failed" else "",
+            len(pf.done),
+            len(pf.missing),
+            len(pf.failed),
+            len(pf.no_capacity),
+            pf.total,
+            f" ({pf.error_reason()})" if terminal == "failed" else "",
         )
 
-    def _advance_migration(self, mig: _MigrationState, budget: int) -> int:
-        """Advance up to `budget` of one migration's keys. Returns keys used.
+    def _advance_fetch(self, pf: _FetchState, budget: int) -> int:
+        """Advance up to `budget` of one fetch's keys. Returns keys used.
 
         Never re-probes a resolved key, so a source miss cannot loop forever.
-        Probes wait while the source is still connecting, and the migration
+        Probes wait while the source is still connecting, and the fetch
         fails if it is unreachable.
         """
-        ctx = mig.req_context
-        source_ready = self._migration_source_ready(ctx)
+        ctx = pf.req_context
+        source_ready = self._fetch_source_ready(ctx)
         if source_ready is None:
             return 0
         if source_ready is False:
-            self._fail_migration_keys(mig, "source_unreachable")
+            self._fail_fetch_keys(pf, "source_unreachable")
             return 0
         used = 0
-        for key, key_state in list(mig.active.items()):
+        for key, key_state in list(pf.active.items()):
             if used >= budget:
                 break
             used += 1
@@ -1458,37 +1455,37 @@ class TieringOffloadingManager(OffloadingManager):
                 # promotion; the P2P tier fetches from the named peer.
                 result = self.lookup(key, ctx)
                 if result is LookupResult.HIT:
-                    mig.active.pop(key)
-                    mig.done.add(key)
+                    pf.active.pop(key)
+                    pf.done.add(key)
                 elif result is LookupResult.HIT_PENDING:
-                    mig.active[key] = _KEY_PROMOTING
+                    pf.active[key] = _KEY_PROMOTING
                 elif result is LookupResult.MISS:
-                    mig.active.pop(key)
+                    pf.active.pop(key)
                     # A tier held the block but the primary tier could not make
                     # room: that is our failure, not a source miss.
                     if self._promotion_out_of_capacity:
-                        mig.no_capacity.add(key)
+                        pf.no_capacity.add(key)
                     else:
-                        mig.missing.add(key)
+                        pf.missing.add(key)
                 # RETRY: probe still pending on the peer; leave as-is.
             else:  # _KEY_PROMOTING
                 result = self.primary_tier.lookup(key, ctx)
                 if result is LookupResult.HIT:
-                    mig.active.pop(key)
-                    mig.done.add(key)
+                    pf.active.pop(key)
+                    pf.done.add(key)
                 elif result is LookupResult.MISS:
-                    mig.active.pop(key)
-                    mig.failed.add(key)
+                    pf.active.pop(key)
+                    pf.failed.add(key)
                 # HIT_PENDING: promotion still in flight; leave as-is.
         return used
 
-    def _migration_source_ready(self, req_context: ReqContext) -> bool | None:
-        """Combine the migrating tiers' view of the source: ready if any is,
+    def _fetch_source_ready(self, req_context: ReqContext) -> bool | None:
+        """Combine the fetching tiers' view of the source: ready if any is,
         connecting if any still is, otherwise unreachable."""
         states = [
-            tier.is_migration_source_ready(req_context)
+            tier.is_fetch_source_ready(req_context)
             for tier in self.secondary_tiers
-            if tier.supports_migration
+            if tier.supports_proactive_fetch
         ]
         if True in states:
             return True
@@ -1496,66 +1493,65 @@ class TieringOffloadingManager(OffloadingManager):
             return None
         return False
 
-    def _fail_migration_keys(self, mig: _MigrationState, error: str) -> None:
-        """Force-resolve every still-active key of a migration as failed.
+    def _fail_fetch_keys(self, pf: _FetchState, error: str) -> None:
+        """Force-resolve every still-active key of a fetch as failed.
 
         Failed, never missing: the source may well hold them, we simply never
-        got an answer, and a clean miss would let the migration complete.
+        got an answer, and a clean miss would let the fetch complete.
         """
-        mig.error = error
-        for key in list(mig.active):
-            mig.active.pop(key)
-            mig.failed.add(key)
+        pf.error = error
+        for key in list(pf.active):
+            pf.active.pop(key)
+            pf.failed.add(key)
 
-    def _drive_migrations(self) -> None:
-        """Advance active migrations within a per-step budget; reap old ones.
+    def _drive_fetches(self) -> None:
+        """Advance active fetches within a per-step budget; reap old ones.
 
         Called from on_schedule_end() after the finished-job poll and gate
-        reset. At most _MIGRATION_KEYS_PER_STEP keys are touched per step across
-        all migrations, so a large prefetch cannot stall the scheduler.
+        reset. At most _FETCH_KEYS_PER_STEP keys are touched per step across
+        all fetches, so a large prefetch cannot stall the scheduler.
         """
-        if not self._migrations:
+        if not self._fetches:
             return
         # Commit any promotions that finished since the top-of-step poll, so a
-        # migration whose keys are all promoting (no probe lookup this step to
+        # fetch whose keys are all promoting (no probe lookup this step to
         # trigger the poll) still observes completion via primary_tier.lookup.
         self._maybe_process_finished_jobs()
         now = time.monotonic()
 
-        active: list[_MigrationState] = []
-        for transfer_id, mig in list(self._migrations.items()):
-            if mig.terminal is None:
-                active.append(mig)
+        active: list[_FetchState] = []
+        for transfer_id, pf in list(self._fetches.items()):
+            if pf.terminal is None:
+                active.append(pf)
             elif (
-                mig.terminal_at is not None
-                and now - mig.terminal_at > _MIGRATION_REAP_TTL_S
+                pf.terminal_at is not None and now - pf.terminal_at > _FETCH_REAP_TTL_S
             ):
-                del self._migrations[transfer_id]
+                del self._fetches[transfer_id]
         if not active:
             return
 
-        # Rotate the starting point so the same migration does not consume the
+        # Rotate the starting point so the same fetch does not consume the
         # whole budget every step while later ones never advance.
-        self._migration_cursor += 1
-        budget = _MIGRATION_KEYS_PER_STEP
+        self._fetch_cursor += 1
+        budget = _FETCH_KEYS_PER_STEP
         for offset in range(len(active)):
             if budget <= 0:
                 break
-            mig = active[(self._migration_cursor + offset) % len(active)]
-            budget -= self._advance_migration(mig, budget)
+            pf = active[(self._fetch_cursor + offset) % len(active)]
+            budget -= self._advance_fetch(pf, budget)
 
-        for mig in active:
-            if mig.active and now > mig.deadline:
+        for pf in active:
+            if pf.active and now > pf.deadline:
                 logger.warning(
-                    "Proactive migration %s timed out with %d block(s) "
+                    "Proactive fetch %s timed out with %d block(s) "
                     "unresolved after %.0fs; failing them.",
-                    mig.transfer_id,
-                    len(mig.active),
-                    _MIGRATION_TIMEOUT_S,
+                    pf.transfer_id,
+                    len(pf.active),
+                    _FETCH_TIMEOUT_S,
                 )
-                self._fail_migration_keys(mig, "timeout")
-            if not mig.active:
-                self._finalize_migration(mig, mig.resolve_terminal(), now)
+                self._fail_fetch_keys(pf, "timeout")
+            if not pf.active:
+                self._finalize_fetch(pf, pf.resolve_terminal(), now)
 
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
@@ -1577,11 +1573,11 @@ class TieringOffloadingManager(OffloadingManager):
         # lookup() calls within it skip redundant _process_finished_jobs().
         self._processed_jobs_this_step = False
 
-        # Advance proactive migrations before flushing: lookups registered here
+        # Advance proactive fetches before flushing: lookups registered here
         # get their LookupMsg flushed by tier.on_schedule_end() below, and
         # promotions initiated here get their FetchMsg flushed by
         # _flush_pending_promotions(), all within this same step.
-        self._drive_migrations()
+        self._drive_fetches()
 
         self._flush_pending_promotions()
         # Keys parked by this step's prepare_store cannot have completed yet, so
@@ -1600,9 +1596,9 @@ class TieringOffloadingManager(OffloadingManager):
 
     @override
     def has_pending_work(self) -> bool:
-        # A migration advances only in on_schedule_end(), and between steps
+        # A fetch advances only in on_schedule_end(), and between steps
         # it can have no transfer job yet (every key still probing).
-        if any(mig.terminal is None for mig in self._migrations.values()):
+        if any(pf.terminal is None for pf in self._fetches.values()):
             return True
         # In-flight primary<->secondary transfers (pending promotions are
         # translated to transfer jobs in on_schedule_end), plus any work the
@@ -1672,10 +1668,10 @@ class TieringOffloadingManager(OffloadingManager):
         # above. Fail what is still active rather than let the next step's
         # primary lookups misreport the lost chunks as transfer failures.
         now = time.monotonic()
-        for mig in self._migrations.values():
-            if mig.terminal is None:
-                self._fail_migration_keys(mig, "reset")
-                self._finalize_migration(mig, mig.resolve_terminal(), now)
+        for pf in self._fetches.values():
+            if pf.terminal is None:
+                self._fail_fetch_keys(pf, "reset")
+                self._finalize_fetch(pf, pf.resolve_terminal(), now)
 
         finished_req_ids = []
         for req_id, state in self._req_state.items():
