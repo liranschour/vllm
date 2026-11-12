@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# End-to-end correctness test for proactive P2P KV migration.
+# End-to-end correctness test for proactive P2P KV fetch.
 #
 # Prereq: a deployment created with PROACTIVE_MODE=true, e.g.
 #   PROACTIVE_MODE=true CONNECTOR=pd_connector bash deploy.sh --config <cluster_pd.env>
 #
 # The proxy's proactive flow: prefill -> learn the prefiller's CPU block keys
 # from its KV events -> one-token warm-up request to the decoder whose kv_hints
-# carry a p2p.migrate action naming those blocks -> wait for their CPU
+# carry a p2p.fetch action naming those blocks -> wait for their CPU
 # BlockStored events on the decoder's KV-event stream -> plain decode, served
 # from the prefetched CPU cache.
 #
@@ -18,14 +18,14 @@
 #      generation on the prefiller. The prefiller is the ground-truth oracle: it
 #      holds the KV that was copied, and it computes independently of the
 #      decoder's (possibly wrongly-populated) cache, so this catches a corrupt
-#      migration that a decoder-vs-decoder compare would miss.
+#      fetch that a decoder-vs-decoder compare would miss.
 #   2. Efficacy — the proxy log shows the decoder's KV events reported the
-#      migrated blocks landing (state=completed, blocks_done > 0), and the
+#      fetched blocks landing (state=completed, blocks_done > 0), and the
 #      decoder's vllm:external_prefix_cache_hits grew on the decode, i.e. the
-#      request was served from the migrated KV rather than recomputed.
+#      request was served from the fetched KV rather than recomputed.
 #
 # Negative control: deploy with PROACTIVE_NO_HINT=true (proxy
-# --no-migrate-hint) and expect check 2 to FAIL while check 1 still passes.
+# --no-fetch-hint) and expect check 2 to FAIL while check 1 still passes.
 #
 # Usage:
 #   bash test_proactive_e2e.sh                 # uses /tmp/deploy_state.env
@@ -54,7 +54,7 @@ fi
 command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 required locally." >&2; exit 1; }
 
 # Unique prompt (epoch-seeded so it never hits a stale prefix cache) that is
-# long enough to span several KV blocks so there is real KV to migrate.
+# long enough to span several KV blocks so there is real KV to fetch.
 SEED="$(date +%s)"
 PROMPT="proactive-e2e run ${SEED}. "
 for i in $(seq 1 60); do
@@ -98,13 +98,13 @@ R_REF="$(oc exec "${PREFILLER_POD}" -- curl -sS --max-time 180 \
     -H 'Content-Type: application/json' -d "${BODY}")"
 O_REF="$(printf '%s' "$R_REF" | extract_text)"
 
-echo "=== 3/3: migration outcome from proxy log ==="
-MLINE="$(oc exec "${PROXY_POD}" -- grep 'MIGRATION ' "${PROXY_LOG}" 2>/dev/null | tail -1 || true)"
+echo "=== 3/3: fetch outcome from proxy log ==="
+MLINE="$(oc exec "${PROXY_POD}" -- grep 'FETCH ' "${PROXY_LOG}" 2>/dev/null | tail -1 || true)"
 
 echo
-echo "--- proxy (decoder, migrated KV): ${O_PROXY}"
+echo "--- proxy (decoder, fetched KV): ${O_PROXY}"
 echo "--- reference (prefiller):        ${O_REF}"
-echo "--- migration:                    ${MLINE:-<none found>}"
+echo "--- fetch:                    ${MLINE:-<none found>}"
 echo "--- decoder external prefix-cache hits: ${EXT_BEFORE} -> ${EXT_AFTER}"
 echo
 
@@ -121,16 +121,16 @@ fi
 if [[ "$MLINE" == *"state=completed"* ]]; then
     DONE="$(sed -n 's/.*blocks_done=\([0-9]*\).*/\1/p' <<<"$MLINE")"
     if [[ "${DONE:-0}" -gt 0 ]]; then
-        echo "PASS: migration completed with blocks_done=${DONE} (KV moved)."
+        echo "PASS: fetch completed with blocks_done=${DONE} (KV moved)."
     else
-        echo "FAIL: migration completed but blocks_done=0 (nothing migrated)."; FAIL=1
+        echo "FAIL: fetch completed but blocks_done=0 (nothing fetched)."; FAIL=1
     fi
 else
-    echo "FAIL: no completed migration found in ${PROXY_LOG}."; FAIL=1
+    echo "FAIL: no completed fetch found in ${PROXY_LOG}."; FAIL=1
 fi
 
 if [[ "${EXT_AFTER:-0}" -gt "${EXT_BEFORE:-0}" ]]; then
-    echo "PASS: decode hit $((EXT_AFTER - EXT_BEFORE)) external prefix-cache token(s) (served from migrated KV)."
+    echo "PASS: decode hit $((EXT_AFTER - EXT_BEFORE)) external prefix-cache token(s) (served from fetched KV)."
 else
     echo "FAIL: decoder external prefix-cache hits did not grow (decode recomputed)."; FAIL=1
 fi

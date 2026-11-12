@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""A `p2p.migrate` kv_hints action pulls blocks through the real P2P tier.
+"""A `p2p.fetch` kv_hints action pulls blocks through the real P2P tier.
 
 Two TieringOffloadingManagers, each over a real CPU primary tier and a real
 P2PSecondaryTierManager, are paired over the in-memory loopback control
@@ -54,7 +54,7 @@ def _carry(mgr: TieringOffloadingManager, blocks: list[str], host: str, port: in
             actions=[
                 KvHintAction(
                     action_id="m0",
-                    action_type="p2p.migrate",
+                    action_type="p2p.fetch",
                     action_version="1.0",
                     payload={
                         "source": {"host": host, "port": port},
@@ -71,11 +71,13 @@ def _carry(mgr: TieringOffloadingManager, blocks: list[str], host: str, port: in
 def _run_until_terminal(dst, src, transfer_id: str, max_rounds: int = 50) -> dict:
     for _ in range(max_rounds):
         _step(dst, src)
-        status = dst.poll_migration(transfer_id)
+        status = dst.poll_proactive_fetch(transfer_id)
         assert status is not None
         if status["state"] != "running":
             return status
-    raise AssertionError(f"migration still running: {dst.poll_migration(transfer_id)}")
+    raise AssertionError(
+        f"fetch still running: {dst.poll_proactive_fetch(transfer_id)}"
+    )
 
 
 def test_hint_pulls_a_block_from_the_source_cpu_cache():
@@ -97,6 +99,6 @@ def test_hint_pulls_a_block_from_the_source_cpu_cache():
     dst.on_new_request(later)
     assert dst.primary_tier.lookup(held, later) is LookupResult.HIT
     assert dst.primary_tier.lookup(absent, later) is LookupResult.MISS
-    # The synthetic migration request is gone on both sides.
-    assert "p2p-migration:msg-1:m0" not in dst._req_state
+    # The synthetic fetch request is gone on both sides.
+    assert "p2p-fetch:msg-1:m0" not in dst._req_state
     assert not dst.has_pending_work() or dst._polled_tiers

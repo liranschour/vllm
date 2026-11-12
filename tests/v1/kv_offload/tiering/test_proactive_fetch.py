@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Proactive migration driven by the `p2p.migrate` kv_hints action.
+"""Proactive fetch driven by the `p2p.fetch` kv_hints action.
 
 A real TieringOffloadingManager over a real CPU primary tier, with a scripted
 peer tier standing in for the remote source. The hint is delivered the way the
@@ -31,12 +31,12 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.tiering.base import JobResult, TransferJob
 from vllm.v1.kv_offload.tiering.example.manager import ExampleSecondaryTierManager
 from vllm.v1.kv_offload.tiering.manager import (
-    _MAX_ACTIVE_MIGRATIONS,
-    _MIGRATION_KEYS_PER_STEP,
+    _FETCH_KEYS_PER_STEP,
+    _MAX_ACTIVE_FETCHES,
     CPUPrimaryTierOffloadingManager,
     TieringOffloadingManager,
 )
-from vllm.v1.kv_offload.tiering.migration import MAX_TRANSFER_ID_LEN
+from vllm.v1.kv_offload.tiering.proactive_fetch import MAX_TRANSFER_ID_LEN
 
 SOURCE_HOST = "10.0.0.9"
 SOURCE_PORT = 5710
@@ -57,7 +57,7 @@ class _PeerTier(ExampleSecondaryTierManager):
     `hold_jobs` keeps them in flight.
     """
 
-    supports_migration = True
+    supports_proactive_fetch = True
 
     def __init__(self, primary_kv_view: memoryview):
         super().__init__(
@@ -74,7 +74,7 @@ class _PeerTier(ExampleSecondaryTierManager):
         self.new_requests: list[ReqContext] = []
         self.source_ready: bool | None = True
 
-    def is_migration_source_ready(self, req_context):
+    def is_fetch_source_ready(self, req_context):
         return self.source_ready
 
     def on_new_request(self, req_context):
@@ -104,15 +104,15 @@ class _PeerTier(ExampleSecondaryTierManager):
 
 
 def _make(
-    num_chunks: int = 16, migrating: bool = True
+    num_chunks: int = 16, fetching: bool = True
 ) -> tuple[TieringOffloadingManager, CPUPrimaryTierOffloadingManager, _PeerTier]:
     region = _mock_mmap_region(num_chunks)
     primary = CPUPrimaryTierOffloadingManager(
         num_chunks=num_chunks, mmap_region=region, enable_events=True
     )
     tier = _PeerTier(region.create_kv_memoryview())
-    if not migrating:
-        tier.supports_migration = False  # type: ignore[misc]
+    if not fetching:
+        tier.supports_proactive_fetch = False  # type: ignore[misc]
     mgr = TieringOffloadingManager(primary_tier=primary, secondary_tiers=[tier])
     return mgr, primary, tier
 
@@ -121,7 +121,7 @@ def _step(mgr: TieringOffloadingManager) -> None:
     mgr.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=()))
 
 
-def _migrate(
+def _fetch(
     keys,
     action_id: str = "m0",
     version: str = "1.0",
@@ -130,7 +130,7 @@ def _migrate(
 ) -> KvHintAction:
     return KvHintAction(
         action_id=action_id,
-        action_type="p2p.migrate",
+        action_type="p2p.fetch",
         action_version=version,
         payload={
             "source": {"host": host, "port": port},
@@ -157,15 +157,15 @@ def _carry(
     return ctx
 
 
-def test_hint_migrates_blocks_into_cpu_and_outlives_its_carrier():
+def test_hint_fetches_blocks_into_cpu_and_outlives_its_carrier():
     mgr, primary, tier = _make()
-    _carry(mgr, _migrate([K1]))
+    _carry(mgr, _fetch([K1]))
 
-    # The carrier already finished; the migration it carried keeps running.
+    # The carrier already finished; the fetch it carried keeps running.
     assert tier.finished_requests == ["carrier"]
-    assert mgr.poll_migration("msg-1:m0")["state"] == "running"
-    (migration_ctx,) = (c for c in tier.new_requests if c.req_id != "carrier")
-    assert migration_ctx.kv_transfer_params == {
+    assert mgr.poll_proactive_fetch("msg-1:m0")["state"] == "running"
+    (fetch_ctx,) = (c for c in tier.new_requests if c.req_id != "carrier")
+    assert fetch_ctx.kv_transfer_params == {
         "remote_kv_source": {
             "remote_host": SOURCE_HOST,
             "remote_port": SOURCE_PORT,
@@ -174,15 +174,15 @@ def test_hint_migrates_blocks_into_cpu_and_outlives_its_carrier():
     }
 
     _step(mgr)  # probe registered; the peer has not answered
-    assert mgr.poll_migration("msg-1:m0")["state"] == "running"
+    assert mgr.poll_proactive_fetch("msg-1:m0")["state"] == "running"
     assert mgr.has_pending_work()
 
     tier.held.add(K1)
     _step(mgr)  # probe HIT -> promotion submitted
-    assert primary.lookup(K1, migration_ctx) is LookupResult.HIT_PENDING
+    assert primary.lookup(K1, fetch_ctx) is LookupResult.HIT_PENDING
     _step(mgr)  # load finished -> committed in CPU
 
-    status = mgr.poll_migration("msg-1:m0")
+    status = mgr.poll_proactive_fetch("msg-1:m0")
     assert status == {
         "state": "completed",
         "blocks_total": 1,
@@ -192,18 +192,18 @@ def test_hint_migrates_blocks_into_cpu_and_outlives_its_carrier():
         "blocks_no_capacity": 0,
         "error": None,
     }
-    assert primary.lookup(K1, migration_ctx) is LookupResult.HIT
-    assert "p2p-migration:msg-1:m0" in tier.finished_requests
+    assert primary.lookup(K1, fetch_ctx) is LookupResult.HIT
+    assert "p2p-fetch:msg-1:m0" in tier.finished_requests
     assert not mgr.has_pending_work()
 
 
-def test_migrated_block_serves_a_later_request_without_a_peer_round_trip():
+def test_fetched_block_serves_a_later_request_without_a_peer_round_trip():
     mgr, _, tier = _make()
     tier.held.add(K1)
-    _carry(mgr, _migrate([K1]))
+    _carry(mgr, _fetch([K1]))
     _step(mgr)
     _step(mgr)
-    assert mgr.poll_migration("msg-1:m0")["state"] == "completed"
+    assert mgr.poll_proactive_fetch("msg-1:m0")["state"] == "completed"
 
     tier.lookups.clear()
     real = ReqContext(req_id="real")
@@ -212,7 +212,7 @@ def test_migrated_block_serves_a_later_request_without_a_peer_round_trip():
     assert tier.lookups == []
 
 
-def test_migrated_block_emits_a_cpu_block_stored_event(monkeypatch):
+def test_fetched_block_emits_a_cpu_block_stored_event(monkeypatch):
     """The orchestrator detects completion from this event; it is the whole
     status contract of the hint. Byte-mode hashes let it rebuild the
     OffloadKey it asked for."""
@@ -224,7 +224,7 @@ def test_migrated_block_emits_a_cpu_block_stored_event(monkeypatch):
         )
     )
     tier.held.add(K2)
-    _carry(mgr, _migrate([K2]))
+    _carry(mgr, _fetch([K2]))
     _step(mgr)
     _step(mgr)
 
@@ -239,29 +239,29 @@ def test_migrated_block_emits_a_cpu_block_stored_event(monkeypatch):
 
 
 def test_probes_wait_while_the_source_is_connecting():
-    """Before the handshake completes a P2P lookup answers MISS; a migration
+    """Before the handshake completes a P2P lookup answers MISS; a fetch
     must not read that as the source lacking every block."""
     mgr, _, tier = _make()
     tier.held.add(K1)
     tier.source_ready = None
-    _carry(mgr, _migrate([K1]))
+    _carry(mgr, _fetch([K1]))
     _step(mgr)
     _step(mgr)
     assert tier.lookups == []
-    assert mgr.poll_migration("msg-1:m0")["state"] == "running"
+    assert mgr.poll_proactive_fetch("msg-1:m0")["state"] == "running"
 
     tier.source_ready = True
     _step(mgr)
     _step(mgr)
-    assert mgr.poll_migration("msg-1:m0")["blocks_done"] == 1
+    assert mgr.poll_proactive_fetch("msg-1:m0")["blocks_done"] == 1
 
 
-def test_unreachable_source_fails_the_migration():
+def test_unreachable_source_fails_the_fetch():
     mgr, _, tier = _make()
     tier.source_ready = False
-    _carry(mgr, _migrate([K1, K2]))
+    _carry(mgr, _fetch([K1, K2]))
     _step(mgr)
-    status = mgr.poll_migration("msg-1:m0")
+    status = mgr.poll_proactive_fetch("msg-1:m0")
     assert (status["state"], status["error"]) == ("failed", "source_unreachable")
     assert (status["blocks_failed"], status["blocks_missing"]) == (2, 0)
     assert tier.lookups == []
@@ -274,25 +274,25 @@ def test_block_already_in_cpu_completes_without_a_fetch():
     primary.prepare_store([K1], seed)
     primary.complete_store([K1], seed)
 
-    _carry(mgr, _migrate([K1]))
+    _carry(mgr, _fetch([K1]))
     _step(mgr)
-    assert mgr.poll_migration("msg-1:m0")["blocks_done"] == 1
+    assert mgr.poll_proactive_fetch("msg-1:m0")["blocks_done"] == 1
     assert tier.lookups == []
 
 
 def test_source_miss_is_missing_and_still_completes():
     mgr, _, tier = _make()
     tier.absent.add(K2)
-    _carry(mgr, _migrate([K2]))
+    _carry(mgr, _fetch([K2]))
     _step(mgr)
-    status = mgr.poll_migration("msg-1:m0")
+    status = mgr.poll_proactive_fetch("msg-1:m0")
     assert (status["state"], status["blocks_missing"]) == ("completed", 1)
 
 
 def test_promotion_without_room_is_a_failure_not_a_miss():
     mgr, primary, tier = _make(num_chunks=1)
     tier.held.add(K1)
-    _carry(mgr, _migrate([K1]))
+    _carry(mgr, _fetch([K1]))
     # Another request takes the only chunk (write-pending, not evictable)
     # between submission and the first probe.
     other = ReqContext(req_id="other")
@@ -300,7 +300,7 @@ def test_promotion_without_room_is_a_failure_not_a_miss():
     assert primary.prepare_store([K3], other) is not None
 
     _step(mgr)
-    status = mgr.poll_migration("msg-1:m0")
+    status = mgr.poll_proactive_fetch("msg-1:m0")
     assert status["state"] == "failed"
     assert status["error"] == "insufficient_capacity"
     assert (status["blocks_no_capacity"], status["blocks_missing"]) == (1, 0)
@@ -308,122 +308,119 @@ def test_promotion_without_room_is_a_failure_not_a_miss():
 
 def test_unresolved_probe_at_the_deadline_fails():
     mgr, _, _ = _make()
-    _carry(mgr, _migrate([K1]))
+    _carry(mgr, _fetch([K1]))
     _step(mgr)
-    mgr._migrations["msg-1:m0"].deadline = time.monotonic() - 1.0
+    mgr._fetches["msg-1:m0"].deadline = time.monotonic() - 1.0
     _step(mgr)
-    status = mgr.poll_migration("msg-1:m0")
+    status = mgr.poll_proactive_fetch("msg-1:m0")
     assert (status["state"], status["error"]) == ("failed", "timeout")
     assert (status["blocks_failed"], status["blocks_missing"]) == (1, 0)
 
 
-def test_reset_mid_fetch_fails_the_migration_and_leaves_no_jobs():
+def test_reset_mid_fetch_fails_the_fetch_and_leaves_no_jobs():
     mgr, _, tier = _make()
     tier.held.add(K1)
     tier.hold_jobs = True
-    _carry(mgr, _migrate([K1]))
+    _carry(mgr, _fetch([K1]))
     _step(mgr)
     _step(mgr)
     assert mgr._jobs
 
     mgr.reset_cache()
 
-    status = mgr.poll_migration("msg-1:m0")
+    status = mgr.poll_proactive_fetch("msg-1:m0")
     assert (status["state"], status["error"]) == ("failed", "reset")
     assert not mgr._jobs
-    assert "p2p-migration:msg-1:m0" not in mgr._req_state
+    assert "p2p-fetch:msg-1:m0" not in mgr._req_state
     assert not mgr.has_pending_work()
 
 
 def test_submission_beyond_cpu_capacity_is_rejected():
     mgr, _, _ = _make(num_chunks=1)
-    _carry(mgr, _migrate([K1, K2]))
-    assert mgr.poll_migration("msg-1:m0") is None
+    _carry(mgr, _fetch([K1, K2]))
+    assert mgr.poll_proactive_fetch("msg-1:m0") is None
 
 
-def test_concurrent_migrations_are_bounded():
+def test_concurrent_fetches_are_bounded():
     mgr, _, _ = _make(num_chunks=1024)
     _carry(
         mgr,
-        *(
-            _migrate([_key(i)], action_id=f"a{i}")
-            for i in range(_MAX_ACTIVE_MIGRATIONS)
-        ),
+        *(_fetch([_key(i)], action_id=f"a{i}") for i in range(_MAX_ACTIVE_FETCHES)),
     )
-    _carry(mgr, _migrate([_key(999)], action_id="extra"), message_id="msg-2")
-    assert len(mgr._migrations) == _MAX_ACTIVE_MIGRATIONS
-    assert mgr.poll_migration("msg-2:extra") is None
+    _carry(mgr, _fetch([_key(999)], action_id="extra"), message_id="msg-2")
+    assert len(mgr._fetches) == _MAX_ACTIVE_FETCHES
+    assert mgr.poll_proactive_fetch("msg-2:extra") is None
 
 
-def test_a_repeated_hint_does_not_restart_the_migration():
+def test_a_repeated_hint_does_not_restart_the_fetch():
     mgr, _, tier = _make()
-    _carry(mgr, _migrate([K1]))
-    first = mgr._migrations["msg-1:m0"]
-    _carry(mgr, _migrate([K2]), req_id="carrier-2")
-    assert mgr._migrations["msg-1:m0"] is first
+    _carry(mgr, _fetch([K1]))
+    first = mgr._fetches["msg-1:m0"]
+    _carry(mgr, _fetch([K2]), req_id="carrier-2")
+    assert mgr._fetches["msg-1:m0"] is first
     assert first.total == 1
 
 
 def test_duplicate_keys_reconcile_against_the_total():
     mgr, _, tier = _make()
     tier.absent.update({K1, K2})
-    _carry(mgr, _migrate([K1, K1, K2]))
+    _carry(mgr, _fetch([K1, K1, K2]))
     _step(mgr)
-    status = mgr.poll_migration("msg-1:m0")
+    status = mgr.poll_proactive_fetch("msg-1:m0")
     assert status["blocks_total"] == 2
     assert status["blocks_missing"] == 2
 
 
 def test_keys_advanced_per_step_are_bounded():
-    num_keys = _MIGRATION_KEYS_PER_STEP + 10
+    num_keys = _FETCH_KEYS_PER_STEP + 10
     mgr, _, tier = _make(num_chunks=num_keys * 2)
-    _carry(mgr, _migrate([_key(i) for i in range(num_keys)]))
+    _carry(mgr, _fetch([_key(i) for i in range(num_keys)]))
     _step(mgr)
-    assert len(tier.lookups) == _MIGRATION_KEYS_PER_STEP
+    assert len(tier.lookups) == _FETCH_KEYS_PER_STEP
     _step(mgr)
-    assert len(tier.lookups) == 2 * _MIGRATION_KEYS_PER_STEP
+    assert len(tier.lookups) == 2 * _FETCH_KEYS_PER_STEP
 
 
 @pytest.mark.parametrize(
     "bad",
     [
-        _migrate([K1], version="2.0"),
-        _migrate([K1], host=""),
-        _migrate([K1], port=0),
-        _migrate([]),
-        KvHintAction("m0", "p2p.migrate", "1.0", {"source": {"host": "h"}}),
-        KvHintAction("m0", "p2p.migrate", "1.0", {"source": "h", "blocks": []}),
+        _fetch([K1], version="2.0"),
+        _fetch([K1], host=""),
+        _fetch([K1], port=0),
+        _fetch([]),
+        KvHintAction("m0", "p2p.fetch", "1.0", {"source": {"host": "h"}}),
+        KvHintAction("m0", "p2p.fetch", "1.0", {"source": "h", "blocks": []}),
         KvHintAction(
             "m0",
-            "p2p.migrate",
+            "p2p.fetch",
             "1.0",
             {"source": {"host": "h", "port": 1}, "blocks": ["not-hex"]},
         ),
         KvHintAction(
             "m0",
-            "p2p.migrate",
+            "p2p.fetch",
             "1.0",
             {"source": {"host": "h", "port": 1}, "blocks": ["0011"]},
         ),
-        _migrate([K1], action_id="x" * MAX_TRANSFER_ID_LEN),
-        _migrate([K1], action_id="spaces are not allowed"),
+        _fetch([K1], action_id="x" * MAX_TRANSFER_ID_LEN),
+        _fetch([K1], action_id="spaces are not allowed"),
     ],
 )
 def test_invalid_action_is_skipped_without_blocking_the_others(bad):
     mgr, _, _ = _make()
-    _carry(mgr, bad, _migrate([K2], action_id="good"))
-    assert list(mgr._migrations) == ["msg-1:good"]
+    _carry(mgr, bad, _fetch([K2], action_id="good"))
+    assert list(mgr._fetches) == ["msg-1:good"]
 
 
 def test_other_action_types_are_ignored():
     mgr, _, _ = _make()
     other = KvHintAction("k0", "kv.fetch", "1.0", {"block_hashes": [1]})
     _carry(mgr, other)
-    assert not mgr._migrations
+    assert not mgr._fetches
 
 
-def test_tier_without_migration_support_ignores_the_hint():
-    mgr, _, tier = _make(migrating=False)
-    _carry(mgr, _migrate([K1]))
-    assert not mgr._migrations
+def test_tier_without_fetch_support_ignores_the_hint():
+    mgr, _, tier = _make(fetching=False)
+    _carry(mgr, _fetch([K1]))
+    assert not mgr._fetches
     assert [c.req_id for c in tier.new_requests] == ["carrier"]
