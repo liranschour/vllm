@@ -64,12 +64,12 @@ class FetchHintError(ValueError):
     """A `p2p.fetch` action that cannot be accepted; the message says why."""
 
 
-class _Source(msgspec.Struct, forbid_unknown_fields=False):
+class _Source(msgspec.Struct):
     host: str
     port: int
 
 
-class _Payload(msgspec.Struct, forbid_unknown_fields=False):
+class _Payload(msgspec.Struct):
     source: _Source
     blocks: list[str]
 

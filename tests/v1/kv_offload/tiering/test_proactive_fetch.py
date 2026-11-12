@@ -117,6 +117,12 @@ def _make(
     return mgr, primary, tier
 
 
+def _status(mgr: TieringOffloadingManager, fetch_id: str) -> dict[str, object]:
+    status = mgr.poll_proactive_fetch(fetch_id)
+    assert status is not None, f"unknown fetch {fetch_id}"
+    return status
+
+
 def _step(mgr: TieringOffloadingManager) -> None:
     mgr.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=()))
 
@@ -163,7 +169,7 @@ def test_hint_fetches_blocks_into_cpu_and_outlives_its_carrier():
 
     # The carrier already finished; the fetch it carried keeps running.
     assert tier.finished_requests == ["carrier"]
-    assert mgr.poll_proactive_fetch("msg-1:m0")["state"] == "running"
+    assert _status(mgr, "msg-1:m0")["state"] == "running"
     (fetch_ctx,) = (c for c in tier.new_requests if c.req_id != "carrier")
     assert fetch_ctx.kv_transfer_params == {
         "remote_kv_source": {
@@ -174,7 +180,7 @@ def test_hint_fetches_blocks_into_cpu_and_outlives_its_carrier():
     }
 
     _step(mgr)  # probe registered; the peer has not answered
-    assert mgr.poll_proactive_fetch("msg-1:m0")["state"] == "running"
+    assert _status(mgr, "msg-1:m0")["state"] == "running"
     assert mgr.has_pending_work()
 
     tier.held.add(K1)
@@ -182,7 +188,7 @@ def test_hint_fetches_blocks_into_cpu_and_outlives_its_carrier():
     assert primary.lookup(K1, fetch_ctx) is LookupResult.HIT_PENDING
     _step(mgr)  # load finished -> committed in CPU
 
-    status = mgr.poll_proactive_fetch("msg-1:m0")
+    status = _status(mgr, "msg-1:m0")
     assert status == {
         "state": "completed",
         "blocks_total": 1,
@@ -203,7 +209,7 @@ def test_fetched_block_serves_a_later_request_without_a_peer_round_trip():
     _carry(mgr, _fetch([K1]))
     _step(mgr)
     _step(mgr)
-    assert mgr.poll_proactive_fetch("msg-1:m0")["state"] == "completed"
+    assert _status(mgr, "msg-1:m0")["state"] == "completed"
 
     tier.lookups.clear()
     real = ReqContext(req_id="real")
@@ -248,12 +254,12 @@ def test_probes_wait_while_the_source_is_connecting():
     _step(mgr)
     _step(mgr)
     assert tier.lookups == []
-    assert mgr.poll_proactive_fetch("msg-1:m0")["state"] == "running"
+    assert _status(mgr, "msg-1:m0")["state"] == "running"
 
     tier.source_ready = True
     _step(mgr)
     _step(mgr)
-    assert mgr.poll_proactive_fetch("msg-1:m0")["blocks_done"] == 1
+    assert _status(mgr, "msg-1:m0")["blocks_done"] == 1
 
 
 def test_unreachable_source_fails_the_fetch():
@@ -261,7 +267,7 @@ def test_unreachable_source_fails_the_fetch():
     tier.source_ready = False
     _carry(mgr, _fetch([K1, K2]))
     _step(mgr)
-    status = mgr.poll_proactive_fetch("msg-1:m0")
+    status = _status(mgr, "msg-1:m0")
     assert (status["state"], status["error"]) == ("failed", "source_unreachable")
     assert (status["blocks_failed"], status["blocks_missing"]) == (2, 0)
     assert tier.lookups == []
@@ -276,7 +282,7 @@ def test_block_already_in_cpu_completes_without_a_fetch():
 
     _carry(mgr, _fetch([K1]))
     _step(mgr)
-    assert mgr.poll_proactive_fetch("msg-1:m0")["blocks_done"] == 1
+    assert _status(mgr, "msg-1:m0")["blocks_done"] == 1
     assert tier.lookups == []
 
 
@@ -285,7 +291,7 @@ def test_source_miss_is_missing_and_still_completes():
     tier.absent.add(K2)
     _carry(mgr, _fetch([K2]))
     _step(mgr)
-    status = mgr.poll_proactive_fetch("msg-1:m0")
+    status = _status(mgr, "msg-1:m0")
     assert (status["state"], status["blocks_missing"]) == ("completed", 1)
 
 
@@ -300,7 +306,7 @@ def test_promotion_without_room_is_a_failure_not_a_miss():
     assert primary.prepare_store([K3], other) is not None
 
     _step(mgr)
-    status = mgr.poll_proactive_fetch("msg-1:m0")
+    status = _status(mgr, "msg-1:m0")
     assert status["state"] == "failed"
     assert status["error"] == "insufficient_capacity"
     assert (status["blocks_no_capacity"], status["blocks_missing"]) == (1, 0)
@@ -312,7 +318,7 @@ def test_unresolved_probe_at_the_deadline_fails():
     _step(mgr)
     mgr._fetches["msg-1:m0"].deadline = time.monotonic() - 1.0
     _step(mgr)
-    status = mgr.poll_proactive_fetch("msg-1:m0")
+    status = _status(mgr, "msg-1:m0")
     assert (status["state"], status["error"]) == ("failed", "timeout")
     assert (status["blocks_failed"], status["blocks_missing"]) == (1, 0)
 
@@ -328,7 +334,7 @@ def test_reset_mid_fetch_fails_the_fetch_and_leaves_no_jobs():
 
     mgr.reset_cache()
 
-    status = mgr.poll_proactive_fetch("msg-1:m0")
+    status = _status(mgr, "msg-1:m0")
     assert (status["state"], status["error"]) == ("failed", "reset")
     assert not mgr._jobs
     assert "p2p-fetch:msg-1:m0" not in mgr._req_state
@@ -366,7 +372,7 @@ def test_duplicate_keys_reconcile_against_the_total():
     tier.absent.update({K1, K2})
     _carry(mgr, _fetch([K1, K1, K2]))
     _step(mgr)
-    status = mgr.poll_proactive_fetch("msg-1:m0")
+    status = _status(mgr, "msg-1:m0")
     assert status["blocks_total"] == 2
     assert status["blocks_missing"] == 2
 
