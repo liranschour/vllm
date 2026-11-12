@@ -235,6 +235,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
 
     cache_hit_source: ClassVar[CacheHitSource] = CacheHitSource.P2P
     tolerates_off_thread_polling: ClassVar[bool] = True
+    # Symmetric-P2P consumers address a peer per request, so this tier can serve
+    # a proactive migration. See SecondaryTierManager.supports_migration.
+    supports_migration: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -472,6 +475,23 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         if dest is not None and dest.kv_request_id:
             return RequestOffloadingContext(policy=OffloadPolicy.REQUEST_LEVEL)
         return RequestOffloadingContext()
+
+    @override
+    def is_migration_source_ready(self, req_context: ReqContext) -> bool | None:
+        """Ready once the session to the source has completed its handshake.
+
+        lookup() answers MISS before that, so a live request computes locally
+        instead of waiting on a peer that may be gone; a migration must not
+        read that as the source lacking every block. A session that failed to
+        open, or was dropped (handshake timeout, peer fault), is unreachable.
+        """
+        source = req_context.get_state(P2PSourceInfo)
+        if source is None or source.kv_request_id in self._failed_req_ids:
+            return False
+        session = self._sessions.get(source.peer_id)
+        if session is None:
+            return False
+        return True if session.ready else None
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
