@@ -1,6 +1,6 @@
 # Off-thread promotion for P2P lookups
 
-Status: draft design, base for a PR (rev 3: source choice across secondary tiers)
+Status: draft design, base for a PR (rev 4: sliding window and the probe-cache prerequisite)
 Branch: `worktree-p2p-offthread-promotion`
 Code references are against `01fba62494` (upstream main, 2026-11-11).
 
@@ -32,6 +32,9 @@ primary-tier state that already exists.
 
 Expected effect: one step boundary removed from every symmetric pull
 (`lookup_async_delay` drops from ~2 × T_step to ~1 × T_step on the probe path).
+On sliding-window and partial-tail configs this depends on a probe-cache fix
+(§4.11): today a fetch drops cached MISS answers and unsent probes, which
+would make the next scan defer again.
 
 ## 2. Background
 
@@ -319,7 +322,7 @@ then on the normal path owns it, exactly as today.
 Registration, in `OffloadingConnectorScheduler.__init__`:
 
 ```python
-if eager_promotion_enabled:          # §4.10
+if eager_promotion_enabled:          # §4.12
     self.manager.set_resolved_lookup_handler(self._speculative_lookup)
 ```
 
@@ -496,12 +499,74 @@ Notes
   flush submits it, and the scheduler's k+1 scan treats it like any promotion
   in flight.
 
-### 4.10 Prerequisite: keep MISS answers across a fetch (suspected existing bug)
+### 4.10 Sliding-window and hybrid layouts
 
-`request_blocks` clears *all* probes when the fetch closes a round
-(`client.py:308`). The comment there is about stale `True`. A stale `True`
-could point at a block the producer has since evicted, so clearing it is
-right. Clearing `False` costs a round, though:
+The speculative scan runs `_sliding_window_lookup()` (`offloading/scheduler.py:860`),
+so the selection for sliding-window groups is the scheduler's own. This
+section walks through why that is exact, and what it depends on.
+
+1. **Every key is probed at step k.** On the first scan every P2P key answers
+   RETRY. RETRY resets the consecutive-hit streak but does not stop the scan,
+   so it runs down to index 0 and registers the whole candidate range. When
+   the answers are in, P2P nominates the request with no key left unprobed.
+2. **Only the trailing section is promoted.** The speculative scan walks from
+   the end and promotes every HIT it passes, because the promotion happens
+   inside `manager.lookup`. It returns as soon as it has a full window, using
+   the wider first window (`load_window_size_in_chunks`) for a partial
+   rightmost chunk, plus one chunk for unverified EAGLE groups. Keys below the
+   window are never looked up, so they are never promoted. That is the same
+   set the k+1 scan would promote.
+3. **The k+1 scan sees the same window.** Promoted keys whose load is in
+   flight answer HIT_PENDING, which counts toward the streak and sets
+   `pending_in_window`. The scheduler then defers once more, as it would
+   today, or sees HIT and schedules the load.
+4. **Hybrid (full attention + sliding window) runs the same convergence loop.**
+   - At step k the full-attention scan defers, so `max_hit_size_tokens` is
+     not tightened and the sliding-window group scans its full range too.
+     Every key of both groups is probed at step k.
+   - In the speculative scan, full attention yields a boundary B1 (first
+     MISS). The sliding-window scan starts at B1 and may find its window
+     ending at E < B1.
+   - Full-attention keys in (E, B1) have then been promoted and won't be
+     loaded. The k+1 scan does exactly the same today, so this is existing
+     over-promotion, not a regression. A later pass of the loop finds those
+     slots HIT_PENDING and does not promote again.
+5. **Source choice is per key** and does not depend on scan direction, so the
+   settled check and the finality rule (§4.6, §4.8) apply unchanged.
+
+What it depends on: the probe cache must survive the speculative fetch
+(§4.11). A sliding-window scan from the end usually crosses MISS keys before
+it reaches its window, and without the fix each of them becomes a fresh probe
+at k+1:
+
+```text
+keys:            0 1 2 3 4 5 6 7 8 9      window = 3 chunks
+P2P answers:     3..7 HIT, 8 and 9 MISS
+speculative:     9 (M) 8 (M) 7 6 5 -> window -> promote 5,6,7 -> fetch -> probes cleared
+k+1, no fix:     9 -> primary MISS -> P2P: not in probes -> register -> RETRY
+                 defer_lookup = True ... window 5..7 found -> return None (deferred again)
+k+1, with fix:   9 -> cached False -> MISS; 8 -> MISS; 7 6 5 -> HIT/HIT_PENDING -> window
+```
+
+Full attention loses only the first MISS key to this. Sliding window loses
+every MISS key between the end of the range and the window. That is why §4.11
+is **required** for sliding-window and partial-tail configs, not merely an
+improvement.
+
+Cost to note: a sliding-window request probes its whole range at step k even
+though it fetches only the trailing window. Today's path does the same, and
+the probe is per-key metadata, not KV. Probing from the end in batches is a
+follow-up (§10).
+
+### 4.11 Prerequisite: keep unconsumed probe answers across a fetch (two suspected existing bugs)
+
+`request_blocks` sends the FetchMsg that closes the current round, advances
+`round_seq`, and then clears *every* probe of the request (`client.py:308`).
+The comment there is about stale `True`: once the producer serves the fetch it
+releases its pins, so a cached `True` could point at a block it has since
+evicted. Clearing those is right. Clearing everything else is not.
+
+**Bug A: cached MISS answers are dropped.**
 
 ```text
 k+1  scan: keys 0..h-1 HIT -> promote; key h cached False -> MISS -> break; FetchMsg (clears probes)
@@ -509,22 +574,51 @@ k+2  scan: keys 0..h-1 primary HIT; key h: primary MISS -> P2P -> not in probes 
 k+3  producer answers MISS again -> MISS -> request finally scheduled
 ```
 
-So a partial hit seems to pay one extra lookup round today. With eager
-promotion it matters more: the speculative scan sends the fetch, and clears
-the probes, *before* the scheduler's k+1 scan, so that scan meets key h as a
-fresh probe at k+1. The same applies to sliding-window scans, which skip over
-MISS keys on their way to a window. It also affects multi-tier selection: an
-unanswered P2P probe makes P2P unsettled again.
+So a partial hit seems to pay one extra lookup round today. With speculation
+it costs the whole gain, because the speculative fetch clears the probes
+*before* the k+1 scan (and for sliding window, every MISS key the scan
+crosses, §4.10).
 
-Fix: in `request_blocks`, drop only the `True` (and any `None`) probes, and
-keep `False`. A kept `False` is conservative: at worst the request recomputes
-a block that has become available since, which is today's MISS outcome
-anyway.
+**Bug B: probes registered but not yet sent are orphaned.** A scan can
+register new keys in the same pass that queues promotions. The partial-tail
+lookup (`_lookup_partial_tail_hit`) does so with its boundary keys once the
+complete-chunk hit is known. In order:
 
-This is unverified. PR step 1 starts with a failing test that reproduces the
-extra round, and only then applies the fix.
+1. The flush sends the fetch, which closes round r and clears `probes`. The
+   new key stays in `unsent`, because `request_blocks` doesn't touch it.
+2. The next `on_schedule_end` sends the unsent key, now tagged `round_seq` r+1.
+3. Its answer arrives for a key no longer in `probes`. `on_lookup_resp` drops
+   it silently ("pairs that don't match a known entry").
+4. The next lookup registers the key again: one more round.
 
-### 4.11 Configuration
+Today this happens in the step where the scheduler sends the fetch, because
+`_flush_pending_promotions` runs before `tier.on_schedule_end` flushes the
+lookups. With speculation it happens in the poll round that sends the fetch.
+
+**Fix**: when `request_blocks` closes a round, keep each probe according to
+whether its answer is still usable:
+
+| Probe state at fetch | Action | Why |
+| --- | --- | --- |
+| `True` | drop | the producer releases the pin after serving the fetch; re-probe under the next round |
+| `False` | **keep** | a MISS stays a MISS; at worst the request recomputes a block that has become available since, which is today's MISS outcome anyway |
+| `None`, still in `unsent` | **keep** | it belongs to the next round and goes out with `round_seq+1` |
+| `None`, already sent under round r | drop | round r is closed on the producer; re-probe under the next round |
+
+Two callers treat any entry in `probes` as live lookup state, and must ignore
+kept `False` entries:
+
+- `can_send_terminal_fetch` (`client.py:325`): otherwise a terminal empty
+  FetchMsg is held back for a round that no longer exists.
+- `_maybe_prune` (`client.py:179`): otherwise the request's client state is
+  never pruned between rounds.
+
+`finish()` still clears everything.
+
+Both bugs are unverified. PR step 1 starts with one failing test per bug, and
+only then applies the fix.
+
+### 4.12 Configuration
 
 - P2P tier config key `eager_promotion: bool` (default `false` in the first
   PR). Add it to `config_info_keys`.
@@ -557,6 +651,10 @@ extra round, and only then applies the fix.
 | Session not send-ready | `request_blocks` already queues `pending_fetch`; no change |
 | Eviction between `complete_write` and the scheduler's `prepare_load` | Slot has `ref_cnt=0` and can be evicted (this window exists today too; eager promotion makes it longer). Next lookup: primary MISS -> P2P -> probes were cleared by the fetch -> new LookupMsg under `round_seq+1`. Producer pins again (one pin per round; the previous round's pin was already released at finalize) or answers MISS. Cost: one extra round + re-transfer. Nothing is double-pinned and nothing leaks |
 | Partial fetch of a round's supply | Unchanged: the producer releases leftover pins at round finalize |
+| Sliding window, MISS keys at the end of the range | Speculative scan crosses them, promotes the trailing window; with §4.11 the k+1 scan reads the kept `False` answers and doesn't defer. Without §4.11 it re-probes every one of them and defers again (§4.10) |
+| Sliding window, no full window anywhere | Scan reaches index 0 without a window and promotes every HIT it passed, as k+1 would. The scheduler then gets only the run of hits starting at index 0 (shorter than a window, possibly 0), so promotions above it are unused |
+| Hybrid, sliding-window cut E below full-attention boundary B1 | Full-attention keys in (E, B1) were promoted but won't be loaded, as on today's k+1 path; the loop's next pass finds them HIT_PENDING, so no double promotion |
+| Partial-tail boundary key registered in the speculative pass | Sent at the next `on_schedule_end` under `round_seq+1`; with §4.11 its answer is kept, the request is nominated again, and a second speculative scan promotes the tail |
 | PD path (`remote_prefiller`) | Never registers probes -> never nominated |
 | `tier_poll_interval_s = 0`, flag off, or non-tiering manager | No handler registered -> today's behavior |
 | Stats | `prepare_write` off-thread appends to the CPU tier's per-step allocation stats (`allocation_sizes_in_current_batch`). They are reported with the next step. Under the lock, so this is safe |
@@ -596,6 +694,14 @@ extra round, and only then applies the fix.
    per round. That is the same cost the scheduler pays at k+1 (which still
    runs), moved off the step region. Check scheduler lock-wait p99 with the
    existing lock-hold harness at high concurrency.
+8. **The gain on sliding window depends on the §4.11 fix.** Without it the
+   k+1 scan re-probes every MISS key it crosses and defers again, so
+   sliding-window configs would see no improvement (§4.10). Step 1 of the PR
+   plan must land first, and the e2e A/B must include a sliding-window model.
+9. **Sliding window probes the whole range.** The first scan registers every
+   key down to index 0 though only the trailing window is fetched. This is
+   today's behavior, and the cost is probe metadata, not KV. It grows with
+   prompt length; see the follow-up in §10.
 
 ## 7. Observability
 
@@ -622,8 +728,13 @@ extra round, and only then applies the fix.
 Unit
 
 - `tests/v1/kv_offload/tiering/p2p/test_sessions.py`
-    - fetch keeps `False` probes and drops `True` ones (§4.10), and a
+    - bug A (§4.11): a fetch keeps `False` probes and drops `True` ones, and a
       re-scheduled request with a partial hit sends no second LookupMsg.
+    - bug B (§4.11): a key registered but unsent when the fetch goes out is
+      sent under the next round, and its answer is applied (not dropped).
+    - a key sent under the closed round is dropped and re-probed.
+    - kept `False` probes don't block the terminal empty FetchMsg or
+      pruning.
 - `tests/v1/kv_offload/tiering/p2p/test_manager.py`
     - `take_resolved_lookups` reports nothing until every registered probe is
       answered (multi-step registration), then reports the request once.
@@ -658,7 +769,12 @@ Unit
       full-attention + sliding-window hybrid (plus Mamba-aligned if a
       fixture exists), the keys *and source tiers* promoted by the
       speculative scan equal those the step-k+1 scan promotes with the
-      same answers. Sliding window must promote only the trailing window.
+      same answers. Sliding window must promote only the trailing window,
+      including the wider first window for a partial rightmost chunk.
+    - **no extra deferral**: after a speculative promotion, the k+1 scan
+      does not defer for a fresh probe, for full attention, sliding window
+      with trailing MISS keys (the §4.10 example), and the hybrid case where
+      the sliding-window cut E is below the full-attention boundary B1.
     - speculative mode emits no KV events, does not change
       `Request.shared_prefix_boundary`, and leaves `deferred_lookup_start_time`
       untouched.
@@ -694,8 +810,10 @@ one sliding-window / hybrid model that fits a pod)
 
 ## 9. PR plan
 
-1. **[Bugfix][KV Offload][P2P] Keep MISS probe answers across a fetch.** Test
-   first, then the fix. Stands alone.
+1. **[Bugfix][KV Offload][P2P] Keep unconsumed probe answers across a
+   fetch.** Covers bugs A and B (§4.11), with a failing test for each first,
+   then the fix. Stands alone, and is a prerequisite for steps 3-4 on
+   sliding-window and partial-tail configs.
 2. **[KV Offload] Refactor: route secondary-tier source selection through
    `_select_promotion_source`.** No behavior change. Existing tests prove it.
 3. **[KV Offload] Speculative connector lookup driven by the tier-poll
@@ -727,6 +845,8 @@ one sliding-window / hybrid model that fits a pod)
   a HIT already seen.
 - **Ranked source selection** (cost / locality) as a policy behind
   `_select_promotion_source`.
+- **Probe sliding-window ranges from the end in batches**, so a long prompt
+  doesn't probe keys below the window it will end up loading (risk 9).
 
 ## Revision history
 
@@ -742,3 +862,9 @@ one sliding-window / hybrid model that fits a pod)
   so the configured tier order is never overridden. Selection moves into
   `_select_promotion_source`; adds candidates, expiry, metrics, tests and a
   refactor PR.
+- rev 4: sliding-window and hybrid walkthrough (§4.10). The probe-cache
+  prerequisite (§4.11) is corrected and made required. Keep `False` *and*
+  registered-but-unsent probes across a fetch, and drop only `True` and probes
+  sent under the closed round. It also records the orphaned-unsent-probe case
+  as a second suspected bug, and adds the matching edge cases, risks and
+  tests.
