@@ -6,8 +6,8 @@ Covers the `bytes -> bytes` control channel at the layers below the HTTP
 transport:
 
 * `KVConnectorBase_V1.on_rpc` default (not-implemented sentinel).
-* `MultiConnector.on_rpc` first-non-None dispatch, empty-bytes success, and
-  exception propagation.
+* `MultiConnector.on_rpc` envelope addressing (index, unique name, fan-out)
+  and rejection of plain payloads.
 * `EngineCore.kv_connector_rpc` dispatch via `scheduler.get_kv_connector()`.
 * `AsyncMPClient` DP-rank target resolution (single engine, never broadcast).
 """
@@ -90,29 +90,67 @@ def _make_multi(connectors) -> MultiConnector:
     return mc
 
 
-def test_multi_connector_returns_first_non_none():
-    mc = _make_multi([_StubConnector(), _EchoConnector()])
-    assert mc.on_rpc(b"x") == b"echo:x"
+env = MultiConnector.make_rpc_envelope
 
 
-def test_multi_connector_empty_bytes_is_success_not_decline():
-    # An empty b"" from an earlier child is a valid reply and must win over a
-    # later child that would have returned non-empty bytes.
+def test_multi_connector_rejects_plain_payload():
+    # A non-envelope payload must not be offered to any child.
+    mc = _make_multi([_EchoConnector()])
+    for payload in (b"x", b"", env(0, b"x")[:-1]):
+        with pytest.raises(ValueError, match="must be an envelope"):
+            mc.on_rpc(payload)
+
+
+def test_multi_connector_targets_child_by_index():
     mc = _make_multi([_EmptyAckConnector(), _EchoConnector()])
-    assert mc.on_rpc(b"x") == b""
+    assert mc.on_rpc(env(1, b"ping")) == b"echo:ping"
+    assert mc.on_rpc(env(0, b"ping")) == b""
 
 
-def test_multi_connector_all_decline_returns_none():
-    mc = _make_multi([_StubConnector(), _StubConnector()])
-    assert mc.on_rpc(b"x") is None
+def test_multi_connector_targets_child_by_unique_name():
+    mc = _make_multi([_StubConnector(), _EchoConnector()])
+    assert mc.on_rpc(env("_EchoConnector", b"ping")) == b"echo:ping"
+    assert mc.on_rpc(env("_StubConnector", b"ping")) is None
 
 
-def test_multi_connector_exception_propagates_without_fallthrough():
-    # The raising child comes first; the exception must propagate rather than
-    # falling through to the echo child.
+@pytest.mark.parametrize(
+    "target, match",
+    [
+        (2, "out of range"),
+        (-1, "out of range"),
+        ("_EchoConnector", "ambiguous"),
+        ("Nope", "unknown"),
+    ],
+)
+def test_multi_connector_rejects_bad_target(target, match):
+    mc = _make_multi([_EchoConnector(), _EchoConnector()])
+    with pytest.raises(ValueError, match=match):
+        mc.on_rpc(env(target, b"x"))
+
+
+def test_multi_connector_targeted_child_exception_propagates():
     mc = _make_multi([_RaisingConnector(), _EchoConnector()])
     with pytest.raises(RuntimeError, match="boom"):
-        mc.on_rpc(b"x")
+        mc.on_rpc(env(0, b"x"))
+
+
+def test_multi_connector_fanout_reports_every_child():
+    # A raising child is reported in its entry and does not stop the fan-out.
+    mc = _make_multi([_RaisingConnector(), _StubConnector(), _EchoConnector()])
+    replies = MultiConnector.decode_fanout_reply(
+        mc.on_rpc(env(MultiConnector.RPC_FANOUT, b"p"))
+    )
+    assert [(r.connector, r.result, r.error) for r in replies] == [
+        ("_RaisingConnector", None, "RuntimeError: boom"),
+        ("_StubConnector", None, None),
+        ("_EchoConnector", b"echo:p", None),
+    ]
+
+
+def test_multi_connector_nested_envelope():
+    inner = _make_multi([_StubConnector(), _EchoConnector()])
+    outer = _make_multi([_StubConnector(), inner])
+    assert outer.on_rpc(env(1, env(1, b"deep"))) == b"echo:deep"
 
 
 class _FakeScheduler:

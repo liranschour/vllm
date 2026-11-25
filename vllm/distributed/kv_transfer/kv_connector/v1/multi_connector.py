@@ -6,6 +6,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
+import msgspec
 import torch
 
 from vllm.config import VllmConfig
@@ -828,14 +829,83 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         results = [c.reset_cache() is not False for c in self._connectors]
         return all(results)
 
+    RPC_FANOUT = "*"
+
+    @staticmethod
+    def make_rpc_envelope(target: int | str, payload: bytes) -> bytes:
+        """Build an `on_rpc` request addressed to wrapped connector(s).
+
+        Args:
+            target: Child index in `connectors` config order, a child
+                connector class name that is unique among the children, or
+                `MultiConnector.RPC_FANOUT` (`"*"`) for every child.
+            payload: The inner payload forwarded verbatim to the target(s).
+
+        """
+        return _RPC_ENCODER.encode(MultiConnectorRPCRequest(target, payload))
+
+    @staticmethod
+    def decode_fanout_reply(data: bytes) -> list["MultiConnectorRPCReply"]:
+        """Decode the reply to a `RPC_FANOUT` envelope, in config order."""
+        return _RPC_FANOUT_DECODER.decode(data)
+
     def on_rpc(self, payload: bytes) -> bytes | None:
-        # Try each wrapped connector in configuration order and return the
-        # first non-None reply (bytes, including b""). If a child raises, the
-        # exception propagates immediately rather than falling through to the
-        # next child, so a payload one connector rejects fails loudly instead
-        # of being silently reinterpreted by an unrelated connector.
-        for connector in self._connectors:
-            result = connector.on_rpc(payload)
-            if result is not None:
-                return result
-        return None
+        # Plain payloads are rejected rather than offered to each child in
+        # turn, so a payload is never interpreted by an unintended connector.
+        try:
+            request = _RPC_REQUEST_DECODER.decode(payload)
+        except msgspec.MsgspecError as e:
+            raise ValueError(
+                "MultiConnector RPC payload must be an envelope built with "
+                f"MultiConnector.make_rpc_envelope(): {e}"
+            ) from e
+
+        if request.target == self.RPC_FANOUT:
+            replies = []
+            for connector in self._connectors:
+                reply = MultiConnectorRPCReply(type(connector).__name__)
+                try:
+                    reply.result = connector.on_rpc(request.payload)
+                except Exception as e:
+                    reply.error = f"{type(e).__name__}: {e}"
+                replies.append(reply)
+            return _RPC_ENCODER.encode(replies)
+
+        return self._rpc_target(request.target).on_rpc(request.payload)
+
+    def _rpc_target(self, target: int | str) -> KVConnectorBase_V1:
+        names = [type(c).__name__ for c in self._connectors]
+        if isinstance(target, int):
+            if not 0 <= target < len(self._connectors):
+                raise ValueError(
+                    f"MultiConnector RPC target index {target} is out of range "
+                    f"for connectors {names}."
+                )
+            return self._connectors[target]
+        if names.count(target) != 1:
+            reason = "is ambiguous" if target in names else "is unknown"
+            raise ValueError(
+                f"MultiConnector RPC target {target!r} {reason} among "
+                f"connectors {names}; address the child by index instead."
+            )
+        return self._connectors[names.index(target)]
+
+
+class MultiConnectorRPCRequest(msgspec.Struct, forbid_unknown_fields=True):
+    """Envelope addressing a `MultiConnector.on_rpc` call to its children."""
+
+    target: int | str
+    payload: bytes
+
+
+class MultiConnectorRPCReply(msgspec.Struct):
+    """One child's outcome in a `MultiConnector.RPC_FANOUT` reply."""
+
+    connector: str
+    result: bytes | None = None
+    error: str | None = None
+
+
+_RPC_ENCODER = msgspec.msgpack.Encoder()
+_RPC_REQUEST_DECODER = msgspec.msgpack.Decoder(MultiConnectorRPCRequest)
+_RPC_FANOUT_DECODER = msgspec.msgpack.Decoder(list[MultiConnectorRPCReply])
