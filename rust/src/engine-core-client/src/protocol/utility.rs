@@ -9,7 +9,7 @@ use rmpv::Value;
 use serde::{Deserialize, Serialize};
 use serde_default::DefaultFromSerde;
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
-use serde_with::{DeserializeFromStr, SerializeDisplay};
+use serde_with::{DeserializeFromStr, SerializeDisplay, serde_as};
 use thiserror_ext::AsReport;
 
 use super::{OpaqueValue, default_opaque_value_nil};
@@ -243,6 +243,13 @@ impl<'de> Deserialize<'de> for UtilityCallId {
     }
 }
 
+/// A Python `bytes` value in utility args or results, encoded as a
+/// MessagePack `bin`. A plain `Vec<u8>` would encode as an array of integers.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PyBytes(#[serde_as(as = "serde_with::Bytes")] pub Vec<u8>);
+
 /// Engine-core utility call payload sent from frontend to engine.
 ///
 /// Original Python payload shape:
@@ -357,7 +364,9 @@ mod tests {
     use rmpv::Value;
     use serde::Serialize;
 
-    use super::{EngineCoreUtilityRequest, PauseMode, UtilityOutput, UtilityResultEnvelope};
+    use super::{
+        EngineCoreUtilityRequest, PauseMode, PyBytes, UtilityOutput, UtilityResultEnvelope,
+    };
     use crate::Error;
     use crate::protocol::{decode_msgpack, decode_value, encode_msgpack};
 
@@ -491,5 +500,46 @@ mod tests {
         }
         .into_typed_result::<()>("sleep")
         .unwrap();
+    }
+
+    #[test]
+    fn py_bytes_arg_encodes_as_msgpack_bin() {
+        let request = EngineCoreUtilityRequest::new(
+            7,
+            42,
+            "kv_connector_rpc",
+            (PyBytes(b"\x00rpc".to_vec()),),
+        )
+        .unwrap();
+
+        let encoded = encode_msgpack(&request).unwrap();
+        let value = decode_value(&encoded).unwrap();
+        let array = value.as_array().expect("utility request array");
+
+        assert_eq!(array[2], Value::from("kv_connector_rpc"));
+        assert_eq!(
+            array[3],
+            Value::Array(vec![Value::Binary(b"\x00rpc".to_vec())])
+        );
+    }
+
+    #[test]
+    fn utility_output_decodes_py_bytes_and_none_results() {
+        let decode = |result: Value| {
+            UtilityOutput {
+                call_id: 5_u64.into(),
+                failure_message: None,
+                result: Some(UtilityResultEnvelope::without_type_info(result)),
+            }
+            .into_typed_result::<Option<PyBytes>>("kv_connector_rpc")
+            .unwrap()
+        };
+
+        assert_eq!(
+            decode(Value::Binary(b"reply".to_vec())),
+            Some(PyBytes(b"reply".to_vec()))
+        );
+        assert_eq!(decode(Value::Binary(Vec::new())), Some(PyBytes(Vec::new())));
+        assert_eq!(decode(Value::Nil), None);
     }
 }

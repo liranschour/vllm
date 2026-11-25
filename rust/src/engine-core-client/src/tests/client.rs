@@ -3149,6 +3149,93 @@ async fn wake_up_requires_every_engine_to_be_fully_awake() {
     client.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kv_connector_rpc_targets_exactly_one_engine() {
+    init_tracing();
+    let ipc = IpcNamespace::new().unwrap();
+    let handshake_address = ipc.handshake_endpoint();
+    let mut engines = Vec::new();
+    for engine_index in 0..2_u16 {
+        let engine = spawn_mock_engine_task(
+            handshake_address.clone(),
+            EngineId::from_engine_index(engine_index).into_frame().to_vec(),
+            move |dealer, push| {
+                Box::pin(async move {
+                    if engine_index == 1 {
+                        for reply in [Value::Binary(b"pong".to_vec()), Value::Nil] {
+                            let utility = recv_engine_message(dealer).await;
+                            let payload = decode_value(&utility[1]);
+                            let array = payload.as_array().expect("utility payload array");
+                            assert_eq!(array[2], Value::from("kv_connector_rpc"));
+                            // The payload must reach Python as `bytes`.
+                            assert_eq!(
+                                array[3],
+                                Value::Array(vec![Value::Binary(b"ping".to_vec())])
+                            );
+                            let call_id = array[1].as_u64().expect("call_id");
+                            reply_utility(
+                                push,
+                                call_id,
+                                UtilityResultEnvelope::without_type_info(reply),
+                            )
+                            .await;
+                        }
+                    }
+                    // Engine 0 sees no RPC: its first call is the broadcast.
+                    let call_id = recv_utility_call(dealer, "is_sleeping").await;
+                    reply_utility(push, call_id, utility_result_value(false)).await;
+                })
+            },
+        );
+        engines.push(engine);
+    }
+    let client = connect_client_with_ipc(
+        handshake_test_config(
+            handshake_address,
+            2,
+            "test-model",
+            Duration::from_secs(2),
+            5,
+            None,
+        ),
+        &ipc,
+    )
+    .await;
+
+    let ping = bytes::Bytes::from_static(b"ping");
+    let mut messages = Vec::new();
+    for dp_rank in [None, Some(2), Some(u32::from(u16::MAX) + 1)] {
+        let error = client.kv_connector_rpc(ping.clone(), dp_rank).await.unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidUtilityTarget { .. }),
+            "{dp_rank:?}: {error:?}"
+        );
+        messages.push(error.to_report_string());
+    }
+    expect_test::expect![[r#"
+        [
+            "dp_rank is required: this server fronts 2 engines (DP ranks [0, 1]).",
+            "dp_rank=2 is not served by this server (DP ranks [0, 1]).",
+            "dp_rank=65536 is not served by this server (DP ranks [0, 1]).",
+        ]
+    "#]]
+    .assert_debug_eq(&messages);
+    assert_eq!(client.pending_utility_call_count(), 0);
+
+    assert_eq!(
+        client.kv_connector_rpc(ping.clone(), Some(1)).await.unwrap(),
+        Some(bytes::Bytes::from_static(b"pong"))
+    );
+    assert_eq!(client.kv_connector_rpc(ping, Some(1)).await.unwrap(), None);
+    assert!(!client.is_sleeping().await.unwrap());
+
+    for (shutdown_tx, engine_task) in engines {
+        let _ = shutdown_tx.send(());
+        engine_task.await.unwrap();
+    }
+    client.shutdown().await.unwrap();
+}
+
 /// Serve utility calls as an engine that is ready unless paused or in a weight
 /// update, in whatever order the client sends them, until `stop` fires.
 async fn serve_readiness_engine(

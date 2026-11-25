@@ -43,6 +43,9 @@ pub enum ApiError {
     ServerError { message: String },
     /// The engine rejected the request with a retryable error.
     ServiceUnavailable { message: String },
+    /// An error Python raises as a FastAPI `HTTPException`, whose handler
+    /// names the HTTP status as the error `type`.
+    HttpException { status: StatusCode, message: String },
 }
 
 impl ApiError {
@@ -55,6 +58,7 @@ impl ApiError {
             Self::ServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::JsonParseError { .. } | Self::InvalidQuery { .. } => StatusCode::BAD_REQUEST,
             Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::HttpException { status, .. } => *status,
         }
     }
 
@@ -95,6 +99,11 @@ impl ApiError {
             Self::ServiceUnavailable { message } => {
                 ("ServiceUnavailableError", message.clone(), None)
             }
+            Self::HttpException { status, message } => (
+                status.canonical_reason().unwrap_or("Unknown"),
+                message.clone(),
+                None,
+            ),
         };
 
         ErrorResponse {

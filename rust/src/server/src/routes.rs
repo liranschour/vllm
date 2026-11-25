@@ -8,6 +8,7 @@ mod collective_rpc;
 mod generative_scoring;
 mod health;
 mod inference;
+mod kv_connector;
 mod kv_event_sources;
 mod load;
 mod lora;
@@ -169,7 +170,8 @@ fn build_router_with_gates(state: Arc<AppState>, gates: RouteGates) -> Router {
         )
         // vLLM specific endpoints
         .route("/tokenize", post(tokenize::tokenize))
-        .route("/detokenize", post(tokenize::detokenize));
+        .route("/detokenize", post(tokenize::detokenize))
+        .route("/v1/kv_connector/rpc", post(kv_connector::kv_connector_rpc));
 
     let scale_out_routes: [(&str, MethodRouter<Arc<AppState>>); 4] = [
         ("/inference/v1/generate", post(inference::generate)),

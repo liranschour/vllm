@@ -11033,6 +11033,135 @@ async fn reset_encoder_cache_route_sends_expected_utility_call() {
     engine_task.await.expect("mock engine task");
 }
 
+/// POST `body` to `/v1/kv_connector/rpc` with `query`, returning the status,
+/// content type, and body.
+async fn post_kv_connector_rpc(
+    app: &axum::Router,
+    query: &str,
+    body: &'static [u8],
+) -> (StatusCode, Option<String>, Bytes) {
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/kv_connector/rpc{query}"))
+                .body(Body::from(body))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .map(|value| value.to_str().expect("content type").to_owned());
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    (status, content_type, body)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn kv_connector_rpc_route_forwards_raw_bytes_and_maps_replies() {
+    let mut ready = default_ready_response();
+    ready.vllm_config = Some(json!({"kv_transfer_config": {"kv_connector": "TestConnector"}}));
+    let (app, engine_task) = test_admin_app_with_ready_and_engine_script(ready, |dealer, push| {
+        boxed_test_future(async move {
+            let replies = [
+                (Value::Binary(b"\x00pong".to_vec()), None),
+                (Value::Binary(Vec::new()), None),
+                (Value::Nil, None),
+                (Value::Nil, Some("on_rpc raised".to_owned())),
+            ];
+            for (result, failure_message) in replies {
+                let utility = recv_engine_message(dealer).await;
+                assert_eq!(utility[0].as_ref(), &[0x03]);
+                let payload = decode_value(&utility[1]).expect("decode utility payload");
+                let array = payload.as_array().expect("utility payload array");
+                let call_id = array[1].as_u64().expect("call id");
+                assert_eq!(array[2], Value::from("kv_connector_rpc"));
+                // The body reaches Python unchanged, as `bytes`.
+                assert_eq!(
+                    array[3],
+                    Value::Array(vec![Value::Binary(b"\x00\xffping".to_vec())])
+                );
+                send_outputs(
+                    push,
+                    UtilityCallOutput {
+                        output: UtilityOutput {
+                            call_id: call_id.into(),
+                            result: Some(UtilityResultEnvelope::without_type_info(result)),
+                            failure_message,
+                        },
+                        ..Default::default()
+                    }
+                    .into(),
+                )
+                .await;
+            }
+        })
+    })
+    .await;
+
+    let mut responses = Vec::new();
+    for _ in 0..4 {
+        let (status, content_type, body) = post_kv_connector_rpc(&app, "", b"\x00\xffping").await;
+        responses.push(format!("{status} {content_type:?} {body:?}"));
+    }
+    expect_test::expect![[r#"
+        [
+            "200 OK Some(\"application/octet-stream\") b\"\\0pong\"",
+            "200 OK Some(\"application/octet-stream\") b\"\"",
+            "501 Not Implemented Some(\"application/json\") b\"{\\\"error\\\":{\\\"message\\\":\\\"The configured KV connector does not implement on_rpc().\\\",\\\"type\\\":\\\"Not Implemented\\\",\\\"param\\\":null,\\\"code\\\":501}}\"",
+            "500 Internal Server Error Some(\"application/json\") b\"{\\\"error\\\":{\\\"message\\\":\\\"failed to call kv_connector_rpc: utility call `kv_connector_rpc` failed (call_id=4): on_rpc raised\\\",\\\"type\\\":\\\"InternalServerError\\\",\\\"param\\\":null,\\\"code\\\":500}}\"",
+        ]
+    "#]].assert_debug_eq(&responses);
+    engine_task.await.expect("mock engine task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn kv_connector_rpc_route_rejects_unresolvable_targets_without_engine_calls() {
+    let mut ready = default_ready_response();
+    ready.vllm_config = Some(json!({"kv_transfer_config": {"kv_connector": "TestConnector"}}));
+    let (app, engine_task) =
+        test_admin_app_with_ready_and_engine_script(ready, |_, _| boxed_test_future(async {}))
+            .await;
+
+    let mut responses = Vec::new();
+    for query in ["?dp_rank=0", "?dp_rank=-1"] {
+        let (status, _, body) = post_kv_connector_rpc(&app, query, b"ping").await;
+        responses.push(format!(
+            "{query}: {status} {}",
+            String::from_utf8_lossy(&body)
+        ));
+    }
+    expect_test::expect![[r#"
+        [
+            "?dp_rank=0: 400 Bad Request {\"error\":{\"message\":\"dp_rank=0 is not served by this server (DP ranks []).\",\"type\":\"Bad Request\",\"param\":null,\"code\":400}}",
+            "?dp_rank=-1: 400 Bad Request {\"error\":{\"message\":\"Failed to deserialize query string: dp_rank: invalid digit found in string\",\"type\":\"Bad Request\",\"param\":\"query.dp_rank\",\"code\":400}}",
+        ]
+    "#]].assert_debug_eq(&responses);
+    engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn kv_connector_rpc_route_is_not_found_without_a_kv_connector() {
+    let mut ready = default_ready_response();
+    ready.vllm_config = Some(json!({"kv_transfer_config": null}));
+    let (state, engine_task) =
+        test_admin_state_with_ready_and_engine_script(ready, |_, _| boxed_test_future(async {}))
+            .await;
+    // The route is not a development endpoint.
+    let app = build_router_with_gates(state, RouteGates::default());
+
+    let (status, _, body) = post_kv_connector_rpc(&app, "", b"ping").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    expect_test::expect![[r#"{"error":{"message":"No KV connector is configured.","type":"Not Found","param":null,"code":404}}"#]].assert_eq(&String::from_utf8_lossy(&body));
+    engine_task.abort_and_join().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn collective_rpc_route_sends_expected_utility_call_and_returns_results() {

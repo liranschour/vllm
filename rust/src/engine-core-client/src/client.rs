@@ -6,6 +6,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::future::join_all;
 use itertools::Itertools;
 use serde::Serialize;
@@ -24,7 +25,7 @@ use crate::protocol::dtype::ModelDtype;
 use crate::protocol::handshake::EngineCoreReadyResponse;
 use crate::protocol::lora::LoraRequest;
 use crate::protocol::request::EngineCoreRequest;
-use crate::protocol::utility::{CheckpointState, PauseMode, SleepLevel};
+use crate::protocol::utility::{CheckpointState, PauseMode, PyBytes, SleepLevel};
 use crate::runtime::{BackgroundShutdownRuntime, build_zmq_runtime};
 use crate::transport::{self, ConnectedEngine};
 
@@ -1038,6 +1039,27 @@ impl EngineCoreClient {
             .await?
             .into_iter()
             .all(|reset| reset))
+    }
+
+    /// Deliver an opaque control RPC to the scheduler-side KV connector of one
+    /// engine and return its reply bytes, or `None` if the connector does not
+    /// implement the RPC hook.
+    ///
+    /// Unlike the other utilities, a connector RPC is not idempotent, so it
+    /// goes to exactly one engine instead of being broadcast to all DP ranks.
+    /// `dp_rank` picks the engine by data-parallel rank; without it the client
+    /// must front a single engine. Target resolution failures are
+    /// [`Error::InvalidUtilityTarget`].
+    pub async fn kv_connector_rpc(
+        &self,
+        payload: Bytes,
+        dp_rank: Option<u32>,
+    ) -> Result<Option<Bytes>> {
+        let reply: Option<PyBytes> = self
+            .inner
+            .call_utility_on_rank(dp_rank, "kv_connector_rpc", (PyBytes(payload.into()),))
+            .await?;
+        Ok(reply.map(|PyBytes(reply)| reply.into()))
     }
 
     /// Load or refresh one LoRA adapter on every connected engine.

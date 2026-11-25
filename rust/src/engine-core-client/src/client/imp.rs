@@ -23,7 +23,9 @@ use crate::client::state::{
 };
 use crate::client::stream::{EngineCoreOutputStream, EngineCoreStreamOutput};
 use crate::client::{AbortCause, AbortRequest};
-use crate::error::{client_closed, dispatcher_closed, unexpected_dispatcher_output};
+use crate::error::{
+    client_closed, dispatcher_closed, invalid_utility_target, unexpected_dispatcher_output,
+};
 use crate::metrics::{
     EngineSleepState, IterationMetricHandles, LoraInfoExporter, SchedulerStatsRecorder,
 };
@@ -281,16 +283,78 @@ impl ClientInner {
         T: serde::de::DeserializeOwned,
         A: serde::Serialize + std::fmt::Debug,
     {
+        self.call_utility_on(&self.engine_ids, method, args, recheck).await
+    }
+
+    /// Call a typed utility method on one engine, chosen by data-parallel
+    /// rank as in [`Self::utility_target_engine`].
+    pub async fn call_utility_on_rank<T, A>(
+        self: &Arc<Self>,
+        dp_rank: Option<u32>,
+        method: &str,
+        args: A,
+    ) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        A: serde::Serialize + std::fmt::Debug,
+    {
+        let engine_id = self.utility_target_engine(dp_rank)?;
+        let mut results = self.call_utility_on(&[engine_id], method, args, None).await?;
+        Ok(results.pop().expect("one result per target engine"))
+    }
+
+    /// Resolve the engine for a utility call that must run on exactly one
+    /// engine. Without `dp_rank` the client must front a single engine.
+    ///
+    /// Error messages follow Python `AsyncMPClient._rpc_target_engine`.
+    fn utility_target_engine(&self, dp_rank: Option<u32>) -> Result<EngineId> {
+        let served_ranks =
+            || self.engine_ids.iter().filter_map(EngineId::engine_index).collect::<Vec<_>>();
+        match dp_rank {
+            None => match self.engine_ids.as_slice() {
+                [engine_id] => Ok(engine_id.clone()),
+                engine_ids => Err(invalid_utility_target!(
+                    "dp_rank is required: this server fronts {} engines (DP ranks {:?}).",
+                    engine_ids.len(),
+                    served_ranks()
+                )),
+            },
+            Some(rank) => u16::try_from(rank)
+                .ok()
+                .map(EngineId::from_engine_index)
+                .filter(|engine_id| self.engine_ids.contains(engine_id))
+                .ok_or_else(|| {
+                    invalid_utility_target!(
+                        "dp_rank={rank} is not served by this server (DP ranks {:?}).",
+                        served_ranks()
+                    )
+                }),
+        }
+    }
+
+    /// Call a typed utility method on the given engines, returning one result
+    /// per engine in order.
+    async fn call_utility_on<T, A>(
+        self: &Arc<Self>,
+        engine_ids: &[EngineId],
+        method: &str,
+        args: A,
+        recheck: Option<RecheckGuard>,
+    ) -> Result<Vec<T>>
+    where
+        T: serde::de::DeserializeOwned,
+        A: serde::Serialize + std::fmt::Debug,
+    {
         trace!(
             method,
             client_index = self.client_index,
-            engine_count = self.engine_ids.len(),
+            engine_count = engine_ids.len(),
             "sending utility request"
         );
 
-        let mut call_ids = Vec::with_capacity(self.engine_ids.len());
-        let mut calls = Vec::with_capacity(self.engine_ids.len());
-        let prepared = self.engine_ids.iter().try_for_each(|engine_id| {
+        let mut call_ids = Vec::with_capacity(engine_ids.len());
+        let mut calls = Vec::with_capacity(engine_ids.len());
+        let prepared = engine_ids.iter().try_for_each(|engine_id| {
             let (call_id, rx) = self.allocate_and_register_utility_call()?;
             call_ids.push(call_id);
             let request = EngineCoreUtilityRequest::new(self.client_index, call_id, method, &args)?;
