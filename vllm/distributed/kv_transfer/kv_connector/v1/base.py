@@ -864,6 +864,11 @@ class KVConnectorBase_V1(ABC):
         request payload here without parsing it, and returns the response bytes
         to the caller. The connector owns all (de)serialization and semantics.
 
+        !!! warning "Experimental"
+            This hook and the `/v1/kv_connector/rpc` endpoint are
+            experimental and may change or be removed in any release without
+            a deprecation period.
+
         Only the scheduler-side instance (`KVConnectorRole.SCHEDULER`) is
         invoked. The handler runs synchronously in the EngineCore busy-loop
         thread between model-execution steps, so it must be fast and

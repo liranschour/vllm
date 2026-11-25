@@ -29,6 +29,11 @@ async def kv_connector_rpc(raw_request: Request):
     `on_rpc` hook running in the EngineCore scheduler process, and its
     response bytes are returned verbatim.
 
+    !!! warning "Experimental"
+        This endpoint and the `KVConnectorBase_V1.on_rpc` hook are
+        experimental. Their path, parameters, status codes, and semantics may
+        change or be removed in any release without a deprecation period.
+
     Status codes:
         200: The connector handled the RPC. The body is the response bytes
             (an empty body is a valid success/ack).
