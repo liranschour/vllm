@@ -8,7 +8,7 @@ transport:
 * `KVConnectorBase_V1.on_rpc` default (not-implemented sentinel).
 * `MultiConnector.on_rpc` first-non-None dispatch, empty-bytes success, and
   exception propagation.
-* `Scheduler.invoke_kv_connector` guarding on `self.connector`.
+* `EngineCore.kv_connector_rpc` dispatch via `scheduler.get_kv_connector()`.
 """
 
 import pytest
@@ -17,7 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
 )
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine.core import EngineCore
 
 
 class _StubConnector(KVConnectorBase_V1):
@@ -113,22 +113,28 @@ def test_multi_connector_exception_propagates_without_fallthrough():
         mc.on_rpc(b"x")
 
 
-def _make_scheduler(connector) -> Scheduler:
-    sched = object.__new__(Scheduler)
-    sched.connector = connector
-    return sched
+class _FakeScheduler:
+    def __init__(self, connector):
+        self._connector = connector
+
+    def get_kv_connector(self):
+        return self._connector
 
 
-def test_scheduler_invoke_no_connector_returns_none():
-    assert _make_scheduler(None).invoke_kv_connector(b"x") is None
+def _make_engine_core(connector) -> EngineCore:
+    core = object.__new__(EngineCore)
+    core.scheduler = _FakeScheduler(connector)
+    return core
 
 
-def test_scheduler_invoke_delegates_to_connector():
-    assert (
-        _make_scheduler(_EchoConnector()).invoke_kv_connector(b"ping") == b"echo:ping"
-    )
+def test_engine_core_rpc_no_connector_returns_none():
+    assert _make_engine_core(None).kv_connector_rpc(b"x") is None
 
 
-def test_scheduler_invoke_propagates_connector_exception():
+def test_engine_core_rpc_delegates_to_connector():
+    assert _make_engine_core(_EchoConnector()).kv_connector_rpc(b"ping") == b"echo:ping"
+
+
+def test_engine_core_rpc_propagates_connector_exception():
     with pytest.raises(RuntimeError, match="boom"):
-        _make_scheduler(_RaisingConnector()).invoke_kv_connector(b"x")
+        _make_engine_core(_RaisingConnector()).kv_connector_rpc(b"x")

@@ -200,7 +200,7 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
-    async def invoke_kv_connector(self, payload: bytes) -> bytes | None:
+    async def kv_connector_rpc(self, payload: bytes) -> bytes | None:
         """Deliver a generic control RPC to the scheduler-side KV connector.
 
         The payload is opaque to vLLM and forwarded verbatim to the

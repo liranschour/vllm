@@ -45,7 +45,7 @@ async def kv_connector_rpc(raw_request: Request):
         )
 
     payload = await raw_request.body()
-    result = await client.invoke_kv_connector(payload)
+    result = await client.kv_connector_rpc(payload)
 
     if result is None:
         raise HTTPException(

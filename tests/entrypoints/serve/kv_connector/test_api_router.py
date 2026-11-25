@@ -43,7 +43,7 @@ class _FakeEngineClient:
         kv_transfer_config = object() if has_connector else None
         self.vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
 
-    async def invoke_kv_connector(self, payload: bytes):
+    async def kv_connector_rpc(self, payload: bytes):
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -96,7 +96,7 @@ def test_payload_forwarded_verbatim():
     captured = {}
 
     class _Capturing(_FakeEngineClient):
-        async def invoke_kv_connector(self, payload: bytes):
+        async def kv_connector_rpc(self, payload: bytes):
             captured["payload"] = payload
             return b"ok"
 

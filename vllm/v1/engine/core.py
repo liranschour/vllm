@@ -936,8 +936,13 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
-    def invoke_kv_connector(self, payload: bytes) -> bytes | None:
-        return self.scheduler.invoke_kv_connector(payload)
+    def kv_connector_rpc(self, payload: bytes) -> bytes | None:
+        connector = self.scheduler.get_kv_connector()
+        if connector is None:
+            # The HTTP layer returns 404 before dispatch when no KV connector
+            # is configured; guard anyway for direct utility callers.
+            return None
+        return connector.on_rpc(payload)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
