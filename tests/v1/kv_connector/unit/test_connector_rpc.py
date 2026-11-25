@@ -9,6 +9,7 @@ transport:
 * `MultiConnector.on_rpc` first-non-None dispatch, empty-bytes success, and
   exception propagation.
 * `EngineCore.kv_connector_rpc` dispatch via `scheduler.get_kv_connector()`.
+* `AsyncMPClient` DP-rank target resolution (single engine, never broadcast).
 """
 
 import pytest
@@ -18,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
 )
 from vllm.v1.engine.core import EngineCore
+from vllm.v1.engine.core_client import AsyncMPClient
 
 
 class _StubConnector(KVConnectorBase_V1):
@@ -138,3 +140,41 @@ def test_engine_core_rpc_delegates_to_connector():
 def test_engine_core_rpc_propagates_connector_exception():
     with pytest.raises(RuntimeError, match="boom"):
         _make_engine_core(_RaisingConnector()).kv_connector_rpc(b"x")
+
+
+def _make_client(ranks: list[int]) -> AsyncMPClient:
+    client = object.__new__(AsyncMPClient)
+    client.core_engines = [r.to_bytes(2, "little") for r in ranks]
+    return client
+
+
+def test_rpc_target_single_engine_default():
+    # External LB: the server fronts one engine (here DP rank 2).
+    client = _make_client([2])
+    assert client._rpc_target_engine(None) == (2).to_bytes(2, "little")
+    assert client._rpc_target_engine(2) == (2).to_bytes(2, "little")
+
+
+def test_rpc_target_requires_dp_rank_with_multiple_engines():
+    with pytest.raises(ValueError, match="dp_rank is required"):
+        _make_client([0, 1])._rpc_target_engine(None)
+
+
+@pytest.mark.parametrize("dp_rank", [1, 5, 70000])
+def test_rpc_target_rejects_unserved_rank(dp_rank):
+    with pytest.raises(ValueError, match="not served"):
+        _make_client([0] if dp_rank == 1 else [0, 1])._rpc_target_engine(dp_rank)
+
+
+@pytest.mark.asyncio
+async def test_rpc_sent_to_exactly_one_engine():
+    client = _make_client([0, 1, 2])
+    calls = []
+
+    async def _fake_call(method, *args, engine):
+        calls.append((method, args, engine))
+        return b"ok"
+
+    client._call_utility_async = _fake_call
+    assert await client.kv_connector_rpc_async(b"p", dp_rank=1) == b"ok"
+    assert calls == [("kv_connector_rpc", (b"p",), (1).to_bytes(2, "little"))]

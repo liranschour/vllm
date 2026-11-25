@@ -9,7 +9,8 @@ Exercises the HTTP status-code mapping of `POST /v1/kv_connector/rpc` (RFC
   empty `b""`);
 * 404 when no KV connector is configured;
 * 501 when the connector returns `None` (not implemented);
-* 500 when the connector handler raises.
+* 500 when the connector handler raises;
+* `?dp_rank=N` forwarding and 400 when target resolution fails.
 """
 
 from argparse import Namespace
@@ -43,7 +44,7 @@ class _FakeEngineClient:
         kv_transfer_config = object() if has_connector else None
         self.vllm_config = SimpleNamespace(kv_transfer_config=kv_transfer_config)
 
-    async def kv_connector_rpc(self, payload: bytes):
+    async def kv_connector_rpc(self, payload: bytes, dp_rank=None):
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
@@ -59,9 +60,9 @@ def _build_app(client: _FakeEngineClient) -> FastAPI:
     return app
 
 
-def _post(client: _FakeEngineClient, body: bytes = b"payload"):
+def _post(client: _FakeEngineClient, body: bytes = b"payload", params=None):
     with TestClient(_build_app(client), raise_server_exceptions=False) as tc:
-        return tc.post(URL, content=body)
+        return tc.post(URL, content=body, params=params)
 
 
 def test_returns_bytes_as_200():
@@ -96,10 +97,45 @@ def test_payload_forwarded_verbatim():
     captured = {}
 
     class _Capturing(_FakeEngineClient):
-        async def kv_connector_rpc(self, payload: bytes):
+        async def kv_connector_rpc(self, payload: bytes, dp_rank=None):
             captured["payload"] = payload
             return b"ok"
 
     resp = _post(_Capturing(b"ok"), body=b"\x00\x01\x02raw")
     assert resp.status_code == HTTPStatus.OK.value
     assert captured["payload"] == b"\x00\x01\x02raw"
+
+
+def _capture_dp_rank():
+    captured = {}
+
+    class _Capturing(_FakeEngineClient):
+        async def kv_connector_rpc(self, payload: bytes, dp_rank=None):
+            captured["dp_rank"] = dp_rank
+            return b"ok"
+
+    return _Capturing(b"ok"), captured
+
+
+def test_dp_rank_defaults_to_none():
+    client, captured = _capture_dp_rank()
+    assert _post(client).status_code == HTTPStatus.OK.value
+    assert captured["dp_rank"] is None
+
+
+def test_dp_rank_query_param_forwarded():
+    client, captured = _capture_dp_rank()
+    assert _post(client, params={"dp_rank": 3}).status_code == HTTPStatus.OK.value
+    assert captured["dp_rank"] == 3
+
+
+def test_negative_dp_rank_is_422():
+    client, _ = _capture_dp_rank()
+    resp = _post(client, params={"dp_rank": -1})
+    assert resp.status_code == HTTPStatus.UNPROCESSABLE_ENTITY.value
+
+
+def test_target_resolution_error_is_400():
+    resp = _post(_FakeEngineClient(ValueError("dp_rank is required")))
+    assert resp.status_code == HTTPStatus.BAD_REQUEST.value
+    assert "dp_rank is required" in resp.text

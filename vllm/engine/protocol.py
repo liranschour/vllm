@@ -200,12 +200,25 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
-    async def kv_connector_rpc(self, payload: bytes) -> bytes | None:
+    async def kv_connector_rpc(
+        self, payload: bytes, dp_rank: int | None = None
+    ) -> bytes | None:
         """Deliver a generic control RPC to the scheduler-side KV connector.
 
         The payload is opaque to vLLM and forwarded verbatim to the
-        connector's `on_rpc` hook. Returns the connector's response bytes, or
-        `None` if the connector does not implement the hook.
+        connector's `on_rpc` hook on exactly one engine. Returns the
+        connector's response bytes, or `None` if the connector does not
+        implement the hook.
+
+        Args:
+            payload: The connector-defined request payload, as raw bytes.
+            dp_rank: Data-parallel rank of the target engine. `None` targets
+                the single engine this client fronts.
+
+        Raises:
+            ValueError: `dp_rank` is `None` but this client fronts more than
+                one engine, or `dp_rank` is not an engine this client fronts.
+
         """
         ...
 

@@ -328,7 +328,9 @@ class EngineCoreClient(ABC):
     async def reset_encoder_cache_async(self) -> None:
         raise NotImplementedError
 
-    async def kv_connector_rpc_async(self, payload: bytes) -> bytes | None:
+    async def kv_connector_rpc_async(
+        self, payload: bytes, dp_rank: int | None = None
+    ) -> bytes | None:
         raise NotImplementedError
 
     async def sleep_async(
@@ -1428,8 +1430,35 @@ class AsyncMPClient(MPClient):
             )
         )
 
-    async def kv_connector_rpc_async(self, payload: bytes) -> bytes | None:
-        return await self.call_utility_async("kv_connector_rpc", payload)
+    async def kv_connector_rpc_async(
+        self, payload: bytes, dp_rank: int | None = None
+    ) -> bytes | None:
+        # Unlike the other utilities, a connector RPC is not idempotent, so it
+        # goes to exactly one engine instead of being broadcast to all DP
+        # ranks (which DPLBAsyncMPClient.call_utility_async would do).
+        return await self._call_utility_async(
+            "kv_connector_rpc", payload, engine=self._rpc_target_engine(dp_rank)
+        )
+
+    def _rpc_target_engine(self, dp_rank: int | None) -> EngineIdentity:
+        if dp_rank is None:
+            if len(self.core_engines) != 1:
+                raise ValueError(
+                    "dp_rank is required: this server fronts "
+                    f"{len(self.core_engines)} engines (DP ranks "
+                    f"{self._managed_dp_ranks()})."
+                )
+            return self.core_engines[0]
+        engine = dp_rank.to_bytes(2, "little") if 0 <= dp_rank < 2**16 else None
+        if engine not in self.core_engines:
+            raise ValueError(
+                f"dp_rank={dp_rank} is not served by this server "
+                f"(DP ranks {self._managed_dp_ranks()})."
+            )
+        return engine
+
+    def _managed_dp_ranks(self) -> list[int]:
+        return [int.from_bytes(e, "little") for e in self.core_engines]
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")

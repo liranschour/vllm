@@ -1213,8 +1213,10 @@ class AsyncLLM(EngineClient):
             reset_running_requests, reset_connector
         )
 
-    async def kv_connector_rpc(self, payload: bytes) -> bytes | None:
-        return await self.engine_core.kv_connector_rpc_async(payload)
+    async def kv_connector_rpc(
+        self, payload: bytes, dp_rank: int | None = None
+    ) -> bytes | None:
+        return await self.engine_core.kv_connector_rpc_async(payload, dp_rank)
 
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
